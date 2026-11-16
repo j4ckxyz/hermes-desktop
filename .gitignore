@@ -1,0 +1,4 @@
+/target
+.DS_Store
+*.part
+/screenshots/tmp

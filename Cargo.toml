@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.12" }
+gpui-component = { version = "=0.10.0" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "fs", "io-util", "signal"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+url = "2"
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+regex = "1"
+directories = "5"
+async-channel = "2"
+log = "0.4"
+env_logger = "0.11"
+axum = { version = "0.8", features = ["ws"] }
+mime_guess = "2"
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+debug = 0
