@@ -2,7 +2,7 @@
 //! disk. Session tokens and API keys live in the OS keychain (`keyring`: macOS Keychain, Windows
 //! Credential Manager, Linux Secret Service).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -182,15 +182,44 @@ pub fn data_dir() -> PathBuf {
 
 impl Config {
     pub fn load() -> Config {
-        std::fs::read(config_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+        Self::load_from(&config_path())
+    }
+
+    /// A file that exists but doesn't parse is kept as `config.json.bak` before defaults are
+    /// used, so a bad edit or a newer version's file never silently loses the server list.
+    pub fn load_from(p: &Path) -> Config {
+        let Ok(bytes) = std::fs::read(p) else { return Config::default() };
+        match serde_json::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("{} is unreadable ({e}); keeping a copy as .bak", p.display());
+                let _ = std::fs::write(p.with_extension("json.bak"), &bytes);
+                Config::default()
+            }
+        }
     }
 
     pub fn save(&self) -> Result<()> {
-        let p = config_path();
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(&p, serde_json::to_vec_pretty(self)?).with_context(|| format!("writing {}", p.display()))
+        self.save_to(&config_path())
+    }
+
+    /// Write to a temporary file in the same directory, then rename over the old one: a crash or
+    /// full disk mid-write leaves the previous config intact.
+    pub fn save_to(&self, p: &Path) -> Result<()> {
+        let dir = p.parent().unwrap_or(Path::new("."));
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!(".config.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let write = || -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&serde_json::to_vec_pretty(self)?)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, p)
+        };
+        write().map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow!(e)
+        }).with_context(|| format!("writing {}", p.display()))
     }
 }
 
@@ -288,6 +317,21 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_writes_are_atomic_and_bad_files_are_kept() {
+        let dir = std::env::temp_dir().join(format!("hd-cfg-{}", uuid::Uuid::new_v4().simple()));
+        let p = dir.join("config.json");
+        let c = Config { user_name: Some("Ada".into()), ..Default::default() };
+        c.save_to(&p).unwrap();
+        assert_eq!(Config::load_from(&p).user_name.as_deref(), Some("Ada"));
+        // No temporary files left next to it.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::write(&p, b"{ not json").unwrap();
+        assert!(Config::load_from(&p).connections.is_empty());
+        assert_eq!(std::fs::read(dir.join("config.json.bak")).unwrap(), b"{ not json");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn dev_overrides_exist_only_in_debug_builds() {
         std::env::set_var("HERMES_DESKTOP_TEST_PROBE", "1");

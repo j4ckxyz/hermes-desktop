@@ -98,6 +98,10 @@ pub struct Bot {
     pub model: Option<String>,
     pub is_default: bool,
     pub meta: BotMeta,
+    /// `ui_meta["hermes-bots"]` exactly as the server sent it. Writes patch this, not `meta`,
+    /// so fields we can't parse (a newer or different client's types) survive untouched.
+    #[serde(default)]
+    pub meta_raw: Value,
     pub meta_revision: Option<i64>,
     pub has_avatar: bool,
     pub canonical: Option<SessionSummary>,
@@ -118,6 +122,21 @@ fn summary(v: Option<&Value>) -> Option<SessionSummary> {
     Some(s)
 }
 
+/// Apply a `ui_meta` patch (null removes a key) to the raw stored object.
+pub fn patch_meta(raw: &Value, patch: &Value) -> Value {
+    let mut out = if raw.is_object() { raw.clone() } else { Value::Object(Default::default()) };
+    if let (Some(m), Some(pt)) = (out.as_object_mut(), patch.as_object()) {
+        for (k, v) in pt {
+            if v.is_null() {
+                m.remove(k);
+            } else {
+                m.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    out
+}
+
 impl Bot {
     /// Parse one row of `profiles.list`.
     pub fn from_row(conn: &str, conn_name: &str, row: &Value) -> Option<Bot> {
@@ -132,6 +151,7 @@ impl Bot {
             model: str_opt("model"),
             is_default: row.get("is_default").and_then(Value::as_bool).unwrap_or(name == "default"),
             meta,
+            meta_raw: ui_meta.filter(|m| m.is_object()).cloned().unwrap_or_else(|| Value::Object(Default::default())),
             meta_revision: row.get("ui_meta_revisions").and_then(|r| r.get(UI_META_KEY)).and_then(Value::as_i64),
             has_avatar: row.get("has_avatar").and_then(Value::as_bool).unwrap_or(false),
             canonical: summary(row.get("canonical_session")),
@@ -473,6 +493,16 @@ mod tests {
         assert_eq!(b.last_active(), 20.0);
         assert!(b.meta.extra.contains_key("unknownKey"));
         assert!(b.tags().contains(&"researchbuddy".to_string()));
+    }
+
+    #[test]
+    fn writes_keep_fields_we_cannot_parse() {
+        // `title` has a type BotMeta rejects, so the typed view is empty; a write must not erase it.
+        let row = json!({"name":"r","ui_meta":{"hermes-bots":{"title":{"rich":"x"},"pinned":"yes","x":1}}});
+        let b = Bot::from_row("c", "C", &row).unwrap();
+        assert_eq!(b.meta, BotMeta::default());
+        let out = patch_meta(&b.meta_raw, &json!({"hidden": true, "x": null}));
+        assert_eq!(out, json!({"title":{"rich":"x"},"pinned":"yes","hidden":true}));
     }
 
     #[test]

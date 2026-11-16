@@ -694,7 +694,7 @@ impl Svc {
         let mut bots: Vec<Bot> = rows.iter().filter_map(|row| Bot::from_row(&conn, &conn_name, row)).collect();
         roster::sort_roster(&mut bots);
         let unread = self.unread_of(&bots);
-        let js = serde_json::to_string(&bots).unwrap_or_default() + &format!("{unread:?}");
+        let js = roster_fingerprint(&bots, &unread);
         let changed = {
             let mut st = self.st.lock().unwrap();
             match st.conns.get_mut(&conn) {
@@ -1077,16 +1077,7 @@ impl Svc {
         let gw = self.gw(&key.conn).ok_or("Not connected.")?;
         for _ in 0..3 {
             let bot = self.bot(key).ok_or("Unknown bot.")?;
-            let mut meta = serde_json::to_value(&bot.meta).unwrap_or(json!({}));
-            if let (Some(m), Some(pt)) = (meta.as_object_mut(), patch.as_object()) {
-                for (k, v) in pt {
-                    if v.is_null() {
-                        m.remove(k);
-                    } else {
-                        m.insert(k.clone(), v.clone());
-                    }
-                }
-            }
+            let meta = roster::patch_meta(&bot.meta_raw, &patch);
             let mut params = json!({"name": key.profile, "ui_meta": {UI_META_KEY: meta}});
             if let Some(rev) = bot.meta_revision {
                 params["ui_meta_expected_revisions"] = json!({UI_META_KEY: rev});
@@ -1146,4 +1137,26 @@ const MEDIA_TTL: Duration = Duration::from_secs(3600);
 pub fn media_cache_path(cache_dir: &std::path::Path, conn: &str, profile: &str, remote: &str) -> PathBuf {
     let ext = std::path::Path::new(remote).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("img").to_ascii_lowercase();
     cache_dir.join("media").join(format!("{:016x}.{ext}", hash(&format!("{conn}\0{profile}\0{remote}"))))
+}
+
+/// What a roster update looks like, for change detection. The unread set is sorted so a
+/// `HashSet`'s random iteration order can't make an unchanged roster look new.
+pub(crate) fn roster_fingerprint(bots: &[Bot], unread: &HashSet<BotKey>) -> String {
+    let mut keys: Vec<String> = unread.iter().map(|k| format!("{k:?}")).collect();
+    keys.sort();
+    serde_json::to_string(&bots).unwrap_or_default() + &keys.join("|")
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn unread_order_does_not_change_the_fingerprint() {
+        let keys: Vec<BotKey> = (0..40).map(|i| BotKey::new("c", format!("p{i}"))).collect();
+        let a: HashSet<BotKey> = keys.iter().cloned().collect();
+        let b: HashSet<BotKey> = keys.iter().rev().cloned().collect();
+        assert_eq!(roster_fingerprint(&[], &a), roster_fingerprint(&[], &b));
+        assert_ne!(roster_fingerprint(&[], &a), roster_fingerprint(&[], &HashSet::new()));
+    }
 }

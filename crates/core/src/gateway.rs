@@ -24,6 +24,19 @@ const HEARTBEAT_EVERY: Duration = Duration::from_secs(15);
 const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(45);
 const BACKOFF_MS: [u64; 6] = [400, 1_000, 2_000, 4_000, 8_000, 15_000];
 
+/// A link has to stay up this long before the backoff starts over. A server that accepts the
+/// socket and drops it straight away (crash loop, proxy reset) keeps backing off instead of
+/// being hammered every 400 ms.
+const STABLE_LINK: Duration = Duration::from_secs(10);
+
+fn attempt_after_link(attempt: u32, uptime: Duration) -> u32 {
+    if uptime >= STABLE_LINK {
+        0
+    } else {
+        attempt
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RpcError {
     pub code: i64,
@@ -190,8 +203,9 @@ async fn run(s: Arc<Shared>) {
         };
         let reason = match attempt_result {
             Ok(ws) => {
-                attempt = 0;
+                let up = std::time::Instant::now();
                 let r = pump(&s, ws).await;
+                attempt = attempt_after_link(attempt, up.elapsed());
                 *s.out.lock().unwrap() = None;
                 fail_pending(&s);
                 match r {
@@ -370,4 +384,18 @@ async fn stopped(rx: &mut watch::Receiver<bool>) {
 
 fn is_stopped(rx: &watch::Receiver<bool>) -> bool {
     *rx.borrow()
+}
+
+#[cfg(test)]
+mod backoff_tests {
+    use super::*;
+
+    #[test]
+    fn flapping_links_keep_backing_off() {
+        assert_eq!(attempt_after_link(3, Duration::from_millis(50)), 3);
+        assert_eq!(attempt_after_link(3, Duration::from_secs(30)), 0);
+        // After a brief link, the next delay is longer than the first one.
+        let next = attempt_after_link(2, Duration::from_millis(100)) + 1;
+        assert!(BACKOFF_MS[(next as usize - 1).min(BACKOFF_MS.len() - 1)] > BACKOFF_MS[0]);
+    }
 }
