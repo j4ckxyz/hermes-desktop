@@ -82,3 +82,15 @@ fn mention_lookup_never_slices_mid_character() {
     assert_eq!(mention_query(t, 9), Some((4, 8, "研")));
     assert_eq!(mention_query("mail a@b", 8), None, "not at a word start");
 }
+
+#[test]
+fn usage_series_includes_the_servers_today() {
+    use hermes_core::usage::{Day, Totals};
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 15).unwrap();
+    // The server (UTC) is already on the 16th.
+    let daily = vec![Day { day: "2026-11-16".into(), t: Totals { input_tokens: 7, ..Default::default() } }];
+    let s = crate::overlays::day_series(&daily, 3, today);
+    assert_eq!(s.iter().map(|(d, _)| d.as_str()).collect::<Vec<_>>(), ["2026-11-14", "2026-11-15", "2026-11-16"]);
+    assert_eq!(s.last().unwrap().1, 7);
+    assert_eq!(crate::overlays::day_series(&[], 2, today).last().unwrap().0, "2026-11-15");
+}

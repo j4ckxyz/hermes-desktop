@@ -3,7 +3,6 @@
 //! Only official Hermes protocols are used: the gateway JSON-RPC WebSocket (`/api/ws`), the
 //! dashboard REST API (`/api/...`) and the OpenAI-compatible API server (`/v1`). See PLAN.md.
 
-pub mod api_server;
 pub mod apps;
 pub mod auth;
 pub mod conn;

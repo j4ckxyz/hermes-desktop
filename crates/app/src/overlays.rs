@@ -471,15 +471,7 @@ impl HermesApp {
         let any_actual = shown.iter().any(|x| x.totals.actual_cost > 0.0);
 
         // Daily series over the whole range (quiet days are zero).
-        let today = chrono::Local::now().date_naive();
-        let series: Vec<(String, i64)> = (0..days as i64)
-            .rev()
-            .map(|d| {
-                let day = (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
-                let v = daily.iter().find(|x| x.day == day).map(|x| x.t.tokens()).unwrap_or(0);
-                (day, v)
-            })
-            .collect();
+        let series = day_series(&daily, days, chrono::Local::now().date_naive());
         let peak = series.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
 
         let range_items: Vec<(SharedString, bool, Handler)> = [7u32, 30, 90]
@@ -1058,4 +1050,20 @@ fn app_card_skeleton(i: usize, pal: &Palette) -> impl IntoElement {
 /// "2026-11-16" → "16 Nov".
 fn short_day(d: &str) -> String {
     chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map(|x| x.format("%-d %b").to_string()).unwrap_or_else(|_| d.to_owned())
+}
+
+/// One bar per day for `days` days. Hermes buckets by its own calendar day, which can run ahead
+/// of ours (time zones), so the range ends at whichever is later: today here or the newest day
+/// the server reported.
+pub(crate) fn day_series(daily: &[hermes_core::usage::Day], days: u32, today: chrono::NaiveDate) -> Vec<(String, i64)> {
+    let newest = daily.iter().filter_map(|d| chrono::NaiveDate::parse_from_str(&d.day, "%Y-%m-%d").ok()).max();
+    let end = newest.map_or(today, |n| n.max(today));
+    (0..days as i64)
+        .rev()
+        .map(|d| {
+            let day = (end - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+            let v = daily.iter().filter(|x| x.day == day).map(|x| x.t.tokens()).sum();
+            (day, v)
+        })
+        .collect()
 }

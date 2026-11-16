@@ -16,6 +16,9 @@ pub struct Totals {
     pub actual_cost: f64,
     pub sessions: i64,
     pub requests: i64,
+    /// For sums over several bots: each part's best figure added up, so one bot's provider
+    /// cost doesn't hide the others' estimates.
+    pub combined_cost: Option<f64>,
 }
 
 impl Totals {
@@ -24,6 +27,9 @@ impl Totals {
     }
     /// The provider's figure when it gave one, else the estimate.
     pub fn cost(&self) -> f64 {
+        if let Some(c) = self.combined_cost {
+            return c;
+        }
         if self.actual_cost > 0.0 {
             self.actual_cost
         } else {
@@ -31,6 +37,7 @@ impl Totals {
         }
     }
     pub fn add(&mut self, o: &Totals) {
+        self.combined_cost = Some(self.cost() + o.cost());
         self.input_tokens += o.input_tokens;
         self.output_tokens += o.output_tokens;
         self.cache_read_tokens += o.cache_read_tokens;
@@ -80,6 +87,7 @@ fn row(v: &Value) -> Totals {
         actual_cost: f(v, "actual_cost"),
         sessions: i(v, "sessions"),
         requests: i(v, "api_calls"),
+        combined_cost: None,
     }
 }
 
@@ -96,6 +104,7 @@ pub fn parse(v: &Value) -> Usage {
             actual_cost: f(&t, "total_actual_cost"),
             sessions: i(&t, "total_sessions"),
             requests: i(&t, "total_api_calls"),
+            combined_cost: None,
         },
         daily: v.get("daily").and_then(Value::as_array).into_iter().flatten().map(|d| Day { day: d.get("day").and_then(Value::as_str).unwrap_or_default().to_owned(), t: row(d) }).collect(),
         by_model: v.get("by_model").and_then(Value::as_array).into_iter().flatten().map(|d| ModelRow { model: d.get("model").and_then(Value::as_str).unwrap_or("unknown").to_owned(), t: row(d) }).collect(),
@@ -140,6 +149,16 @@ pub fn fmt_cost(usd: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_bots_provider_cost_does_not_hide_others_estimates() {
+        let a = Totals { actual_cost: 1.0, estimated_cost: 0.8, ..Default::default() };
+        let b = Totals { estimated_cost: 5.0, ..Default::default() };
+        let mut sum = Totals::default();
+        sum.add(&a);
+        sum.add(&b);
+        assert!((sum.cost() - 6.0).abs() < 1e-9, "{}", sum.cost());
+    }
     use serde_json::json;
 
     #[test]
