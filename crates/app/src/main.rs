@@ -42,7 +42,23 @@ fn init_logging(config: &Config) {
     log::set_max_level(app::log_level(&config.prefs));
 }
 
+/// The reply to a command-line-only invocation (`--version`, `--help`), if this is one.
+fn cli_reply(arg: Option<&str>) -> Option<String> {
+    let v = env!("CARGO_PKG_VERSION");
+    match arg? {
+        "--version" | "-V" => Some(format!("hermes-desktop {v}")),
+        "--help" | "-h" => Some(format!("hermes-desktop {v}\nA native desktop client for Hermes Agent.\n\nUsage: hermes-desktop [--version | --help]")),
+        _ => None,
+    }
+}
+
 fn main() {
+    // Answer on stdout and exit before any window, config or keychain access, so installers and
+    // scripts can check the binary without starting the app.
+    if let Some(reply) = cli_reply(std::env::args().nth(1).as_deref()) {
+        println!("{reply}");
+        return;
+    }
     let config = app::bootstrap_config(Config::load());
     init_logging(&config);
     let data = data_dir();

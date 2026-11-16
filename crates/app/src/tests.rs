@@ -94,3 +94,11 @@ fn usage_series_includes_the_servers_today() {
     assert_eq!(s.last().unwrap().1, 7);
     assert_eq!(crate::overlays::day_series(&[], 2, today).last().unwrap().0, "2026-11-15");
 }
+
+#[test]
+fn version_flag_is_answered_without_the_app() {
+    assert_eq!(crate::cli_reply(Some("--version")).unwrap(), format!("hermes-desktop {}", env!("CARGO_PKG_VERSION")));
+    assert!(crate::cli_reply(Some("-h")).unwrap().contains("Usage"));
+    assert_eq!(crate::cli_reply(None), None);
+    assert_eq!(crate::cli_reply(Some("--other")), None);
+}
