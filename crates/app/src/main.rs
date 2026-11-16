@@ -77,14 +77,29 @@ fn main() {
                 ],
                 disabled: false,
             },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Undo", gpui_component::input::Undo),
+                    MenuItem::action("Redo", gpui_component::input::Redo),
+                    MenuItem::separator(),
+                    MenuItem::action("Cut", gpui_component::input::Cut),
+                    MenuItem::action("Copy", gpui_component::input::Copy),
+                    MenuItem::action("Paste", gpui_component::input::Paste),
+                    MenuItem::action("Select All", gpui_component::input::SelectAll),
+                ],
+                disabled: false,
+            },
             Menu { name: "View".into(), items: vec![MenuItem::action("Toggle Sidebar", app::ToggleSidebar), MenuItem::action("Focus Composer", app::FocusComposer)], disabled: false },
             Menu {
                 name: "Chat".into(),
                 items: vec![MenuItem::action("Attach Files…", app::AttachFiles), MenuItem::action("Copy Conversation", app::CopyConversation), MenuItem::action("Stop Reply", app::StopTurn)],
                 disabled: false,
             },
+            Menu { name: "Window".into(), items: vec![MenuItem::action("Minimize", app::MinimizeWindow), MenuItem::action("Zoom", app::ZoomWindow)], disabled: false },
         ]);
-        let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
+        let (w, h) = config.window_size.filter(|(w, h)| *w >= app::MIN_W && *h >= app::MIN_H && *w <= 10_000. && *h <= 10_000.).unwrap_or((1180., 780.));
+        let bounds = Bounds::centered(None, size(px(w), px(h)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(chrome::titlebar_options()),

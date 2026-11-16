@@ -38,7 +38,9 @@ actions!(
         PrevBot,
         CopyConversation,
         StopTurn,
-        AttachFiles
+        AttachFiles,
+        MinimizeWindow,
+        ZoomWindow
     ]
 );
 
@@ -395,6 +397,9 @@ pub struct HermesApp {
     _subs: Vec<Subscription>,
     palette_sub: Option<Subscription>,
     apps_sub: Option<Subscription>,
+    save_soon: Option<Task<()>>,
+    /// The server whose "Remove" button was pressed once and now asks for confirmation.
+    pub confirm_remove: Option<String>,
 }
 
 /// Seed a connection from the environment (`HERMES_DESKTOP_URL` + `HERMES_DESKTOP_TOKEN`) for
@@ -531,6 +536,21 @@ impl HermesApp {
             }
         }));
         subs.push(cx.observe_window_appearance(window, |this, window, cx| this.apply_prefs(window, cx)));
+        // Remember the window size (saved a moment after resizing stops).
+        subs.push(cx.observe_window_bounds(window, |this, window, cx| {
+            if window.is_maximized() || window.is_fullscreen() {
+                return;
+            }
+            let s = window.bounds().size;
+            let size = (f32::from(s.width).round(), f32::from(s.height).round());
+            if this.config.window_size != Some(size) {
+                this.config.window_size = Some(size);
+                this.save_soon = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(std::time::Duration::from_millis(800)).await;
+                    let _ = this.update(cx, |this, cx| this.save_config(cx));
+                }));
+            }
+        }));
         subs.push(cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
             // A ⌘ released while another app had focus never reaches us.
@@ -588,6 +608,8 @@ impl HermesApp {
             _subs: subs,
             palette_sub: None,
             apps_sub: None,
+            save_soon: None,
+            confirm_remove: None,
         };
         this.apply_prefs(window, cx);
         // Paint the cached roster immediately, then connect.

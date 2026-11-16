@@ -37,6 +37,9 @@ pub struct Config {
     pub user_name: Option<String>,
     #[serde(default)]
     pub prefs: Prefs,
+    /// Last window size (logical pixels), restored at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size: Option<(f32, f32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

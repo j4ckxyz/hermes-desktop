@@ -287,7 +287,23 @@ impl HermesApp {
                                         d.child(button(SharedString::from(format!("signout-{}", c.id)), "Sign out", Kind::Secondary, &pal).child(ico("log-out", 13., pal.muted)).flex_row_reverse().on_click(cx.listener(move |this, _, _, cx| this.sign_out(&id4, cx))))
                                     })
                                     .child(button(SharedString::from(format!("switch-{}", c.id)), "Switch server", Kind::Secondary, &pal).on_click(cx.listener(move |this, _, window, cx| this.open_onboarding(crate::onboard::Step::Server, Some(id3.clone()), window, cx))))
-                                    .child(icon_btn(SharedString::from(format!("rm-{}", c.id)), "trash-2", &pal).on_click(cx.listener(move |this, _, _, cx| this.remove_connection(&id2, cx))))
+                                    .child(if self.confirm_remove.as_deref() == Some(c.id.as_str()) {
+                                        // Second step: an explicit, labelled confirmation.
+                                        button(SharedString::from(format!("rm-yes-{}", c.id)), "Remove server and sign out", Kind::Danger, &pal)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.confirm_remove = None;
+                                                this.remove_connection(&id2, cx);
+                                            }))
+                                            .into_any_element()
+                                    } else {
+                                        let id5 = c.id.clone();
+                                        icon_btn(SharedString::from(format!("rm-{}", c.id)), "trash-2", &pal)
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.confirm_remove = Some(id5.clone());
+                                                cx.notify();
+                                            }))
+                                            .into_any_element()
+                                    })
                                 })
                         }))
                         .child(div().pt(px(12.)).flex().child(button("add-server", "Add server", Kind::Primary, &pal).child(ico("plus", 14., pal.on_accent)).flex_row_reverse().on_click(cx.listener(|this, _, window, cx| this.open_onboarding(crate::onboard::Step::Server, None, window, cx))))),

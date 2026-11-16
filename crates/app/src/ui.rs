@@ -31,6 +31,7 @@ pub fn icon_label(name: &str) -> &'static str {
         "search" => "Search",
         "settings" => "Settings",
         "share" => "Share",
+        "trash-2" => "Remove server",
         "minus" => "Minimise",
         "square" | "copy" => "Maximise",
         _ => "Button",

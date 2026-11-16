@@ -129,7 +129,7 @@ impl HermesApp {
         let url = cx.new(|cx| InputState::new(window, cx).placeholder("homelab.tail1234.ts.net or https://hermes.example.com").default_value(existing.as_ref().map(|c| c.base_url.clone()).unwrap_or_default()));
         let username = cx.new(|cx| InputState::new(window, cx).placeholder("Username").default_value(account.unwrap_or_default()));
         let password = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Password"));
-        let token = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Session token or API key"));
+        let token = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder("Session token"));
         let bot_title = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Research Buddy"));
         let mut subs = vec![
             cx.subscribe_in(&url, window, |this, _, ev: &InputEvent, window, cx| match ev {
@@ -560,7 +560,7 @@ impl HermesApp {
         let link = |id: &'static str, label: &'static str| div().id(id).text_size(pal.t(13.)).text_color(pal.muted).cursor_pointer().hover(|s| s.text_color(pal.text)).child(label);
         div().flex().justify_center().text_size(pal.t(12.)).text_color(pal.faint).map(|d| match o.step {
             Step::Welcome => d.child("Your conversations stay on your Hermes. Nothing goes through us."),
-            Step::Server => d.child(link("ob-advanced", "Have a session token or API key? Use it instead").on_click(cx.listener(|this, _, window, cx| {
+            Step::Server => d.child(link("ob-advanced", "Have a session token? Use it instead").on_click(cx.listener(|this, _, window, cx| {
                 if this.onboard.as_ref().is_some_and(|o| o.server.is_some()) {
                     this.set_onboard_step(Step::Token, window, cx);
                 } else if let Some(o) = &mut this.onboard {

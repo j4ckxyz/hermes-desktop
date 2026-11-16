@@ -1144,9 +1144,6 @@ impl HermesApp {
                                         }),
                                     ),
                                 )
-                                .child(composer_btn("mic", "mic", &pal).on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_toast("Voice input isn't available yet: Hermes' voice.* gateway methods are not served on remote connections.", false, cx);
-                                })))
                                 .child(
                                     div()
                                         .id("send")
@@ -1537,6 +1534,8 @@ impl HermesApp {
             .on_action(cx.listener(|this, _: &StopTurn, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &AttachFiles, _, cx| this.pick_files(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
+            .on_action(|_: &MinimizeWindow, window, _| window.minimize_window())
+            .on_action(|_: &ZoomWindow, window, _| window.zoom_window())
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)))
             .on_action(cx.listener(|this, _: &OpenUsage, window, cx| this.open_usage(window, cx)))
             .on_action(cx.listener(|this, _: &TogglePin, _, cx| {
@@ -1566,6 +1565,14 @@ impl HermesApp {
             .on_drag_move(cx.listener(|this, _: &DragMoveEvent<ExternalPaths>, _, cx| {
                 if !this.dragging {
                     this.dragging = true;
+                    cx.notify();
+                }
+            }))
+            // A drag that leaves the window or is cancelled sends no drop: clear the highlight
+            // on the next ordinary mouse move.
+            .on_mouse_move(cx.listener(|this, _: &MouseMoveEvent, _, cx| {
+                if this.dragging && !cx.has_active_drag() {
+                    this.dragging = false;
                     cx.notify();
                 }
             }))
