@@ -51,7 +51,9 @@ pub enum Cmd {
     /// Focus a bot: open its canonical Bot Chat and load history.
     OpenBot(BotKey),
     /// `refresh` applies the long-break policy before the prompt (see `conn::GapAction`).
-    Send { key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction> },
+    /// `slash`: the client recognised `text` as a known command (see `slash::is_command`);
+    /// otherwise a leading `/` is just text.
+    Send { key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction>, slash: bool },
     Stop(BotKey),
     MarkRead(BotKey),
     /// Download an agent-produced file; `open` opens it with the OS when done.
@@ -260,9 +262,9 @@ impl Svc {
                 s.st.lock().unwrap().focused = Some(key.clone());
                 tokio::spawn(async move { s.open_bot(key, true).await });
             }
-            Cmd::Send { key, text, files, refresh } => {
+            Cmd::Send { key, text, files, refresh, slash } => {
                 tokio::spawn(async move {
-                    if let Err(m) = s.send(key.clone(), text, files, refresh).await {
+                    if let Err(m) = s.send(key.clone(), text, files, refresh, slash).await {
                         s.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: Some(m) });
                     }
                 });
@@ -939,7 +941,7 @@ impl Svc {
         msgs
     }
 
-    async fn send(&self, key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction>) -> Result<(), String> {
+    async fn send(&self, key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction>, slash: bool) -> Result<(), String> {
         let (gw, mut sid, _) = self.ensure_live(&key).await?;
         let p = key.profile.clone();
         // /new and /reset would fork the forever-chat: compact instead (docs: Bot Mode).
@@ -957,7 +959,7 @@ impl Svc {
             }
             // Any other slash command runs through the official `slash.exec` (docs: *Shared
             // authority local slash commands*). Skills come back as a message to submit.
-            if let Some(cmd) = text.trim().strip_prefix('/').filter(|c| !c.is_empty() && !c.starts_with('/')) {
+            if let Some(cmd) = text.trim().strip_prefix('/').filter(|c| slash && !c.is_empty() && !c.starts_with('/')) {
                 let command = format!("/{cmd}");
                 let name = command.split_whitespace().next().unwrap_or(&command).to_owned();
                 match gw.call_timeout("slash.exec", json!({"session_id": sid, "command": command, "profile": p}), Duration::from_secs(120)).await {
@@ -966,7 +968,7 @@ impl Svc {
                         if msg.is_empty() {
                             return Err(format!("{name} returned nothing to send."));
                         }
-                        return Box::pin(self.send(key, msg, vec![], refresh)).await;
+                        return Box::pin(self.send(key, msg, vec![], refresh, false)).await;
                     }
                     Ok(r) => {
                         let out = r.get("output").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| r.to_string());

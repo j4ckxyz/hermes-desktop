@@ -109,7 +109,7 @@ fn a_reply_survives_a_dropped_connection() {
     let key = BotKey::new("r1", "default");
     svc.send(Cmd::OpenBot(key.clone()));
     wait(&svc, 10, |e| matches!(e, Ev::History { cached: false, .. }).then_some(()));
-    svc.send(Cmd::Send { key: key.clone(), text: "hello there".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "hello there".into(), files: vec![], refresh: None, slash: false });
     wait(&svc, 10, |e| matches!(e, Ev::Delta { .. }).then_some(()));
     m.drop_sockets();
     wait(&svc, 10, |e| matches!(e, Ev::Link { state: LinkState::Reconnecting { .. }, .. }).then_some(()));
@@ -141,7 +141,7 @@ fn pending_approval_comes_back_after_a_drop() {
     let key = BotKey::new("r2", "default");
     svc.send(Cmd::OpenBot(key.clone()));
     wait(&svc, 10, |e| matches!(e, Ev::History { cached: false, .. }).then_some(()));
-    svc.send(Cmd::Send { key: key.clone(), text: "please rm -rf build".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "please rm -rf build".into(), files: vec![], refresh: None, slash: false });
     let first = wait(&svc, 10, |e| match e {
         Ev::Approval { request_id, .. } => Some(request_id.clone()),
         _ => None,
@@ -179,4 +179,21 @@ fn concurrent_opens_create_one_bot_chat() {
         (n == 3).then_some(())
     });
     assert_eq!(m.bot_chats("scribe"), 1);
+}
+
+#[test]
+fn a_message_that_starts_with_a_path_is_sent_as_text() {
+    let (_rt, _m, url) = mock();
+    let svc = start(&url, "sl");
+    ready(&svc, "sl");
+    let key = BotKey::new("sl", "default");
+    svc.send(Cmd::OpenBot(key.clone()));
+    wait(&svc, 10, |e| matches!(e, Ev::History { cached: false, .. }).then_some(()));
+    svc.send(Cmd::Send { key: key.clone(), text: "/etc/hosts is empty".into(), files: vec![], refresh: None, slash: false });
+    let full = wait(&svc, 10, |e| match e {
+        Ev::Slash { command, .. } => panic!("ran as a command: {command}"),
+        Ev::TurnEnd { text, error: None, .. } if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    });
+    assert!(full.contains("/etc/hosts is empty"), "{full}");
 }

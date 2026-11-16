@@ -32,6 +32,15 @@ pub struct SlashCmd {
 }
 
 /// The embedded copy of the official registry.
+/// Whether `text` invokes a known command: `/name` or `/name args`, where `name` (or an alias)
+/// is in `cmds`. A message that merely starts with a slash, such as a path (`/etc/hosts is
+/// empty`) or `/s` typo, stays an ordinary message.
+pub fn is_command(cmds: &[SlashCmd], text: &str) -> bool {
+    let Some(rest) = text.trim_start().strip_prefix('/') else { return false };
+    let name = rest.split(char::is_whitespace).next().unwrap_or_default();
+    !name.is_empty() && cmds.iter().any(|c| c.name.eq_ignore_ascii_case(name) || c.aliases.iter().any(|a| a.trim_start_matches('/').eq_ignore_ascii_case(name)))
+}
+
 pub fn builtin() -> &'static [SlashCmd] {
     static CMDS: OnceLock<Vec<SlashCmd>> = OnceLock::new();
     CMDS.get_or_init(|| serde_json::from_str(include_str!("slash_registry.json")).unwrap_or_default())
@@ -124,6 +133,17 @@ pub fn filter<'a>(cmds: &'a [SlashCmd], query: &str) -> Vec<&'a SlashCmd> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_known_commands_are_commands() {
+        let cmds = builtin();
+        assert!(is_command(cmds, "/model"));
+        assert!(is_command(cmds, "/model gpt-5 --global"));
+        assert!(is_command(cmds, "/MODEL"));
+        for not in ["/etc/hosts is empty", "/usr/bin/env python", "/", "/ model", "hello /model", "//model", "/notacommand"] {
+            assert!(!is_command(cmds, not), "{not}");
+        }
+    }
+
     use super::*;
     use serde_json::json;
 

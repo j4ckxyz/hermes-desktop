@@ -400,6 +400,9 @@ pub fn scripted() -> Option<String> {
     dev_env("HERMES_DESKTOP_SCRIPT")
 }
 
+/// Slash commands handled by the desktop, whatever the bot's catalog says.
+const LOCAL_SLASH: &[&str] = &["/usage", "/insights", "/stop", "/approve", "/deny"];
+
 pub fn bootstrap_config(mut c: Config) -> Config {
     if let Some(url) = dev_env("HERMES_DESKTOP_URL") {
         if let Some(t) = dev_env("HERMES_DESKTOP_TOKEN") {
@@ -1187,7 +1190,8 @@ impl HermesApp {
             .map(|f| Attachment { name: f.name.clone(), mime: f.mime.clone(), kind: transcript::kind_of(&f.mime), remote_path: None, local_path: Some(f.path.display().to_string()), size: Some(f.size) })
             .collect();
         let is_command = key.thread.is_none() && roster::rewrite_bot_chat_command(&text).is_some() && files.is_empty();
-        let slash = files.is_empty() && text.starts_with('/') && !text.starts_with("//") && !is_command;
+        let first = text.split_whitespace().next().unwrap_or_default();
+        let slash = files.is_empty() && !is_command && (LOCAL_SLASH.contains(&first) || hermes_core::slash::is_command(&self.slash_commands(), &text));
         if slash && self.local_slash(&text, window, cx) {
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
             self.slash = None;
@@ -1214,7 +1218,7 @@ impl HermesApp {
             chat.awaiting = true;
         }
         chat.error = None;
-        self.svc.send(Cmd::Send { key, text, files, refresh });
+        self.svc.send(Cmd::Send { key, text, files, refresh, slash });
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.mention = None;
         self.slash = None;
@@ -1456,6 +1460,7 @@ impl HermesApp {
     }
 
     /// Commands the app answers itself. Returns true when handled.
+    /// Commands the desktop handles itself (see `local_slash`).
     fn local_slash(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let name = text.split_whitespace().next().unwrap_or_default();
         match name {
@@ -1841,7 +1846,7 @@ impl HermesApp {
             Act::Hidden => self.show_hidden = !self.show_hidden,
             Act::Compact => {
                 if let Some(k) = self.selected.clone() {
-                    self.svc.send(Cmd::Send { key: k.base(), text: "/compact".into(), files: vec![], refresh: None });
+                    self.svc.send(Cmd::Send { key: k.base(), text: "/compact".into(), files: vec![], refresh: None, slash: true });
                 }
             }
             Act::AddServer => self.open_onboarding(crate::onboard::Step::Server, None, window, cx),

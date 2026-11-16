@@ -81,7 +81,7 @@ fn roster_chat_stream_mentions_files_compact() {
     assert!(matches!(&msgs[5].role, Role::Agent(n) if n.name == "Research Buddy"));
 
     // Stream a reply with tool activity.
-    svc.send(Cmd::Send { key: key.clone(), text: "please search for gpui".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "please search for gpui".into(), files: vec![], refresh: None, slash: false });
     let mut deltas = String::new();
     let mut saw_tool = false;
     let end = wait(&svc, 10, |e| match e {
@@ -103,7 +103,7 @@ fn roster_chat_stream_mentions_files_compact() {
 
     // @mention: note appended for message_agent, and the teammate's reply comes back as an
     // attributed agent notice.
-    svc.send(Cmd::Send { key: key.clone(), text: "ask @research-buddy about memory".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "ask @research-buddy about memory".into(), files: vec![], refresh: None, slash: false });
     let notice = wait(&svc, 10, |e| match e {
         Ev::Incoming { message, .. } => match &message.role {
             Role::Agent(n) => Some(n.clone()),
@@ -124,7 +124,7 @@ fn roster_chat_stream_mentions_files_compact() {
     let txt = dir.join("notes.txt");
     std::fs::write(&txt, "hello").unwrap();
     let files = vec![LocalFile::from_path(png).unwrap(), LocalFile::from_path(txt).unwrap()];
-    svc.send(Cmd::Send { key: key.clone(), text: "see attached".into(), files, refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "see attached".into(), files, refresh: None, slash: false });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { error: None, .. }).then_some(()));
     let sent = mock.messages_of("default");
     let u = sent.iter().rev().find(|m| m["role"] == "user").unwrap();
@@ -132,7 +132,7 @@ fn roster_chat_stream_mentions_files_compact() {
     assert!(u["attachments"][0]["path"].as_str().unwrap().starts_with("/home/hermes/uploads/"));
 
     // /new in a Bot Chat compacts instead of forking.
-    svc.send(Cmd::Send { key: key.clone(), text: "/new".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "/new".into(), files: vec![], refresh: None, slash: true });
     wait(&svc, 10, |e| matches!(e, Ev::Info { message } if message.contains("compacted")).then_some(()));
     assert!(mock.messages_of("default").iter().any(|m| m["display_kind"] == "context_compaction"));
 }
@@ -150,7 +150,7 @@ fn creates_bot_chat_and_writes_meta() {
         _ => None,
     });
     assert!(msgs.is_empty());
-    svc.send(Cmd::Send { key: key.clone(), text: "hello".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "hello".into(), files: vec![], refresh: None, slash: false });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { .. }).then_some(()));
     assert_eq!(mock.messages_of("scribe").len(), 2);
 
@@ -186,7 +186,7 @@ fn approval_round_trip() {
     wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
     let key = BotKey::new("m4", "coder");
     svc.send(Cmd::OpenBot(key.clone()));
-    svc.send(Cmd::Send { key: key.clone(), text: "run rm -rf build".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "run rm -rf build".into(), files: vec![], refresh: None, slash: false });
     let (conn, id) = wait(&svc, 10, |e| match e {
         Ev::Approval { conn, request_id, command, .. } => {
             assert_eq!(command, "rm -rf build/");
@@ -265,7 +265,7 @@ fn threads_open_their_own_session() {
     });
     assert!(msgs.iter().any(|m| m.text.contains("bump the version")));
 
-    svc.send(Cmd::Send { key: key.clone(), text: "and after that?".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "and after that?".into(), files: vec![], refresh: None, slash: false });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, .. } if *k == key).then_some(()));
     assert!(mock.messages_of("coder").iter().all(|m| m["content"] != "and after that?"), "the Bot Chat was not touched");
 }
@@ -288,7 +288,7 @@ fn one_stream_per_bot_with_gap_refresh() {
     assert!(msgs.windows(2).all(|w| w[0].timestamp.unwrap_or(0.0) <= w[1].timestamp.unwrap_or(0.0)), "sorted by time");
 
     // A long break compacts before the prompt (official session.compress), then the turn runs.
-    svc.send(Cmd::Send { key: key.clone(), text: "back again".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Compact) });
+    svc.send(Cmd::Send { key: key.clone(), text: "back again".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Compact), slash: false });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
     svc.send(Cmd::OpenBot(key.clone()));
     let msgs = wait(&svc, 10, |e| match e {
@@ -298,7 +298,7 @@ fn one_stream_per_bot_with_gap_refresh() {
     assert!(msgs.iter().any(|m| m.role == Role::System && m.text == "Context compacted"));
 
     // A fresh session keeps the old one in the stream.
-    svc.send(Cmd::Send { key: key.clone(), text: "new day".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Fresh) });
+    svc.send(Cmd::Send { key: key.clone(), text: "new day".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Fresh), slash: false });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
     svc.send(Cmd::OpenBot(key.clone()));
     let msgs = wait(&svc, 10, |e| match e {
@@ -324,7 +324,7 @@ fn slash_commands_and_usage() {
     assert!(all.iter().any(|c| c.name == "sethome"));
 
     // An exec command comes back as output.
-    svc.send(Cmd::Send { key: key.clone(), text: "/status".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "/status".into(), files: vec![], refresh: None, slash: true });
     let (cmd, out, err) = wait(&svc, 10, |e| match e {
         Ev::Slash { command, output, error, .. } => Some((command.clone(), output.clone(), *error)),
         _ => None,
@@ -333,7 +333,7 @@ fn slash_commands_and_usage() {
     assert!(out.contains("Model: mock-model") && !err);
 
     // An unsupported one explains itself.
-    svc.send(Cmd::Send { key: key.clone(), text: "/sethome".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "/sethome".into(), files: vec![], refresh: None, slash: true });
     let (out, err) = wait(&svc, 10, |e| match e {
         Ev::Slash { output, error, .. } => Some((output.clone(), *error)),
         _ => None,
@@ -341,7 +341,7 @@ fn slash_commands_and_usage() {
     assert!(err && out.contains("/sethome"), "{out}");
 
     // A skill command turns into a normal turn.
-    svc.send(Cmd::Send { key: key.clone(), text: "/arxiv agent memory".into(), files: vec![], refresh: None });
+    svc.send(Cmd::Send { key: key.clone(), text: "/arxiv agent memory".into(), files: vec![], refresh: None, slash: true });
     let text = wait(&svc, 10, |e| match e {
         Ev::TurnEnd { key: k, text, error: None } if *k == key && !text.is_empty() => Some(text.clone()),
         _ => None,
