@@ -296,8 +296,14 @@ async fn pump(s: &Arc<Shared>, ws: Ws) -> Option<String> {
                     let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                     log::debug!(target: "hermes_net", "→ {} id={}", v.get("method").and_then(Value::as_str).unwrap_or("response"), v.get("id").map(|i| i.to_string()).unwrap_or_default());
                 }
+                let sent = Instant::now();
                 if let Err(e) = sink.send(Message::Text(text.into())).await {
                     return Some(friendly(&e));
+                }
+                // While a large frame (an attachment) was being written nothing was read, so
+                // the server's replies are queued, not missing: don't call the link quiet.
+                if sent.elapsed() > Duration::from_secs(1) {
+                    last_in = Instant::now();
                 }
             }
             _ = beat.tick() => {

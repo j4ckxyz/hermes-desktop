@@ -372,6 +372,8 @@ pub struct HermesApp {
     pub media: HashMap<String, PathBuf>,
     media_requested: HashSet<String>,
     pub approvals: Vec<Approval>,
+    /// Long-break refreshes requested and not yet confirmed: chat → seconds away.
+    pub gap_pending: HashMap<BotKey, f64>,
     pub onboard: Option<crate::onboard::Onboard>,
     /// Select this bot when it first shows up in the roster (just created).
     pub want_select: Option<BotKey>,
@@ -398,6 +400,18 @@ pub struct HermesApp {
 /// The demo script, in development builds only.
 pub fn scripted() -> Option<String> {
     dev_env("HERMES_DESKTOP_SCRIPT")
+}
+
+/// Whether a long break has passed since the last real message. Only history fetched from the
+/// server counts (`loaded`): the local cache may be stale while the conversation carried on in
+/// another client.
+pub(crate) fn gap_due(msgs: &[MsgVm], loaded: bool, p: &Prefs, now: f64) -> Option<(hermes_core::conn::GapAction, f64)> {
+    if p.gap_action == hermes_core::conn::GapAction::Off || !loaded {
+        return None;
+    }
+    let last = msgs.iter().rev().filter(|m| matches!(m.m.role, Role::User | Role::Assistant | Role::Agent(_))).find_map(|m| m.m.timestamp)?;
+    let gap = now - last;
+    (gap > p.gap_hours as f64 * 3600.0).then_some((p.gap_action, gap))
 }
 
 /// Slash commands handled by the desktop, whatever the bot's catalog says.
@@ -497,6 +511,7 @@ impl HermesApp {
             media: HashMap::new(),
             media_requested: HashSet::new(),
             approvals: vec![],
+            gap_pending: HashMap::new(),
             onboard: None,
             want_select: None,
             new_bot: None,
@@ -1138,6 +1153,26 @@ impl HermesApp {
             Ev::Probed { tag, result } => self.on_probed(&tag, result, cx),
             Ev::LocalServers { servers } => self.on_local_servers(servers, cx),
             Ev::SignedIn { tag, conn_id, result } => self.on_signed_in(&tag, conn_id, result, cx),
+            Ev::Refreshed { key, action } => {
+                if let Some(secs) = self.gap_pending.remove(&key) {
+                    let away = fmt_gap(secs);
+                    let label = match action {
+                        hermes_core::conn::GapAction::Fresh => format!("Back after {away} · new session started"),
+                        _ => format!("Back after {away} · context compacted"),
+                    };
+                    let detail = "Saves tokens: Hermes summarises or sets aside the older context. The whole conversation stays here.".to_owned();
+                    let id = self.push_local(&key, label, "history", Some(detail), None, None);
+                    // It describes what happened before the prompt: show it just above it.
+                    let chat = self.chat_mut(&key);
+                    if let (Some(at), Some(user)) = (chat.msgs.iter().position(|m| m.m.id == id), chat.msgs.iter().rposition(|m| m.m.role == Role::User)) {
+                        if user < at {
+                            let chip = chat.msgs.remove(at);
+                            chat.msgs.insert(user, chip);
+                        }
+                    }
+                    cx.notify();
+                }
+            }
             Ev::Slash { key, command, output, error } => {
                 self.chat_mut(&key).awaiting = false;
                 let icon = if error { "circle-alert" } else { "slash" };
@@ -1201,14 +1236,9 @@ impl HermesApp {
         // Long break since the last message: refresh the context first (Settings → Chat).
         let gap = (!slash && !is_command).then(|| self.gap_refresh(&key)).flatten();
         let refresh = gap.map(|(a, _)| a);
-        if let Some((action, secs)) = gap {
-            let away = fmt_gap(secs);
-            let label = match action {
-                hermes_core::conn::GapAction::Fresh => format!("Back after {away} · new session started"),
-                _ => format!("Back after {away} · context compacted"),
-            };
-            let detail = "Saves tokens: Hermes summarises or sets aside the older context. The whole conversation stays here.".to_owned();
-            self.push_local(&key, label, "history", Some(detail), None, None);
+        // The chip is posted when Hermes confirms the refresh (Ev::Refreshed), never on a guess.
+        if let Some((_, secs)) = gap {
+            self.gap_pending.insert(key.clone(), secs);
         }
         let chat = self.chat_mut(&key);
         if !is_command && !slash {
@@ -1342,17 +1372,13 @@ impl HermesApp {
 
     // ---- long breaks, pinning, sidebar ------------------------------------------------------
 
-    /// The refresh to apply when the bot's stream has been quiet longer than the setting.
     /// The refresh to apply before sending, and how long the break was (seconds).
     fn gap_refresh(&self, key: &BotKey) -> Option<(hermes_core::conn::GapAction, f64)> {
-        use hermes_core::conn::GapAction;
-        let p = &self.config.prefs;
-        if p.gap_action == GapAction::Off || key.thread.is_some() {
+        if key.thread.is_some() {
             return None;
         }
-        let last = self.chats.get(key)?.msgs.iter().rev().filter(|m| matches!(m.m.role, Role::User | Role::Assistant | Role::Agent(_))).find_map(|m| m.m.timestamp)?;
-        let gap = hermes_core::service::now() - last;
-        (gap > p.gap_hours as f64 * 3600.0).then_some((p.gap_action, gap))
+        let chat = self.chats.get(key)?;
+        gap_due(&chat.msgs, chat.loaded, &self.config.prefs, hermes_core::service::now())
     }
 
     /// Pin state lives in the bot's Bot Mode metadata (`ui_meta["hermes-bots"].pinned`), so every

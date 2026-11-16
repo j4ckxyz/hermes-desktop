@@ -23,3 +23,18 @@ fn approve_only_reaches_the_visible_chat() {
     assert!(loose.belongs_to(&a) && loose.belongs_to(&b) && !loose.belongs_to(&other_server));
     assert!(!loose.waiting_on(&a));
 }
+
+#[test]
+fn long_break_needs_fresh_history() {
+    use hermes_core::conn::{GapAction, Prefs};
+    use hermes_core::transcript::{ChatMessage, Role};
+    let p = Prefs { gap_action: GapAction::Compact, gap_hours: 6, ..Default::default() };
+    let old = vec![crate::app::MsgVm { m: ChatMessage::new("1", Role::User, "hi", Some(0.0)), md: None }];
+    let now = 7.0 * 3600.0;
+    // Cached-only history might be stale: no refresh.
+    assert_eq!(crate::app::gap_due(&old, false, &p, now), None);
+    assert_eq!(crate::app::gap_due(&old, true, &p, now).map(|g| g.0), Some(GapAction::Compact));
+    assert_eq!(crate::app::gap_due(&old, true, &p, 3600.0), None);
+    let off = Prefs { gap_action: GapAction::Off, ..p };
+    assert_eq!(crate::app::gap_due(&old, true, &off, now), None);
+}

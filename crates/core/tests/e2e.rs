@@ -289,7 +289,17 @@ fn one_stream_per_bot_with_gap_refresh() {
 
     // A long break compacts before the prompt (official session.compress), then the turn runs.
     svc.send(Cmd::Send { key: key.clone(), text: "back again".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Compact), slash: false });
-    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
+    // The client's "context compacted" chip waits for this confirmation.
+    let mut confirmed = false;
+    wait(&svc, 10, |e| match e {
+        Ev::Refreshed { key: k, action: hermes_core::conn::GapAction::Compact } if *k == key => {
+            confirmed = true;
+            None
+        }
+        Ev::TurnEnd { key: k, error: None, .. } if *k == key => Some(()),
+        _ => None,
+    });
+    assert!(confirmed, "compaction confirmed before the turn ended");
     svc.send(Cmd::OpenBot(key.clone()));
     let msgs = wait(&svc, 10, |e| match e {
         Ev::History { key: k, messages, cached: false } if *k == key => Some(messages.clone()),
@@ -299,6 +309,7 @@ fn one_stream_per_bot_with_gap_refresh() {
 
     // A fresh session keeps the old one in the stream.
     svc.send(Cmd::Send { key: key.clone(), text: "new day".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Fresh), slash: false });
+    wait(&svc, 10, |e| matches!(e, Ev::Refreshed { key: k, action: hermes_core::conn::GapAction::Fresh } if *k == key).then_some(()));
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
     svc.send(Cmd::OpenBot(key.clone()));
     let msgs = wait(&svc, 10, |e| match e {

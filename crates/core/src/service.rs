@@ -122,6 +122,8 @@ pub enum Ev {
     Info { message: String },
     /// Output of a slash command run through `slash.exec` (or why it could not run).
     Slash { key: BotKey, command: String, output: String, error: bool },
+    /// The long-break refresh asked for with `Cmd::Send { refresh }` actually happened.
+    Refreshed { key: BotKey, action: GapAction },
     Rpc { tag: String, conn: String, result: Result<Value, String> },
     Probed { tag: String, result: Result<ServerInfo, String> },
     LocalServers { servers: Vec<ServerInfo> },
@@ -993,15 +995,15 @@ impl Svc {
         }
         // Long break: refresh the working context before this prompt.
         match refresh {
-            Some(GapAction::Compact) => {
-                if let Err(m) = self.compress(&gw, &sid, &p, None).await {
-                    log::warn!("long-break compaction failed: {m}");
-                }
-            }
+            Some(GapAction::Compact) => match self.compress(&gw, &sid, &p, None).await {
+                Ok(()) => self.emit(Ev::Refreshed { key: key.clone(), action: GapAction::Compact }),
+                Err(m) => log::warn!("long-break compaction failed: {m}"),
+            },
             Some(GapAction::Fresh) if key.thread.is_none() => {
                 let (rt, st) = self.create_canonical(&gw, &p).await?;
                 self.bind_live(&key, &rt, &st);
                 sid = rt;
+                self.emit(Ev::Refreshed { key: key.clone(), action: GapAction::Fresh });
             }
             _ => {}
         }
@@ -1013,12 +1015,22 @@ impl Svc {
                 return Err(format!("{} is larger than Hermes accepts (256 MB).", f.name));
             }
             let path = f.path.clone();
-            // Read and encode off the async workers so big files never stall streaming.
-            let b64 = tokio::task::spawn_blocking(move || std::fs::read(&path).map(|b| base64::engine::general_purpose::STANDARD.encode(b)))
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| format!("Couldn't read {}: {e}", f.name))?;
-            let data_url = format!("data:{};base64,{}", f.mime, b64);
+            // Read and encode off the async workers so big files never stall streaming. The
+            // base64 is written straight after the `data:` prefix and the raw bytes are freed
+            // before returning, so only one encoded copy is held.
+            let mime = f.mime.clone();
+            let data_url = tokio::task::spawn_blocking(move || {
+                let bytes = std::fs::read(&path)?;
+                let mut s = String::with_capacity(bytes.len() / 3 * 4 + 8 + mime.len() + 16);
+                s.push_str("data:");
+                s.push_str(&mime);
+                s.push_str(";base64,");
+                base64::engine::general_purpose::STANDARD.encode_string(&bytes, &mut s);
+                Ok::<_, std::io::Error>(s)
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("Couldn't read {}: {e}", f.name))?;
             if f.mime.starts_with("image/") && f.size <= MAX_IMAGE_BYTES {
                 match rest.upload_image(&p, &f.name, data_url.clone()).await {
                     Ok(v) if v.get("path").is_some() => {
