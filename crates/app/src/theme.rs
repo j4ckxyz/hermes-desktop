@@ -89,11 +89,12 @@ impl Palette {
             border_strong: rgba(0xffffff24),
             text: rgb(0xececf1),
             muted: rgb(0x9a9aa3),
-            faint: rgb(0x6b6b74),
+            // ≥ 4.5:1 on bg and sidebar (WCAG AA for small text).
+            faint: rgb(0x85858e),
             bot_bubble: rgb(0x232327),
             accent: rgb(accent),
             accent_soft: Self::soft(accent, 0x2e),
-            on_accent: rgb(0xffffff),
+            on_accent: on_accent(accent),
             danger: rgb(0xf87171),
             danger_soft: rgba(0xf8717122),
             ok: rgb(0x4ade80),
@@ -120,11 +121,12 @@ impl Palette {
             border_strong: rgba(0x00000024),
             text: rgb(0x16161a),
             muted: rgb(0x62626c),
-            faint: rgb(0x9b9ba5),
+            // ≥ 4.5:1 on bg and sidebar (WCAG AA for small text).
+            faint: rgb(0x6e6e78),
             bot_bubble: rgb(0xf0f0f3),
             accent: rgb(accent),
             accent_soft: Self::soft(accent, 0x1f),
-            on_accent: rgb(0xffffff),
+            on_accent: on_accent(accent),
             danger: rgb(0xdc2626),
             danger_soft: rgba(0xdc262614),
             ok: rgb(0x16a34a),
@@ -138,10 +140,70 @@ impl Palette {
     }
 }
 
+/// WCAG relative luminance of `0xrrggbb`.
+pub fn luminance(hex: u32) -> f32 {
+    let ch = |s: u32| {
+        let c = ((hex >> s) & 0xff) as f32 / 255.0;
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * ch(16) + 0.7152 * ch(8) + 0.0722 * ch(0)
+}
+
+/// WCAG contrast ratio between two `0xrrggbb` colours (1–21).
+pub fn contrast(a: u32, b: u32) -> f32 {
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
+const ON_ACCENT_DARK: u32 = 0x111114;
+
+/// Text on an accent fill (buttons, badges, the user bubble): white while it keeps at least
+/// 3:1 (bold UI text), otherwise near-black. Orange, green, teal and light custom accents get
+/// dark text.
+pub fn on_accent(accent: u32) -> Rgba {
+    rgb(on_accent_hex(accent))
+}
+
+pub fn on_accent_hex(accent: u32) -> u32 {
+    if contrast(accent, 0xffffff) >= 3.0 || contrast(accent, 0xffffff) >= contrast(accent, ON_ACCENT_DARK) {
+        0xffffff
+    } else {
+        ON_ACCENT_DARK
+    }
+}
+
 /// Avatar colour: explicit `#rrggbb` from Bot Mode metadata, else a stable hue from the name.
 pub fn avatar_color(hex: Option<u32>, seed: u32) -> Hsla {
     if let Some(h) = hex {
         return rgb(h).into();
     }
     hsla((seed % 360) as f32 / 360.0, 0.55, 0.52, 1.0)
+}
+
+#[cfg(test)]
+mod contrast_tests {
+    use super::*;
+
+    fn hex(c: Rgba) -> u32 {
+        let b = |v: f32| (v * 255.0).round() as u32;
+        (b(c.r) << 16) | (b(c.g) << 8) | b(c.b)
+    }
+
+    #[test]
+    fn faint_text_meets_aa_and_accents_stay_legible() {
+        for p in [Palette::light(DEFAULT_ACCENT), Palette::dark(DEFAULT_ACCENT)] {
+            for bg in [p.bg, p.sidebar] {
+                assert!(contrast(hex(p.faint), hex(bg)) >= 4.5, "faint on {:06x}", hex(bg));
+            }
+        }
+        for &(a, name) in ACCENTS.iter().chain([(0xfacc15, "custom yellow"), (0x0f172a, "custom navy")].iter()) {
+            assert!(contrast(a, on_accent_hex(a)) >= 3.0, "{name}");
+        }
+        assert_eq!(on_accent_hex(0x3b82f6), 0xffffff, "the default blue keeps white text");
+        assert_eq!(on_accent_hex(0xf97316), ON_ACCENT_DARK);
+    }
 }

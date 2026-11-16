@@ -55,3 +55,11 @@ fn history_refresh_merges_instead_of_replacing() {
     assert_eq!(out.last().unwrap().m.id, "c");
     assert!(tail);
 }
+
+#[test]
+fn every_icon_button_has_a_name() {
+    // Each icon used for an icon-only button in the UI gets a tooltip / accessible label.
+    for name in ["x", "arrow-left", "chart-column", "download", "external-link", "eye", "eye-off", "layout-grid", "panel-left", "panel-right", "plus", "search", "settings", "share", "minus", "square", "copy"] {
+        assert_ne!(crate::ui::icon_label(name), "Button", "{name}");
+    }
+}

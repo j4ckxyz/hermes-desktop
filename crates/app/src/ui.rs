@@ -14,14 +14,45 @@ pub fn ico(name: &'static str, size: f32, color: impl Into<Hsla>) -> Svg {
     svg().path(icon(name)).size(px(size)).flex_none().text_color(color.into())
 }
 
-/// Square icon button: 32 px hit target, 16 px glyph, centred on both axes.
+/// What an icon-only button does, for its tooltip and accessible name.
+pub fn icon_label(name: &str) -> &'static str {
+    match name {
+        "x" => "Close",
+        "arrow-left" => "Back",
+        "chart-column" => "Usage",
+        "download" => "Save",
+        "external-link" => "Open",
+        "eye" => "Hide hidden bots",
+        "eye-off" => "Show hidden bots",
+        "layout-grid" => "Apps & Connectors",
+        "panel-left" => "Toggle sidebar",
+        "panel-right" => "Bot info",
+        "plus" => "New bot",
+        "search" => "Search",
+        "settings" => "Settings",
+        "share" => "Share",
+        "minus" => "Minimise",
+        "square" | "copy" => "Maximise",
+        _ => "Button",
+    }
+}
+
+/// Keyboard and screen-reader access for a clickable div: a tab stop (Enter / Space click it),
+/// a visible focus ring, the button role and an accessible name.
+pub fn accessible(el: Stateful<Div>, label: impl Into<SharedString>, pal: &Palette) -> Stateful<Div> {
+    let ring = pal.accent;
+    el.tab_index(0).role(Role::Button).aria_label(label).focus_visible(move |s| s.border_2().border_color(ring))
+}
+
+/// Square icon button: 32 px hit target, 16 px glyph, centred on both axes, with a tooltip.
 pub fn icon_btn(id: impl Into<ElementId>, name: &'static str, pal: &Palette) -> Stateful<Div> {
     icon_btn_sized(id, name, 32., 16., pal)
 }
 
 pub fn icon_btn_sized(id: impl Into<ElementId>, name: &'static str, box_size: f32, glyph: f32, pal: &Palette) -> Stateful<Div> {
     let (hover, pressed) = (pal.hover, pal.pressed);
-    div()
+    let label = icon_label(name);
+    let el = div()
         .id(id.into())
         .size(px(box_size))
         .flex_none()
@@ -32,7 +63,9 @@ pub fn icon_btn_sized(id: impl Into<ElementId>, name: &'static str, box_size: f3
         .cursor_pointer()
         .hover(move |s| s.bg(hover))
         .active(move |s| s.bg(pressed))
-        .child(ico(name, glyph, pal.muted))
+        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(label).build(window, cx))
+        .child(ico(name, glyph, pal.muted));
+    accessible(el, label, pal)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -44,6 +77,8 @@ pub enum Kind {
 }
 
 pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, kind: Kind, pal: &Palette) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    let ring = pal.accent;
     let (bg, fg, border) = match kind {
         Kind::Primary => (pal.accent, pal.on_accent, pal.accent),
         Kind::Secondary => (pal.raised, pal.text, pal.border),
@@ -70,7 +105,11 @@ pub fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, kind: Ki
         .cursor_pointer()
         .when(kind == Kind::Primary, |d| d.hover(|s| s.opacity(0.9)).active(|s| s.opacity(0.78)))
         .when(kind != Kind::Primary, move |d| d.hover(move |s| s.bg(hover)).active(move |s| s.bg(pressed)))
-        .child(label.into())
+        .tab_index(0)
+        .role(Role::Button)
+        .aria_label(label.clone())
+        .focus_visible(move |s| s.border_2().border_color(ring))
+        .child(label)
 }
 
 pub fn chip(id: impl Into<ElementId>, label: impl Into<SharedString>, selected: bool, pal: &Palette) -> Stateful<Div> {
@@ -94,8 +133,13 @@ pub fn chip(id: impl Into<ElementId>, label: impl Into<SharedString>, selected: 
 
 /// A 36×20 switch.
 pub fn toggle(id: impl Into<ElementId>, on: bool, pal: &Palette) -> Stateful<Div> {
+    let ring = pal.accent;
     div()
         .id(id.into())
+        .tab_index(0)
+        .role(Role::Switch)
+        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
+        .focus_visible(move |s| s.border_2().border_color(ring))
         .w(px(36.))
         .h(px(20.))
         .flex_none()
