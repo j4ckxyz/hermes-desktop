@@ -1,0 +1,84 @@
+# Runs the one-line installers from the README on fresh GitHub runners against a published
+# release, then checks the installed binary with --version (no window is opened).
+name: Install test
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to install (e.g. v0.6.1)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    name: install.sh on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04, ubuntu-22.04-arm, macos-14, macos-15]
+    runs-on: ${{ matrix.runner }}
+    env:
+      HERMES_VERSION: ${{ inputs.tag }}
+    steps:
+      - name: Runtime libraries (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxkbcommon0 libxkbcommon-x11-0 \
+            libwayland-client0 libvulkan1 libfontconfig1 libfreetype6 libdbus-1-3 libx11-xcb1 libxcb1
+      - name: Install with the README one-liner
+        run: curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ inputs.tag }}/install.sh" | bash
+      - name: Check the installed app
+        run: |
+          set -eux
+          if [ "$RUNNER_OS" = macOS ]; then
+            BIN=/Applications/Hermes.app/Contents/MacOS/hermes-desktop
+            codesign --verify --deep --strict /Applications/Hermes.app
+            ! xattr -p com.apple.quarantine /Applications/Hermes.app 2>/dev/null
+          else
+            BIN="$HOME/.local/bin/hermes-desktop"
+            test -f "$HOME/.local/share/applications/hermes-desktop.desktop"
+            test -f "$HOME/.local/share/icons/hicolor/256x256/apps/hermes-desktop.png"
+          fi
+          "$BIN" --version | grep -qx "hermes-desktop ${HERMES_VERSION#v}"
+      - name: A tampered download is refused
+        run: |
+          set -u
+          export HERMES_TEST_CORRUPT=1
+          if curl -fsSL "https://raw.githubusercontent.com/${{ github.repository }}/${{ inputs.tag }}/install.sh" | bash; then
+            echo "installer accepted a corrupted archive"; exit 1
+          fi
+
+  windows:
+    name: install.ps1 on windows-latest
+    runs-on: windows-latest
+    env:
+      HERMES_VERSION: ${{ inputs.tag }}
+    steps:
+      - name: Install with the README one-liner
+        shell: pwsh
+        run: irm "https://raw.githubusercontent.com/${{ github.repository }}/${{ inputs.tag }}/install.ps1" | iex
+      - name: Check the installed app
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:LOCALAPPDATA 'Programs\Hermes Desktop\hermes-desktop.exe'
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Hermes Desktop.lnk'
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          if (-not (Test-Path $lnk)) { throw "missing Start Menu shortcut" }
+          $v = (& $exe --version | Out-String).Trim()
+          Write-Host $v
+          if ($v -ne "hermes-desktop $($env:HERMES_VERSION.TrimStart('v'))") { throw "unexpected version '$v'" }
+      - name: A tampered download is refused
+        shell: pwsh
+        run: |
+          $env:HERMES_TEST_CORRUPT = '1'
+          $failed = $false
+          try { irm "https://raw.githubusercontent.com/${{ github.repository }}/${{ inputs.tag }}/install.ps1" | iex } catch { $failed = $true; Write-Host "refused: $_" }
+          if (-not $failed) { throw "installer accepted a corrupted archive" }

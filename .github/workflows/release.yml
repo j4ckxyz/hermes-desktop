@@ -1,0 +1,164 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re)build and publish, e.g. v0.6.1
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  macos:
+    name: macOS (universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Tag matches VERSION
+        run: test "${TAG#v}" = "$(cat VERSION)"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked -p hermes-desktop --target aarch64-apple-darwin
+          cargo build --release --locked -p hermes-desktop --target x86_64-apple-darwin
+      - name: Bundle, ad-hoc sign, package
+        run: |
+          set -eux
+          V="$(cat VERSION)"
+          APP=dist/Hermes.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          lipo -create -output "$APP/Contents/MacOS/hermes-desktop" \
+            target/aarch64-apple-darwin/release/hermes-desktop target/x86_64-apple-darwin/release/hermes-desktop
+          lipo -info "$APP/Contents/MacOS/hermes-desktop"
+          sed "s/__VERSION__/$V/g" packaging/Info.plist > "$APP/Contents/Info.plist"
+          mkdir AppIcon.iconset
+          for s in 16 32 128 256 512; do
+            sips -z $s $s packaging/icon.png --out AppIcon.iconset/icon_${s}x${s}.png >/dev/null
+            sips -z $((s*2)) $((s*2)) packaging/icon.png --out AppIcon.iconset/icon_${s}x${s}@2x.png >/dev/null
+          done
+          iconutil -c icns AppIcon.iconset -o "$APP/Contents/Resources/AppIcon.icns"
+          # Ad-hoc signature: no Apple Developer account. Gatekeeper still asks on first open of a
+          # browser download; install.sh clears the quarantine flag (see README).
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          "$APP/Contents/MacOS/hermes-desktop" --version
+          (cd dist && ditto -c -k --sequesterRsrc --keepParent Hermes.app ../hermes-desktop-macos-universal.zip)
+          mkdir dmg && cp -R "$APP" dmg/ && ln -s /Applications dmg/Applications
+          hdiutil create -volname "Hermes" -srcfolder dmg -ov -format UDZO hermes-desktop-macos-universal.dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: |
+            hermes-desktop-macos-universal.zip
+            hermes-desktop-macos-universal.dmg
+
+  linux:
+    name: Linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, arch: x86_64 }
+          - { runner: ubuntu-22.04-arm, arch: aarch64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo ./scripts/linux-deps.sh
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release --locked -p hermes-desktop
+      - name: Package
+        run: |
+          set -eux
+          D=hermes-desktop
+          mkdir -p "$D"
+          cp target/release/hermes-desktop packaging/hermes-desktop.desktop LICENSE README.md "$D/"
+          cp packaging/icon.png "$D/hermes-desktop.png"
+          "$D/hermes-desktop" --version
+          tar -czf hermes-desktop-linux-${{ matrix.arch }}.tar.gz "$D"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: hermes-desktop-linux-${{ matrix.arch }}.tar.gz
+
+  windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - run: cargo build --release --locked -p hermes-desktop
+      - name: Package
+        shell: pwsh
+        run: |
+          $d = New-Item -ItemType Directory -Force pkg
+          Copy-Item target/release/hermes-desktop.exe, LICENSE, README.md $d
+          $v = (& "$d/hermes-desktop.exe" --version | Out-String).Trim()
+          Write-Host $v
+          if ($v -notlike "hermes-desktop *") { throw "unexpected --version output: '$v'" }
+          Compress-Archive -Path "$d/*" -DestinationPath hermes-desktop-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: hermes-desktop-windows-x86_64.zip
+
+  publish:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums and release notes
+        run: |
+          cd dist
+          sha256sum hermes-desktop-* > SHA256SUMS
+          cat SHA256SUMS
+          cd ..
+          V="${TAG#v}"
+          awk -v v="$V" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
+          printf '\n---\nInstall: see the [README](https://github.com/%s#install). macOS builds are ad-hoc signed (no Apple Developer ID).\n' "$GITHUB_REPOSITORY" >> notes.md
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "Hermes Desktop ${TAG#v}" --notes-file notes.md
+          fi
+
+  install-test:
+    needs: publish
+    uses: ./.github/workflows/install-test.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
