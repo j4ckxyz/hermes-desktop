@@ -57,6 +57,14 @@ struct Inner {
     /// Gated mode (`--basic-auth`): the `basic` provider's account, as on a non-loopback bind.
     basic: Option<(String, String)>,
     login: LoginState,
+    /// stored session → runtime id of the socket it is attached to now (turns follow a resume).
+    attached: HashMap<String, String>,
+    /// stored session → the turn still running (`session.resume.inflight`).
+    inflight: HashMap<String, Value>,
+    /// stored session → unanswered server→client request frames (`open_requests`).
+    open_reqs: HashMap<String, Vec<Value>>,
+    /// Closes every socket (tests: simulate a dropped connection).
+    kill: Option<tokio::sync::broadcast::Sender<()>>,
 }
 
 /// Sign-in bookkeeping for gated mode (shapes of `hermes_cli/dashboard_auth` + `web_server_auth`).
@@ -146,6 +154,10 @@ impl Mock {
             mcp_installed: vec!["filesystem".into()],
             toolsets_off: vec!["image_gen".into()],
             basic: None,
+            attached: HashMap::new(),
+            inflight: HashMap::new(),
+            open_reqs: HashMap::new(),
+            kill: Some(tokio::sync::broadcast::channel(4).0),
             login: LoginState { access_ttl: 12 * 3600, ..Default::default() },
         })))
     }
@@ -166,6 +178,18 @@ impl Mock {
         let mut i = self.0.lock().unwrap();
         i.login.access.clear();
         i.login.refresh.clear();
+    }
+
+    /// Number of canonical "Bot Chat" sessions a profile has (tests).
+    pub fn bot_chats(&self, profile: &str) -> usize {
+        self.0.lock().unwrap().sessions.values().filter(|s| s.profile == profile && s.title == "Bot Chat").count()
+    }
+
+    /// Drop every WebSocket, as a network blip would. Running turns keep going.
+    pub fn drop_sockets(&self) {
+        if let Some(k) = &self.0.lock().unwrap().kill {
+            let _ = k.send(());
+        }
     }
 
     /// (refreshes, password logins) so far.
@@ -483,21 +507,46 @@ fn event(kind: &str, sid: &str, payload: Value) -> String {
 async fn socket(m: Mock, s: WebSocket) {
     let (mut sink, mut stream) = s.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let mut kill_w = m.0.lock().unwrap().kill.as_ref().map(|k| k.subscribe());
     tokio::spawn(async move {
-        while let Some(t) = rx.recv().await {
+        loop {
+            let t = match &mut kill_w {
+                Some(k) => tokio::select! {
+                    t = rx.recv() => t,
+                    _ = k.recv() => {
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                },
+                None => rx.recv().await,
+            };
+            let Some(t) = t else { break };
             if sink.send(Message::Text(t.into())).await.is_err() {
                 break;
             }
         }
     });
     let _ = tx.send(event("gateway.ready", "", json!({"heartbeat": true, "change_events": true, "replay_epoch": "mock"})));
-    while let Some(Ok(msg)) = stream.next().await {
+    let mut kill = m.0.lock().unwrap().kill.as_ref().map(|k| k.subscribe());
+    loop {
+        let next = match &mut kill {
+            Some(k) => tokio::select! {
+                n = stream.next() => n,
+                _ = k.recv() => None,
+            },
+            None => stream.next().await,
+        };
+        let Some(Ok(msg)) = next else { break };
         let Message::Text(t) = msg else { continue };
         let Ok(f) = serde_json::from_str::<Value>(&t) else { continue };
         // A response to one of our server→client requests.
         if f.get("method").is_none() {
             if let Some(id) = f.get("id").and_then(Value::as_str) {
-                if let Some(w) = m.0.lock().unwrap().pending_approvals.remove(id) {
+                let mut i = m.0.lock().unwrap();
+                for v in i.open_reqs.values_mut() {
+                    v.retain(|r| r["id"].as_str() != Some(id));
+                }
+                if let Some(w) = i.pending_approvals.remove(id) {
                     let _ = w.send(f.get("result").cloned().unwrap_or(Value::Null));
                 }
             }
@@ -613,6 +662,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             i.sessions.insert(stored.clone(), Session { profile: profile.clone(), title: String::new(), messages: vec![], last_active: now() });
             i.runtime.insert(rt.clone(), stored.clone());
             i.sinks.insert(rt.clone(), tx.clone());
+            i.attached.insert(stored.clone(), rt.clone());
             Ok(json!({"session_id": rt, "stored_session_id": stored, "info": {"title": "", "model": "mock-model"}, "revision": 1}))
         }
         "session.title" => {
@@ -631,8 +681,14 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             let rt = format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8]);
             i.runtime.insert(rt.clone(), stored.clone());
             i.sinks.insert(rt.clone(), tx.clone());
+            i.attached.insert(stored.clone(), rt.clone());
             let title = i.sessions[&stored].title.clone();
-            Ok(json!({"session_id": rt, "stored_session_id": stored, "running": false, "info": {"title": title, "model": "mock-model"}, "open_requests": []}))
+            let inflight = i.inflight.get(&stored).cloned().unwrap_or(Value::Null);
+            let open: Vec<Value> = i.open_reqs.get(&stored).cloned().unwrap_or_default().into_iter().map(|mut r| {
+                r["params"]["session_id"] = json!(rt);
+                r
+            }).collect();
+            Ok(json!({"session_id": rt, "stored_session_id": stored, "running": !inflight.is_null(), "info": {"title": title, "model": "mock-model"}, "inflight": inflight, "open_requests": open}))
         }
         "session.interrupt" => Ok(json!({"ok": true})),
         "profiles.describe" => {
@@ -770,56 +826,78 @@ fn push_row(m: &Mock, stored: &str, role: &str, content: &str, extra: Value) {
     }
 }
 
-async fn stream_reply(m: &Mock, rt: &str, tx: &mpsc::UnboundedSender<String>, reply: &str, pace: u64) {
+/// Send an event to whichever socket `stored` is attached to now.
+fn emit(m: &Mock, stored: &str, kind: &str, payload: Value) {
+    let i = m.0.lock().unwrap();
+    let Some(rt) = i.attached.get(stored) else { return };
+    if let Some(tx) = i.sinks.get(rt) {
+        let _ = tx.send(event(kind, rt, payload));
+    }
+}
+
+async fn stream_reply(m: &Mock, stored: &str, reply: &str, pace: u64) {
     for chunk in reply.split_inclusive(' ') {
-        let _ = tx.send(event("message.delta", rt, json!({"text": chunk})));
+        if let Some(t) = m.0.lock().unwrap().inflight.get_mut(stored) {
+            let so_far = t["assistant"].as_str().unwrap_or_default().to_owned() + chunk;
+            t["assistant"] = json!(so_far);
+        }
+        emit(m, stored, "message.delta", json!({"text": chunk}));
         if pace > 0 {
             tokio::time::sleep(Duration::from_millis(pace)).await;
         }
     }
-    let _ = m;
 }
 
 async fn run_turn(m: Mock, rt: String, stored: String, text: String, pace: u64) {
-    let Some(tx) = m.0.lock().unwrap().sinks.get(&rt).cloned() else { return };
+    let _ = &rt;
+    m.0.lock().unwrap().inflight.insert(stored.clone(), json!({"user": text, "assistant": "", "streaming": true}));
     let lower = text.to_lowercase();
-    let _ = tx.send(event("message.start", &rt, json!({})));
+    emit(&m, &stored, "message.start", json!({}));
     let mut tool_calls = vec![];
     if lower.contains("search") || lower.contains("look up") {
-        let _ = tx.send(event("tool.start", &rt, json!({"tool_id": "t1", "name": "web_search", "context": "hermes agent gpui", "labels": [{"text": "Searching the web"}]})));
+        emit(&m, &stored, "tool.start", json!({"tool_id": "t1", "name": "web_search", "context": "hermes agent gpui", "labels": [{"text": "Searching the web"}]}));
         tokio::time::sleep(Duration::from_millis(pace * 8)).await;
-        let _ = tx.send(event("tool.complete", &rt, json!({"tool_id": "t1", "name": "web_search", "duration_s": 1.2, "summary": "5 results"})));
+        emit(&m, &stored, "tool.complete", json!({"tool_id": "t1", "name": "web_search", "duration_s": 1.2, "summary": "5 results"}));
         tool_calls.push(json!({"id": "t1", "function": {"name": "web_search"}}));
     }
     if lower.contains("routine") || lower.contains("remind") {
         let args = json!({"action": "create", "name": "News watch", "schedule": "0 8 * * 1-5", "prompt": "Summarise agent news"});
-        let _ = tx.send(event("tool.start", &rt, json!({"tool_id": "cj2", "name": "cronjob", "args": args, "context": "create News watch"})));
+        emit(&m, &stored, "tool.start", json!({"tool_id": "cj2", "name": "cronjob", "args": args, "context": "create News watch"}));
         tokio::time::sleep(Duration::from_millis(pace * 6)).await;
-        let _ = tx.send(event("tool.complete", &rt, json!({"tool_id": "cj2", "name": "cronjob", "duration_s": 0.3, "summary": "job j-news scheduled"})));
+        emit(&m, &stored, "tool.complete", json!({"tool_id": "cj2", "name": "cronjob", "duration_s": 0.3, "summary": "job j-news scheduled"}));
         tool_calls.push(json!({"id": "cj2", "function": {"name": "cronjob", "arguments": args.to_string()}}));
     }
     if lower.contains("delegate") || lower.contains("in parallel") {
         for (n, goal) in ["Survey crates.io for GPUI widgets", "Benchmark idle RAM"].iter().enumerate() {
             let id = format!("sa{n}");
-            let _ = tx.send(event("subagent.start", &rt, json!({"subagent_id": id, "goal": goal, "task_count": 2, "task_index": n})));
-            let _ = tx.send(event("subagent.tool", &rt, json!({"subagent_id": id, "goal": goal, "tool_name": "terminal"})));
+            emit(&m, &stored, "subagent.start", json!({"subagent_id": id, "goal": goal, "task_count": 2, "task_index": n}));
+            emit(&m, &stored, "subagent.tool", json!({"subagent_id": id, "goal": goal, "tool_name": "terminal"}));
         }
         tokio::time::sleep(Duration::from_millis(pace * 12)).await;
         for (n, goal) in ["Survey crates.io for GPUI widgets", "Benchmark idle RAM"].iter().enumerate() {
-            let _ = tx.send(event("subagent.complete", &rt, json!({"subagent_id": format!("sa{n}"), "goal": goal, "status": "completed", "summary": "done"})));
+            emit(&m, &stored, "subagent.complete", json!({"subagent_id": format!("sa{n}"), "goal": goal, "status": "completed", "summary": "done"}));
         }
         tool_calls.push(json!({"id": "d1", "function": {"name": "delegate_task"}}));
     }
     if lower.contains("rm -rf") || lower.contains("dangerous") {
         let (w, r) = tokio::sync::oneshot::channel();
         let id = format!("srq-{}", &uuid::Uuid::new_v4().to_string()[..6]);
-        m.0.lock().unwrap().pending_approvals.insert(id.clone(), w);
-        let _ = tx.send(json!({"jsonrpc": "2.0", "id": id, "method": "approval", "params": {"session_id": rt, "request_id": id, "command": "rm -rf build/", "description": "Delete the build directory"}}).to_string());
+        {
+            let mut i = m.0.lock().unwrap();
+            i.pending_approvals.insert(id.clone(), w);
+            let cur = i.attached.get(&stored).cloned().unwrap_or(rt.clone());
+            let frame = json!({"jsonrpc": "2.0", "id": id, "method": "approval", "params": {"session_id": cur, "request_id": id, "command": "rm -rf build/", "description": "Delete the build directory"}});
+            i.open_reqs.entry(stored.clone()).or_default().push(json!({"id": id, "method": "approval", "params": frame["params"].clone()}));
+            if let Some(tx) = i.sinks.get(&cur) {
+                let _ = tx.send(frame.to_string());
+            }
+        }
         let choice = tokio::time::timeout(Duration::from_secs(120), r).await.ok().and_then(|r| r.ok()).and_then(|v| v["choice"].as_str().map(str::to_owned)).unwrap_or("deny".into());
         let reply = if choice == "deny" { "Okay, I won't run it." } else { "Removed `build/`." };
-        stream_reply(&m, &rt, &tx, reply, pace).await;
+        stream_reply(&m, &stored, reply, pace).await;
         push_row(&m, &stored, "assistant", reply, json!({}));
-        let _ = tx.send(event("message.complete", &rt, json!({"text": reply, "status": "complete"})));
+        m.0.lock().unwrap().inflight.remove(&stored);
+        emit(&m, &stored, "message.complete", json!({"text": reply, "status": "complete"}));
         return;
     }
     let mention = text.find("message_agent target: \"").map(|i| text[i + 23..].split('"').next().unwrap_or("").to_owned());
@@ -835,9 +913,10 @@ async fn run_turn(m: Mock, rt: String, stored: String, text: String, pace: u64) 
         let first = text.lines().next().unwrap_or_default();
         format!("You said: *{}*. This is the mock Hermes streaming a reply word by word so the client can be tested end to end.", first.chars().take(60).collect::<String>())
     };
-    stream_reply(&m, &rt, &tx, &reply, pace).await;
+    stream_reply(&m, &stored, &reply, pace).await;
     push_row(&m, &stored, "assistant", &reply, if tool_calls.is_empty() { json!({}) } else { json!({"tool_calls": tool_calls}) });
-    let _ = tx.send(event("message.complete", &rt, json!({"text": reply, "status": "complete", "usage": {"input": 10, "output": 20}})));
+    m.0.lock().unwrap().inflight.remove(&stored);
+    emit(&m, &stored, "message.complete", json!({"text": reply, "status": "complete", "usage": {"input": 10, "output": 20}}));
     // Bot-to-bot: the teammate's reply comes back into this Bot Chat as an attributed
     // notice and starts a new turn (docs: Bot-to-bot messaging).
     if let Some(target) = mention {
@@ -849,11 +928,11 @@ async fn run_turn(m: Mock, rt: String, stored: String, text: String, pace: u64) 
         let handle = slug(&title);
         let notice = format!("Message from 🤖 {title} (@{handle}): Happy to help, I've picked this up and will report back within the hour.");
         push_row(&m, &stored, "user", &notice, json!({}));
-        let _ = tx.send(event("message.start", &rt, json!({"text": notice})));
+        emit(&m, &stored, "message.start", json!({"text": notice}));
         let r2 = format!("{title} confirmed they're on it.");
-        stream_reply(&m, &rt, &tx, &r2, pace).await;
+        stream_reply(&m, &stored, &r2, pace).await;
         push_row(&m, &stored, "assistant", &r2, json!({}));
-        let _ = tx.send(event("message.complete", &rt, json!({"text": r2, "status": "complete"})));
+        emit(&m, &stored, "message.complete", json!({"text": r2, "status": "complete"}));
     }
 }
 

@@ -142,6 +142,13 @@ struct ConnState {
     by_runtime: HashMap<String, BotKey>,
     last_roster_json: String,
     turn_text: HashMap<String, String>,
+    /// `turn_id` of the turn streaming in each slot (a re-sent `message.start` keeps its text).
+    turn_ids: HashMap<String, String>,
+    /// Bots whose turn was still running when the socket dropped: resumed on `gateway.ready`.
+    resume: HashSet<BotKey>,
+    /// `session.resume`'s `inflight` turn, replayed after history loads (docs: *Rebuilding the
+    /// in-flight turn on reconnect*).
+    inflight: HashMap<String, Value>,
 }
 
 struct State {
@@ -155,6 +162,9 @@ struct Svc {
     store: Arc<Store>,
     ev: async_channel::Sender<Ev>,
     cache_dir: PathBuf,
+    /// One `ensure_live` at a time per bot slot, so concurrent callers can't each create or
+    /// resume a session.
+    opening: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 /// Handle the UI keeps. Dropping it shuts the runtime down.
@@ -170,7 +180,7 @@ impl Service {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("hermes-io").enable_all().build()?;
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Cmd>();
         let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
-        let svc = Svc { st: Arc::new(Mutex::new(State { conns: HashMap::new(), focused: None })), store: store.clone(), ev: ev_tx, cache_dir };
+        let svc = Svc { st: Arc::new(Mutex::new(State { conns: HashMap::new(), focused: None })), store: store.clone(), ev: ev_tx, cache_dir, opening: Default::default() };
         rt.spawn(svc.clone().run(cmd_rx));
         Ok(Service { cmd: cmd_tx, ev: ev_rx, store, _rt: rt })
     }
@@ -404,7 +414,7 @@ impl Svc {
         let id = conn.id.clone();
         if let Some(old) = self.st.lock().unwrap().conns.insert(
             id.clone(),
-            ConnState { conn, gw, rest, ready: Value::Null, roster: cached, live: HashMap::new(), by_runtime: HashMap::new(), last_roster_json: String::new(), turn_text: HashMap::new() },
+            ConnState { conn, gw, rest, ready: Value::Null, roster: cached, live: HashMap::new(), by_runtime: HashMap::new(), last_roster_json: String::new(), turn_text: HashMap::new(), turn_ids: HashMap::new(), resume: HashSet::new(), inflight: HashMap::new() },
         ) {
             old.gw.stop();
         }
@@ -422,48 +432,67 @@ impl Svc {
                 if !matches!(state, LinkState::Connected) {
                     let mut st = self.st.lock().unwrap();
                     if let Some(c) = st.conns.get_mut(conn) {
+                        // Turns that were streaming get resumed on reconnect (their text and any
+                        // pending approvals come back from `session.resume`).
+                        let running: Vec<BotKey> = c.by_runtime.values().filter(|k| c.turn_text.contains_key(&k.slot())).cloned().collect();
+                        c.resume.extend(running);
                         // Runtime session ids die with the socket; reopen lazily.
                         c.live.clear();
                         c.by_runtime.clear();
+                        c.turn_text.clear();
+                        c.turn_ids.clear();
                     }
                 }
                 self.emit(Ev::Link { conn: conn.to_owned(), state });
             }
             Inbound::Ready(payload) => {
-                let focused = {
+                let reopen: Vec<BotKey> = {
                     let mut st = self.st.lock().unwrap();
-                    if let Some(c) = st.conns.get_mut(conn) {
-                        c.ready = payload;
+                    let focused = st.focused.clone().filter(|k| k.conn == conn);
+                    let mut keys: Vec<BotKey> = match st.conns.get_mut(conn) {
+                        Some(c) => {
+                            c.ready = payload;
+                            c.resume.drain().collect()
+                        }
+                        None => vec![],
+                    };
+                    if let Some(f) = focused {
+                        if !keys.contains(&f) {
+                            keys.push(f);
+                        }
                     }
-                    st.focused.clone().filter(|k| k.conn == conn)
+                    keys
                 };
                 tokio::spawn(self.clone().refresh_roster(conn.to_owned()));
-                if let Some(k) = focused {
+                for k in reopen {
                     let s = self.clone();
                     tokio::spawn(async move { s.open_bot(k, false).await });
                 }
             }
             Inbound::Event { kind, session_id, payload } => self.event(conn, &kind, &session_id, payload),
-            Inbound::Request { id, method, params } => {
-                let key = params.get("session_id").and_then(Value::as_str).and_then(|sid| self.key_for(conn, sid));
-                if method == "approval" {
-                    let mut choices: Vec<String> = params.get("choices").and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect()).unwrap_or_default();
-                    if choices.is_empty() {
-                        choices = vec!["once".into(), "session".into(), "always".into(), "deny".into()];
-                    }
-                    self.emit(Ev::Approval {
-                        conn: conn.to_owned(),
-                        key,
-                        request_id: id,
-                        command: params.get("command").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                        description: params.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
-                        choices,
-                    });
-                } else if let Some(gw) = self.gw(conn) {
-                    // Not implemented yet: fail fast so the agent moves on instead of waiting.
-                    gw.respond_error(&id, METHOD_NOT_FOUND, &format!("hermes-desktop does not handle {method} yet"));
-                }
+            Inbound::Request { id, method, params } => self.server_request(conn, id, &method, &params),
+        }
+    }
+
+    /// A server→client request, live or replayed from `open_requests` after a reconnect.
+    fn server_request(&self, conn: &str, id: String, method: &str, params: &Value) {
+        let key = params.get("session_id").and_then(Value::as_str).and_then(|sid| self.key_for(conn, sid));
+        if method == "approval" {
+            let mut choices: Vec<String> = params.get("choices").and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_owned)).collect()).unwrap_or_default();
+            if choices.is_empty() {
+                choices = vec!["once".into(), "session".into(), "always".into(), "deny".into()];
             }
+            self.emit(Ev::Approval {
+                conn: conn.to_owned(),
+                key,
+                request_id: id,
+                command: params.get("command").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                description: params.get("description").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                choices,
+            });
+        } else if let Some(gw) = self.gw(conn) {
+            // Not implemented: the docs ask hosts to fail fast so the agent moves on.
+            gw.respond_error(&id, METHOD_NOT_FOUND, &format!("hermes-desktop does not handle {method} yet"));
         }
     }
 
@@ -487,11 +516,23 @@ impl Svc {
         let s = |k: &str| p.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
         match kind {
             "message.start" => {
-                {
+                let tid = s("turn_id");
+                let repeat = {
                     let mut st = self.st.lock().unwrap();
-                    if let Some(c) = st.conns.get_mut(conn) {
-                        c.turn_text.insert(key.slot(), String::new());
+                    match st.conns.get_mut(conn) {
+                        Some(c) => {
+                            let same = !tid.is_empty() && c.turn_ids.get(&key.slot()) == Some(&tid) && c.turn_text.contains_key(&key.slot());
+                            if !same {
+                                c.turn_text.insert(key.slot(), String::new());
+                                c.turn_ids.insert(key.slot(), tid.clone());
+                            }
+                            same
+                        }
+                        None => false,
                     }
+                };
+                if repeat {
+                    return; // the same turn announced again: keep what streamed so far
                 }
                 let dk = s("display_kind");
                 // A turn the server started from text we did not type (a bot DM arriving, a
@@ -669,9 +710,18 @@ impl Svc {
 
     /// Find (or create) the canonical Bot Chat and bind it to this socket.
     async fn ensure_live(&self, key: &BotKey) -> Result<(Gateway, String, String), String> {
-        if let Some((gw, rt)) = self.live_of(key) {
+        let bound = || {
+            let (gw, rt) = self.live_of(key)?;
             let stored = self.st.lock().unwrap().conns.get(&key.conn).and_then(|c| c.live.get(&key.slot()).map(|l| l.stored.clone())).unwrap_or_default();
-            return Ok((gw, rt, stored));
+            Some((gw, rt, stored))
+        };
+        if let Some(v) = bound() {
+            return Ok(v);
+        }
+        let gate = self.opening.lock().unwrap().entry(format!("{}\u{0}{}", key.conn, key.slot())).or_default().clone();
+        let _g = gate.lock().await;
+        if let Some(v) = bound() {
+            return Ok(v); // another caller bound it while we waited
         }
         let gw = self.gw(&key.conn).ok_or("Not connected.")?;
         let p = &key.profile;
@@ -706,6 +756,8 @@ impl Svc {
                     .map_err(|e| rpc_msg(&e))?;
                 let rt = r.get("session_id").and_then(Value::as_str).unwrap_or(&stored).to_owned();
                 let st = r.get("stored_session_id").and_then(Value::as_str).map(str::to_owned).unwrap_or(stored);
+                self.bind_live(key, &rt, &st);
+                self.after_resume(key, &r);
                 (rt, st)
             }
             None => self.create_canonical(&gw, p).await?,
@@ -740,6 +792,52 @@ impl Svc {
     }
 
     /// Point this bot's live slot at another runtime session.
+    /// Re-raise `open_requests` and keep `inflight` for `open_bot` to replay after history.
+    fn after_resume(&self, key: &BotKey, r: &Value) {
+        if let Some(t) = r.get("inflight").filter(|v| v.is_object()) {
+            let mut st = self.st.lock().unwrap();
+            if let Some(c) = st.conns.get_mut(&key.conn) {
+                c.inflight.insert(key.slot(), t.clone());
+                if t.get("streaming").and_then(Value::as_bool) == Some(true) {
+                    let so_far = t.get("assistant").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    c.turn_text.insert(key.slot(), so_far);
+                }
+            }
+        }
+        for req in r.get("open_requests").and_then(Value::as_array).into_iter().flatten() {
+            let (Some(id), Some(method)) = (req.get("id").and_then(Value::as_str), req.get("method").and_then(Value::as_str)) else { continue };
+            self.server_request(&key.conn, id.to_owned(), method, req.get("params").unwrap_or(&Value::Null));
+        }
+    }
+
+    /// Replay a resumed in-flight turn with the ordinary turn events.
+    fn replay_inflight(&self, key: &BotKey) {
+        let t = {
+            let mut st = self.st.lock().unwrap();
+            st.conns.get_mut(&key.conn).and_then(|c| c.inflight.remove(&key.slot()))
+        };
+        let Some(t) = t else { return };
+        let s = |k: &str| t.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let (user, assistant, error) = (s("user"), s("assistant"), s("error"));
+        let streaming = t.get("streaming").and_then(Value::as_bool).unwrap_or(false);
+        let dk = s("display_kind");
+        let shown = t.get("display_metadata").and_then(|m| m.get("display_text")).and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| user.clone());
+        if dk != "hidden" && !shown.is_empty() {
+            let role = if dk.is_empty() { Role::User } else { Role::System };
+            self.emit(Ev::Incoming { key: key.clone(), message: ChatMessage::new(format!("inflight-{}", uuid::Uuid::new_v4()), role, shown, Some(now())) });
+        }
+        if !(streaming || !assistant.is_empty() || !error.is_empty()) {
+            return;
+        }
+        self.emit(Ev::TurnStart { key: key.clone() });
+        if !assistant.is_empty() {
+            self.emit(Ev::Delta { key: key.clone(), text: assistant.clone() });
+        }
+        if !streaming {
+            self.emit(Ev::TurnEnd { key: key.clone(), text: assistant, error: Some(if error.is_empty() { "The turn failed.".into() } else { error }) });
+        }
+    }
+
     fn bind_live(&self, key: &BotKey, runtime: &str, stored: &str) {
         let mut st = self.st.lock().unwrap();
         if let Some(c) = st.conns.get_mut(&key.conn) {
@@ -786,7 +884,8 @@ impl Svc {
                     msgs = self.merge_other_sessions(&key, &stored, msgs).await;
                 }
                 let _ = self.store.save_chat(&key, Some(&stored), &msgs);
-                self.emit(Ev::History { key, messages: msgs, cached: false });
+                self.emit(Ev::History { key: key.clone(), messages: msgs, cached: false });
+                self.replay_inflight(&key);
             }
             Err(e) => self.emit(Ev::Error { key: Some(key), message: format!("Couldn't load history: {e}") }),
         }

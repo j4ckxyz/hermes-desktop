@@ -120,6 +120,22 @@ pub struct Approval {
     pub choices: Vec<String>,
 }
 
+impl Approval {
+    /// Shown (and answerable with `/approve`) in this chat: its own bot's approvals, plus ones
+    /// Hermes couldn't tie to a session on the same server.
+    pub fn belongs_to(&self, key: &BotKey) -> bool {
+        match &self.key {
+            Some(k) => k == key,
+            None => self.conn == key.conn,
+        }
+    }
+
+    /// Waiting for a bot that isn't the one on screen (sidebar badge + notification).
+    pub fn waiting_on(&self, bot: &BotKey) -> bool {
+        self.key.as_ref().is_some_and(|k| k.same_bot(bot))
+    }
+}
+
 /// The `/` command popover: matching commands for what follows the slash.
 /// Minimum window size on every platform: the composer, header and one chat column still fit.
 pub const MIN_W: f32 = 560.;
@@ -673,7 +689,8 @@ impl HermesApp {
                 }
             }
             "approve" => {
-                if let Some(id) = self.approvals.first().map(|a| a.request_id.clone()) {
+                let sel = self.selected.clone();
+                if let Some(id) = sel.and_then(|k| self.approvals.iter().find(|a| a.belongs_to(&k)).map(|a| a.request_id.clone())) {
                     self.approve(&id, arg, cx);
                 }
             }
@@ -935,6 +952,21 @@ impl HermesApp {
     fn on_event(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
             Ev::Link { conn, state } => {
+                if state != LinkState::Connected {
+                    // The socket is gone: no turn on it can finish here. Stop the spinners; a
+                    // running turn and its pending approvals come back from `session.resume`.
+                    for (_, chat) in self.chats.iter_mut().filter(|(k, _)| k.conn == conn) {
+                        chat.awaiting = false;
+                        if chat.streaming {
+                            chat.streaming = false;
+                            chat.status = Some("Connection lost, picking the reply back up when Hermes is back…".into());
+                        }
+                        for m in chat.msgs.iter_mut().filter(|m| m.m.streaming) {
+                            m.m.streaming = false;
+                        }
+                    }
+                    self.approvals.retain(|a| a.conn != conn);
+                }
                 // Signed out in Settings: the gateway stops, but what the user needs is "Sign in".
                 let state = if state == LinkState::Stopped && self.svc.store.get_kv(&format!("signedout:{conn}")).as_deref() == Some("1") { LinkState::Unauthorized } else { state };
                 if state == LinkState::Unauthorized && self.links.get(&conn) != Some(&LinkState::Unauthorized) && self.svc.store.get_kv(&format!("signedout:{conn}")).as_deref() != Some("1") {
@@ -977,6 +1009,7 @@ impl HermesApp {
                 chat.msgs = messages.into_iter().map(|m| MsgVm { m, md: None }).collect();
                 chat.loaded = !cached;
                 chat.error = None;
+                chat.status = None;
                 if Some(&key) == self.selected.as_ref() {
                     self.list_count = usize::MAX;
                 }
@@ -1043,7 +1076,18 @@ impl HermesApp {
                 }
             }
             Ev::Approval { conn, key, request_id, command, description, choices } => {
-                self.approvals.push(Approval { conn, key, request_id, command, description, choices });
+                if self.approvals.iter().any(|a| a.request_id == request_id) {
+                    return; // replayed from `open_requests` after a reconnect
+                }
+                let a = Approval { conn, key, request_id, command, description, choices };
+                let on_screen = self.selected.as_ref().is_some_and(|k| a.belongs_to(k)) && self.window_active;
+                if !on_screen {
+                    // Someone is waiting on the user: always say so, even with replies muted.
+                    let who = a.key.as_ref().and_then(|k| self.bot(k)).map(|b| b.title()).unwrap_or_else(|| self.conn_name(&a.conn));
+                    let body = if self.config.prefs.hide_previews { "A command is waiting for your approval.".to_owned() } else { a.command.clone() };
+                    crate::notify::post(&format!("{who} needs approval"), &body, self.config.prefs.sounds);
+                }
+                self.approvals.push(a);
             }
             Ev::ApprovalGone { request_id } => self.approvals.retain(|a| a.request_id != request_id),
             Ev::MediaReady { remote, local } => {
@@ -1421,10 +1465,13 @@ impl HermesApp {
                 true
             }
             "/approve" | "/deny" => {
-                if let Some(id) = self.approvals.first().map(|a| a.request_id.clone()) {
+                // Only this chat's approval: never one from another bot the user can't see.
+                let sel = self.selected.clone();
+                if let Some(id) = sel.and_then(|k| self.approvals.iter().find(|a| a.belongs_to(&k)).map(|a| a.request_id.clone())) {
                     self.approve(&id, if name == "/deny" { "deny" } else { "once" }, cx);
                 } else {
-                    self.show_toast("Nothing is waiting for approval.", false, cx);
+                    let elsewhere = self.approvals.len();
+                    self.show_toast(if elsewhere > 0 { format!("Nothing here is waiting for approval ({elsewhere} waiting in other chats).") } else { "Nothing is waiting for approval.".to_owned() }, false, cx);
                 }
                 true
             }

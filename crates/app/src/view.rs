@@ -206,10 +206,13 @@ impl HermesApp {
         let selected = self.selected.as_ref().is_some_and(|s| s.same_bot(&b.key));
         let unread = self.unread.contains(&b.key);
         let typing = self.chats.iter().any(|(k, c)| k.same_bot(&b.key) && (c.streaming || c.awaiting));
+        let waiting = self.approvals.iter().any(|a| a.waiting_on(&b.key));
         let key = b.key.clone();
         let multi = self.config.connections.len() > 1;
         let hide = self.config.prefs.hide_previews;
-        let preview = if typing {
+        let preview = if waiting {
+            "Waiting for your approval".to_owned()
+        } else if typing {
             "typing…".to_owned()
         } else if hide {
             if unread { "New message".into() } else { format!("@{}", b.handle()) }
@@ -265,10 +268,11 @@ impl HermesApp {
                                     .min_w_0()
                                     .truncate()
                                     .text_size(pal.t(13.))
-                                    .text_color(if typing { pal.accent } else if unread { pal.text } else { pal.muted })
+                                    .text_color(if waiting { pal.warn } else if typing { pal.accent } else if unread { pal.text } else { pal.muted })
                                     .child(if preview.is_empty() { "No messages yet".to_owned() } else { preview }),
                             )
-                            .when(unread, |d| d.child(div().size(px(8.)).flex_none().rounded_full().bg(pal.accent))),
+                            .when(waiting, |d| d.child(ico("shield", 13., pal.warn)))
+                            .when(unread && !waiting, |d| d.child(div().size(px(8.)).flex_none().rounded_full().bg(pal.accent))),
                     ),
             )
     }
@@ -784,7 +788,7 @@ impl HermesApp {
         let error = chat.and_then(|c| c.error.clone());
         let loading = chat.is_none_or(|c| c.msgs.is_empty() && !c.loaded);
         let empty = chat.is_some_and(|c| c.msgs.is_empty() && c.loaded);
-        let approvals: Vec<_> = self.approvals.iter().filter(|a| a.key.as_ref().is_none_or(|k| k == key)).map(|a| (a.request_id.clone(), a.command.clone(), a.description.clone(), a.choices.clone())).collect();
+        let approvals: Vec<_> = self.approvals.iter().filter(|a| a.belongs_to(key)).map(|a| (a.request_id.clone(), a.command.clone(), a.description.clone(), a.choices.clone())).collect();
         let bot = self.bot(key).cloned();
         let is_thread = key.thread.is_some();
         div()

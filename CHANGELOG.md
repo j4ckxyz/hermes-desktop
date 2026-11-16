@@ -24,6 +24,14 @@ Fixes from a full code review (IDs from that review in brackets).
   per download, cleanup on failure, and the exact path chosen in the save dialog is used [M6].
 - Inline images come from `/api/media` (25 MB cap), cached per server, profile and path and
   refreshed after an hour [M7].
+- A dropped connection no longer leaves a chat stuck on "thinking…". The spinner stops, and on
+  reconnect every bot whose turn was running is resumed: the in-progress reply is rebuilt from
+  `session.resume`'s `inflight` and keeps streaming, and pending approvals come back from
+  `open_requests` [H3].
+- `/approve` and `/deny` only answer the chat on screen. An approval waiting in another chat
+  raises a notification and a "Waiting for your approval" badge in the sidebar [H5].
+- Opening a bot is single-flight, so concurrent opens can't create two Bot Chat sessions [M3].
+- A repeated `message.start` for the same `turn_id` no longer wipes the text streamed so far.
 
 ## [0.5.0] - 2026-11-16
 

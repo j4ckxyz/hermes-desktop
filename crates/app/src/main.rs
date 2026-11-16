@@ -6,6 +6,8 @@ mod guard;
 mod notify;
 mod onboard;
 mod overlays;
+#[cfg(test)]
+mod tests;
 mod theme;
 mod ui;
 mod view;
