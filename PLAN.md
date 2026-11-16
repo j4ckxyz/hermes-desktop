@@ -130,6 +130,8 @@ crates/
 
 ## 5. Milestones
 
+Status (v0.1.0): M1 and M2 are done. M3 is done except for download progress UI. From M4, create bot, hide/unhide and approvals are done; clarify prompts, sections UI and avatar upload are still open. M5 has not started.
+
 1. **M1, a running app.** Connection settings with the keychain. The roster sidebar (avatar,
    name, preview, unread). A canonical Bot Chat with live streaming, markdown and code
    highlighting. Composer with + attach, drag-and-drop and paste. Tool-activity and subagent
