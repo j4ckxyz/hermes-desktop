@@ -185,12 +185,15 @@ impl Bot {
     /// One-line preview of the latest message, with an agent-notice prefix replaced by the
     /// sender's name.
     pub fn preview(&self) -> String {
-        let pick = match (&self.canonical, &self.last_session) {
+        let has = |s: &&SessionSummary| s.preview.as_ref().is_some_and(|p| !p.trim().is_empty());
+        let c = self.canonical.as_ref().filter(has);
+        let l = self.last_session.as_ref().filter(has);
+        let pick = match (c, l) {
             (Some(c), Some(l)) if l.last_active.unwrap_or(0.0) > c.last_active.unwrap_or(0.0) => Some(l),
             (Some(c), _) => Some(c),
-            (None, l) => l.as_ref(),
+            (None, l) => l,
         };
-        let raw = pick.and_then(|s| s.preview.clone()).unwrap_or_default();
+        let raw = strip_inline_md(&pick.and_then(|s| s.preview.clone()).unwrap_or_default());
         let line = match parse_agent_notice(&raw) {
             Some(n) => format!("🤖 {}: {}", n.name, n.body),
             None => raw,
@@ -245,6 +248,11 @@ pub fn slug(s: &str, hyphen: bool) -> String {
         }
     }
     out
+}
+
+/// Drop inline Markdown markers so previews read as plain text.
+pub fn strip_inline_md(s: &str) -> String {
+    s.chars().filter(|c| !matches!(c, '*' | '`' | '_' | '#' | '>')).collect()
 }
 
 pub fn one_line(s: &str, max: usize) -> String {
