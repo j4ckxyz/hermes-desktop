@@ -288,7 +288,9 @@ impl Svc {
             }
             Cmd::MarkRead(key) => {
                 let la = s.bot(&key).map(|b| b.last_active()).unwrap_or(0.0);
-                let _ = s.store.set_seen(&key, la.max(now()));
+                // Watermarks are in the server's clock (its `last_active`), never ours: a skewed
+                // local clock would otherwise hide new replies or keep old ones unread.
+                let _ = s.store.set_seen(&key, la);
                 s.st.lock().unwrap().focused = Some(key);
             }
             Cmd::Download { key, remote, dest, save_as, open } => {
@@ -652,15 +654,12 @@ impl Svc {
                 }
                 let status = s("status");
                 let error = p.get("error").and_then(Value::as_str).map(str::to_owned).filter(|e| !e.is_empty()).or_else(|| (status == "error").then(|| "The turn failed.".to_owned()));
-                let focused = self.st.lock().unwrap().focused.clone();
                 // The app decides whether to alert (it knows if the window has focus).
                 if !transcript::is_silent(&text) && !text.is_empty() {
                     let title = self.bot(&key).map(|b| b.title()).unwrap_or_else(|| key.profile.clone());
                     self.emit(Ev::Notify { key: key.clone(), title, body: roster::one_line(&text, 140) });
                 }
-                if focused.as_ref() == Some(&key) {
-                    let _ = self.store.set_seen(&key, now() + 1.0);
-                }
+                // The focused bot's watermark follows its server activity in `unread_of`.
                 self.emit(Ev::TurnEnd { key, text, error });
                 tokio::spawn(self.clone().refresh_roster(conn.to_owned()));
             }
@@ -686,7 +685,13 @@ impl Svc {
                 None => {
                     let _ = self.store.set_seen(&b.key, la);
                 }
-                Some(seen) if la > seen + 0.5 && focused.as_ref() != Some(&b.key) => {
+                // On screen: read up to the server's latest activity.
+                Some(seen) if focused.as_ref() == Some(&b.key) => {
+                    if la > seen {
+                        let _ = self.store.set_seen(&b.key, la);
+                    }
+                }
+                Some(seen) if la > seen + 0.5 => {
                     out.insert(b.key.clone());
                 }
                 _ => {}
@@ -1098,7 +1103,6 @@ impl Svc {
             params["attachments"] = Value::Array(attachments);
         }
         gw.call("prompt.submit", params).await.map_err(|e| e.message)?;
-        let _ = self.store.set_seen(&key, now());
         Ok(())
     }
 
