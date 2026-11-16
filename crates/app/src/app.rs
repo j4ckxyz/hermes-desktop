@@ -370,7 +370,7 @@ pub struct HermesApp {
     pub toast: Option<(SharedString, bool)>,
     toast_gen: u64,
     pub media: HashMap<String, PathBuf>,
-    media_requested: HashSet<String>,
+    pub media_requested: HashSet<String>,
     pub approvals: Vec<Approval>,
     /// Long-break refreshes requested and not yet confirmed: chat → seconds away.
     pub gap_pending: HashMap<BotKey, f64>,

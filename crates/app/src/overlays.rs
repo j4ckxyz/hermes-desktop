@@ -879,8 +879,17 @@ impl HermesApp {
                 .into_any_element(),
         };
         let seed = it.id.bytes().fold(11u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-        let logo: AnyElement = match (&it.logo_url, it.kind) {
-            (Some(url), _) => img(url.clone()).size(px(40.)).rounded(px(10.)).flex_none().into_any_element(),
+        // Logos are fetched by the service (HTTPS, size cap, no credentials) and drawn from the
+        // local cache; the letter tile shows until then or if the fetch fails.
+        let logo_file = it.logo_url.as_ref().and_then(|url| {
+            let f = self.media.get(url).cloned();
+            if f.is_none() && self.media_requested.insert(url.clone()) {
+                self.svc.send(hermes_core::Cmd::FetchLogo { url: url.clone() });
+            }
+            f
+        });
+        let logo: AnyElement = match (logo_file, it.kind) {
+            (Some(file), _) => img(file).size(px(40.)).rounded(px(10.)).flex_none().into_any_element(),
             (None, AppKind::Toolset) => tile_icon_lg("wrench", &pal).into_any_element(),
             (None, AppKind::Skill) => tile_icon_lg("sparkles", &pal).into_any_element(),
             (None, AppKind::Mcp) => tile_icon_lg("plug", &pal).into_any_element(),

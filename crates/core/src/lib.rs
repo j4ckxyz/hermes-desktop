@@ -9,6 +9,7 @@ pub mod auth;
 pub mod conn;
 pub mod files;
 pub mod gateway;
+pub mod logos;
 pub mod rest;
 pub mod roster;
 pub mod slash;

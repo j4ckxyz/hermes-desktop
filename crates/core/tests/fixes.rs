@@ -197,3 +197,21 @@ fn a_message_that_starts_with_a_path_is_sent_as_text() {
     });
     assert!(full.contains("/etc/hosts is empty"), "{full}");
 }
+
+#[test]
+fn logos_are_capped_typed_and_cached() {
+    let (rt, _m, url) = mock();
+    let dir = tmpdir("logo");
+    let ok = format!("{url}/static/logos/ok.png");
+    let p = rt.block_on(hermes_core::logos::fetch_with(&dir, &ok, false)).unwrap();
+    assert!(std::fs::read(&p).unwrap().starts_with(b"\x89PNG"));
+    assert!(rt.block_on(hermes_core::logos::fetch_with(&dir, &format!("{url}/static/logos/big.png"), false)).is_err(), "over the cap");
+    assert!(rt.block_on(hermes_core::logos::fetch_with(&dir, &format!("{url}/static/logos/page.png"), false)).is_err(), "not an image");
+    // Production fetches refuse plain http outright.
+    assert!(rt.block_on(hermes_core::logos::fetch(&dir, &format!("{url}/static/logos/x.png"))).is_err());
+    // Cached copies are served without the network.
+    drop(_m);
+    assert_eq!(rt.block_on(hermes_core::logos::fetch(&dir, &ok)).unwrap(), p);
+    assert!(no_parts(p.parent().unwrap()));
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -61,6 +61,8 @@ pub enum Cmd {
     Download { key: BotKey, remote: String, dest: Option<PathBuf>, save_as: Option<PathBuf>, open: bool },
     /// Fetch an image for inline display (cached on disk).
     FetchMedia { key: BotKey, remote: String },
+    /// A connector logo from the catalog; answered with `Ev::MediaReady { remote: url, .. }`.
+    FetchLogo { url: String },
     Approve { conn: String, request_id: String, choice: String },
     /// Any official gateway method, answered with `Ev::Rpc { tag }`. Used by the Apps page, bot
     /// settings and the thread list, whose wire shapes live in `apps.rs` / `roster.rs`.
@@ -318,6 +320,14 @@ impl Svc {
                     match fetched.await {
                         Ok(()) => s.emit(Ev::MediaReady { remote, local: file }),
                         Err(e) => log::warn!("media {remote}: {e}"),
+                    }
+                });
+            }
+            Cmd::FetchLogo { url } => {
+                tokio::spawn(async move {
+                    match crate::logos::fetch(&s.cache_dir, &url).await {
+                        Ok(local) => s.emit(Ev::MediaReady { remote: url, local }),
+                        Err(e) => log::debug!("{e}"),
                     }
                 });
             }

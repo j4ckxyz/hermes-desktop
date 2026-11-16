@@ -238,6 +238,7 @@ impl Mock {
             .route("/api/chat/image-upload", post(image_upload))
             .route("/api/files/download", get(download))
             .route("/api/media", get(media))
+            .route("/static/logos/{name}", get(logo))
             .route("/v1/capabilities", get(capabilities))
             .route("/health", get(|| async { Json(json!({"status": "ok"})) }))
             .with_state(self.clone())
@@ -497,6 +498,17 @@ async fn download(State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<S
     match m.0.lock().unwrap().files.get(&p) {
         Some(b) => ([("content-type", "application/octet-stream")], b.clone()).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// A third-party logo host for the logo fetcher tests (not a Hermes endpoint).
+async fn logo(axum::extract::Path(name): axum::extract::Path<String>) -> Response {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n-tiny-";
+    match name.as_str() {
+        "ok.png" => ([(axum::http::header::CONTENT_TYPE, "image/png")], PNG.to_vec()).into_response(),
+        "big.png" => ([(axum::http::header::CONTENT_TYPE, "image/png")], vec![0u8; 2 * 1024 * 1024]).into_response(),
+        "page.png" => ([(axum::http::header::CONTENT_TYPE, "text/html")], b"<script>".to_vec()).into_response(),
+        _ => axum::http::StatusCode::NOT_FOUND.into_response(),
     }
 }
 
