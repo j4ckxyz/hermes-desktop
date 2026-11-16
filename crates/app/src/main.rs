@@ -2,6 +2,7 @@
 
 mod app;
 mod assets;
+mod chrome;
 mod guard;
 mod notify;
 mod onboard;
@@ -78,7 +79,8 @@ fn main() {
         let bounds = Bounds::centered(None, size(px(1180.), px(780.)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions { title: Some("Hermes".into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(16.))) }),
+            titlebar: Some(chrome::titlebar_options()),
+            window_decorations: chrome::window_decorations(),
             // Small enough for a side-by-side half screen; below ~760 px the sidebar steps aside.
             window_min_size: Some(size(px(app::MIN_W), px(app::MIN_H))),
             ..Default::default()

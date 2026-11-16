@@ -1484,7 +1484,7 @@ impl Render for HermesApp {
             self.show_toast(msg, true, cx);
         }
         let started = self.frame_stats.is_some().then(std::time::Instant::now);
-        let el = self.render_root(window, cx);
+        let el = crate::chrome::wrap(self.render_root(window, cx), window, &self.pal);
         if let (Some(t), Some(v)) = (started, self.frame_stats.as_mut()) {
             v.push(t.elapsed().as_secs_f64() * 1000.0);
         }
