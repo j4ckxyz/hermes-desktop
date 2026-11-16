@@ -23,6 +23,9 @@ impl HermesApp {
         if self.apps.is_some() {
             v.push(self.render_apps(cx).into_any_element());
         }
+        if self.usage.is_some() {
+            v.push(self.render_usage(cx).into_any_element());
+        }
         if self.palette.is_some() {
             v.push(self.render_palette(cx).into_any_element());
         }
@@ -311,6 +314,27 @@ impl HermesApp {
             Section::Chat => body.child(
                 group("COMPOSER", &pal).child(pref_toggle!("c-enter", "Enter to send", if p.enter_to_send { "Shift+Enter adds a new line." } else { "Enter adds a new line; Cmd/Ctrl+Enter sends." }, enter_to_send)),
             )
+            .child({
+                use hermes_core::conn::GapAction;
+                let ga = p.gap_action;
+                let gh = p.gap_hours;
+                let action_items: Vec<(SharedString, bool, Handler)> = [(GapAction::Off, "Keep going"), (GapAction::Compact, "Compact"), (GapAction::Fresh, "New session")]
+                    .into_iter()
+                    .map(|(a, l)| (SharedString::from(l), ga == a, self.pref_handler(move |p| p.gap_action = a, cx)))
+                    .collect();
+                let hour_items: Vec<(SharedString, bool, Handler)> = [1u32, 3, 6, 12, 24]
+                    .into_iter()
+                    .map(|h| (SharedString::from(if h == 24 { "1 day".to_owned() } else { format!("{h}h") }), gh == h, self.pref_handler(move |p| p.gap_hours = h, cx)))
+                    .collect();
+                let desc = match ga {
+                    GapAction::Off => "Always continue with the full context. Uses the most tokens.",
+                    GapAction::Compact => "Hermes summarises the older context before your next message (session.compress). Same session.",
+                    GapAction::Fresh => "Your next message starts a new Bot Chat session. Earlier sessions stay in the stream.",
+                };
+                group("ONE CONTINUOUS CHAT PER BOT", &pal)
+                    .child(row("After a long break", desc, &pal).child(segmented("gap-action", action_items, &pal)))
+                    .when(ga != GapAction::Off, |d| d.child(row("A long break is", "Time since the bot's last message.", &pal).child(segmented("gap-hours", hour_items, &pal))))
+            })
             .child(
                 group("MESSAGES", &pal)
                     .child(pref_toggle!("c-md", "Render Markdown", "Formatting, links, tables and highlighted code blocks.", render_markdown))
@@ -331,10 +355,22 @@ impl HermesApp {
                 .child(group("PREVIEWS", &pal).child(pref_toggle!("f-prev", "Inline image previews", "Show images bots send right in the chat.", image_previews)))
                 .child(group("LIMITS", &pal).child(row("Uploads", "Images up to 25 MB, other files up to 256 MB (Hermes' limits). Big files are read off the UI thread.", &pal)))
             }
-            Section::Shortcuts => body.child(group("KEYBOARD", &pal).children(SHORTCUTS.iter().map(|(k, d)| {
-                div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child(*d).child(kbd(if k.ends_with("-1") { keys(k) + "–9" } else { keys(k) }, &pal))
+            Section::Shortcuts => body.child(group("KEYBOARD", &pal).children(SHORTCUTS.iter().map(|(bindings, d)| {
+                let label = |k: &str| if k.ends_with("-1") { keys(k) + "–9" } else { keys(k) };
+                div()
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .border_t_1()
+                    .border_color(pal.border)
+                    .text_size(pal.t(13.))
+                    .child(div().min_w_0().truncate().child(*d))
+                    .child(div().flex().flex_none().gap(px(4.)).children(bindings.iter().map(|k| kbd(label(k), &pal))))
             }))
             .child(div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child("Send / new line").child(div().flex().gap(px(4.)).child(kbd("↩", &pal)).child(kbd("⇧↩", &pal))))
+            .child(div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child("Slash commands").child(kbd("/", &pal)))
             .child(div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child("Mention a bot").child(kbd("@", &pal)))),
             Section::Privacy => body
                 .child(group("PRIVACY", &pal).child(pref_toggle!("p-prev", "Hide message previews", "In the sidebar, palette and notifications.", hide_previews)))
@@ -387,6 +423,280 @@ impl HermesApp {
             let f = f.clone();
             this.set_pref(move |p| f(p), window, cx)
         }))
+    }
+
+    // ---- usage ---------------------------------------------------------------------------------
+
+    fn render_usage(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        use hermes_core::usage::{fmt_cost, fmt_count, merge_daily, Totals, Usage};
+        let pal = self.pal;
+        let u = self.usage.as_ref().unwrap();
+        let (days, sel) = (u.days, u.bot.clone());
+        let loading = u.loading(&self.bots);
+        // Per-bot results, in roster order.
+        let rows: Vec<(hermes_core::roster::Bot, Result<Usage, String>)> = self.bots.iter().filter_map(|b| u.data.get(&b.key.base()).map(|r| (b.clone(), r.clone()))).collect();
+        let shown: Vec<&Usage> = rows.iter().filter(|(b, _)| sel.as_ref().is_none_or(|k| b.key.same_bot(k))).filter_map(|(_, r)| r.as_ref().ok()).collect();
+        let mut totals = Totals::default();
+        for x in &shown {
+            totals.add(&x.totals);
+        }
+        let daily = merge_daily(&shown);
+        let mut models: Vec<(String, Totals)> = vec![];
+        for x in &shown {
+            for m in &x.by_model {
+                match models.iter_mut().find(|(n, _)| *n == m.model) {
+                    Some((_, t)) => t.add(&m.t),
+                    None => models.push((m.model.clone(), m.t.clone())),
+                }
+            }
+        }
+        models.sort_by_key(|(_, t)| -t.tokens());
+        let errors: Vec<(String, String)> = rows.iter().filter_map(|(b, r)| r.as_ref().err().map(|e| (b.title(), e.clone()))).collect();
+        let any_actual = shown.iter().any(|x| x.totals.actual_cost > 0.0);
+
+        // Daily series over the whole range (quiet days are zero).
+        let today = chrono::Local::now().date_naive();
+        let series: Vec<(String, i64)> = (0..days as i64)
+            .rev()
+            .map(|d| {
+                let day = (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+                let v = daily.iter().find(|x| x.day == day).map(|x| x.t.tokens()).unwrap_or(0);
+                (day, v)
+            })
+            .collect();
+        let peak = series.iter().map(|(_, v)| *v).max().unwrap_or(0).max(1);
+
+        let range_items: Vec<(SharedString, bool, Handler)> = [7u32, 30, 90]
+            .into_iter()
+            .map(|d| {
+                let h: Handler = Box::new(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(u) = &mut this.usage {
+                        u.days = d;
+                    }
+                    this.reload_usage(cx);
+                }));
+                (SharedString::from(format!("{d} days")), days == d, h)
+            })
+            .collect();
+
+        let tile = |label: &'static str, value: String, sub: String| {
+            div()
+                .flex_1()
+                .min_w(px(120.))
+                .p(px(12.))
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .rounded(px(12.))
+                .bg(pal.raised)
+                .border_1()
+                .border_color(pal.border)
+                .child(div().text_size(pal.t(12.)).text_color(pal.muted).child(label))
+                .child(div().text_size(pal.t(22.)).font_weight(FontWeight::SEMIBOLD).text_color(pal.text).child(value))
+                .child(div().text_size(pal.t(11.)).text_color(pal.faint).truncate().child(sub))
+        };
+
+        let mut chips = div().flex().flex_wrap().gap(px(8.)).child(chip("u-all", "All bots", sel.is_none(), &pal).on_click(cx.listener(|this, _, _, cx| {
+            if let Some(u) = &mut this.usage {
+                u.bot = None;
+            }
+            cx.notify();
+        })));
+        for b in &self.bots {
+            if b.hidden() && !self.show_hidden {
+                continue;
+            }
+            let k = b.key.base();
+            let on = sel.as_ref().is_some_and(|s| s.same_bot(&k));
+            chips = chips.child(chip(SharedString::from(format!("u-{}-{}", k.conn, k.profile)), b.title(), on, &pal).on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(u) = &mut this.usage {
+                    u.bot = Some(k.clone());
+                }
+                cx.notify();
+            })));
+        }
+
+        let chart = div()
+            .h(px(172.))
+            .p(px(12.))
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .rounded(px(12.))
+            .bg(pal.raised)
+            .border_1()
+            .border_color(pal.border)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(pal.t(11.))
+                    .text_color(pal.faint)
+                    .child(format!("Tokens per day · peak {}", fmt_count(peak)))
+                    .child(if loading { "Loading…".to_owned() } else { String::new() }),
+            )
+            .child(div().flex_1().flex().items_end().gap(px(if days > 60 { 1. } else { 2. })).children(series.iter().map(|(_, v)| {
+                let h = if *v == 0 { 2.0 } else { 4.0 + 88.0 * (*v as f32 / peak as f32) };
+                div().flex_1().h(px(h)).rounded_t(px(2.)).bg(if *v == 0 { pal.border } else { pal.accent })
+            })))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .text_size(pal.t(11.))
+                    .text_color(pal.faint)
+                    .child(series.first().map(|(d, _)| short_day(d)).unwrap_or_default())
+                    .child(series.last().map(|(d, _)| short_day(d)).unwrap_or_default()),
+            );
+
+        // Per-bot breakdown (All bots) or per-model (one bot).
+        let all_tokens = rows.iter().filter_map(|(_, r)| r.as_ref().ok()).map(|x| x.totals.tokens()).sum::<i64>().max(1);
+        let table_head = |cols: [&'static str; 4]| {
+            div()
+                .h(px(28.))
+                .flex()
+                .items_center()
+                .gap(px(8.))
+                .text_size(pal.t(11.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(pal.faint)
+                .child(div().flex_1().child(cols[0]))
+                .child(div().w(px(84.)).flex().justify_end().child(cols[1]))
+                .child(div().w(px(72.)).flex().justify_end().child(cols[2]))
+                .child(div().w(px(72.)).flex().justify_end().child(cols[3]))
+        };
+        let table = if sel.is_none() {
+            let mut sorted: Vec<&(hermes_core::roster::Bot, Result<Usage, String>)> = rows.iter().collect();
+            sorted.sort_by_key(|(_, r)| -r.as_ref().map(|x| x.totals.tokens()).unwrap_or(-1));
+            div().flex().flex_col().child(section_label("BY BOT", &pal)).child(table_head(["Bot", "Tokens", "Cost", "Requests"])).children(sorted.into_iter().map(|(b, r)| {
+                let k = b.key.base();
+                let t = r.as_ref().map(|x| x.totals.clone()).unwrap_or_default();
+                let share = t.tokens() as f32 / all_tokens as f32;
+                div()
+                    .id(SharedString::from(format!("ub-{}-{}", k.conn, k.profile)))
+                    .h(px(44.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .border_t_1()
+                    .border_color(pal.border)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(pal.hover))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(u) = &mut this.usage {
+                            u.bot = Some(k.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(avatar_for(Some(b), &b.name, 24.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(div().text_size(pal.t(13.)).truncate().child(b.title()))
+                                    .child(div().h(px(4.)).w_full().rounded_full().bg(pal.border).child(div().h_full().w(relative(share.clamp(0.0, 1.0))).rounded_full().bg(pal.accent))),
+                            ),
+                    )
+                    .child(div().w(px(84.)).flex().justify_end().text_size(pal.t(13.)).child(match r {
+                        Ok(_) => fmt_count(t.tokens()),
+                        Err(_) => "—".into(),
+                    }))
+                    .child(div().w(px(72.)).flex().justify_end().text_size(pal.t(13.)).text_color(pal.muted).child(if r.is_ok() { fmt_cost(t.cost()) } else { "—".into() }))
+                    .child(div().w(px(72.)).flex().justify_end().text_size(pal.t(13.)).text_color(pal.muted).child(if r.is_ok() { fmt_count(t.requests) } else { "—".into() }))
+            }))
+        } else {
+            div().flex().flex_col().child(section_label("BY MODEL", &pal)).child(table_head(["Model", "Tokens", "Cost", "Requests"])).children(models.iter().map(|(name, t)| {
+                div()
+                    .h(px(40.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .border_t_1()
+                    .border_color(pal.border)
+                    .text_size(pal.t(13.))
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(div().w(px(84.)).flex().justify_end().child(fmt_count(t.tokens())))
+                    .child(div().w(px(72.)).flex().justify_end().text_color(pal.muted).child(fmt_cost(t.cost())))
+                    .child(div().w(px(72.)).flex().justify_end().text_color(pal.muted).child(fmt_count(t.requests)))
+            }))
+        };
+
+        let title = match &sel {
+            Some(k) => self.bot(k).map(|b| b.title()).unwrap_or_default(),
+            None => "All bots".into(),
+        };
+        let cost_sub = if any_actual { "Provider-reported".to_owned() } else { "Estimated".to_owned() };
+        let body = div()
+            .id("usage-body")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px(px(24.))
+            .pb(px(24.))
+            .flex()
+            .flex_col()
+            .gap(px(16.))
+            .child(div().flex().items_center().justify_between().gap(px(12.)).flex_wrap().child(div().text_size(pal.t(15.)).font_weight(FontWeight::SEMIBOLD).child(title)).child(segmented("u-range", range_items, &pal)))
+            .child(chips)
+            .child(if loading && shown.is_empty() {
+                div().flex().gap(px(12.)).children((0..4).map(|i| div().flex_1().child(skeleton(SharedString::from(format!("usk-{i}")), relative(1.).into(), 84., &pal)))).into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(12.))
+                    .child(tile("Tokens", fmt_count(totals.tokens()), format!("{} in · {} out", fmt_count(totals.input_tokens), fmt_count(totals.output_tokens))))
+                    .child(tile("Cost", fmt_cost(totals.cost()), cost_sub))
+                    .child(tile("Requests", fmt_count(totals.requests), "Model API calls".into()))
+                    .child(tile("Sessions", fmt_count(totals.sessions), format!("Last {days} days")))
+                    .into_any_element()
+            })
+            .child(chart)
+            .child(table)
+            .when(!errors.is_empty(), |d| {
+                d.child(div().flex().flex_col().gap(px(4.)).children(errors.iter().map(|(b, e)| {
+                    div().flex().items_center().gap(px(8.)).text_size(pal.t(12.)).text_color(pal.muted).child(ico("circle-alert", 14., pal.warn)).child(format!("{b}: {e}"))
+                })))
+            })
+            .child(
+                div()
+                    .text_size(pal.t(11.))
+                    .text_color(pal.faint)
+                    .child("From Hermes' session store (GET /api/analytics/usage), per bot profile. Not available from Hermes: per-message cost, live rate limits (usage.bars needs a Nous account), and real cost for providers that don't report it, which is shown as an estimate."),
+            );
+
+        self.dismiss_scrim("usage-scrim", cx).child(
+            sheet(760., &pal)
+                .h(px(660.))
+                .max_h(relative(0.92))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .h(px(64.))
+                        .flex_none()
+                        .px(px(24.))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .child(tile_icon("chart-column", &pal))
+                        .child(div().flex_1().flex().flex_col().child(div().text_size(pal.t(16.)).font_weight(FontWeight::SEMIBOLD).child("Usage")).child(div().text_size(pal.t(12.)).text_color(pal.muted).child("Tokens, cost, requests and sessions per bot")))
+                        .child(icon_btn("u-close", "x", &pal).on_click(cx.listener(|this, _, _, cx| {
+                            this.usage = None;
+                            cx.notify();
+                        }))),
+                )
+                .child(body),
+        )
     }
 
     // ---- apps -----------------------------------------------------------------------------------
@@ -697,6 +1007,9 @@ impl HermesApp {
 fn act_icon(a: Act) -> &'static str {
     match a {
         Act::NewBot => "plus",
+        Act::Usage => "chart-column",
+        Act::Pin => "pin",
+        Act::Sidebar => "panel-left",
         Act::Settings => "settings",
         Act::Apps => "layout-grid",
         Act::Info => "panel-right",
@@ -751,4 +1064,9 @@ fn app_card_skeleton(i: usize, pal: &Palette) -> impl IntoElement {
         .gap(px(12.))
         .child(div().size(px(40.)).rounded(px(10.)).bg(pal.skeleton))
         .child(div().flex_1().flex().flex_col().gap(px(8.)).child(skeleton(SharedString::from(format!("ak-a{i}")), relative(0.4).into(), 12., pal)).child(skeleton(SharedString::from(format!("ak-b{i}")), relative(0.8).into(), 10., pal)))
+}
+
+/// "2026-11-16" → "16 Nov".
+fn short_day(d: &str) -> String {
+    chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").map(|x| x.format("%-d %b").to_string()).unwrap_or_else(|_| d.to_owned())
 }

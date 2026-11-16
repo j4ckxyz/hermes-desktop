@@ -10,7 +10,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::conn::{ConnKind, Connection, Endpoint, Secrets};
+use crate::conn::{ConnKind, Connection, Endpoint, GapAction, Secrets};
 use crate::gateway::{Gateway, Inbound, LinkState, RpcError, METHOD_NOT_FOUND};
 use crate::rest::Rest;
 use crate::roster::{self, Bot, BotKey, BOT_CHAT_TITLE, UI_META_KEY};
@@ -49,7 +49,8 @@ pub enum Cmd {
     Disconnect(String),
     /// Focus a bot: open its canonical Bot Chat and load history.
     OpenBot(BotKey),
-    Send { key: BotKey, text: String, files: Vec<LocalFile> },
+    /// `refresh` applies the long-break policy before the prompt (see `conn::GapAction`).
+    Send { key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction> },
     Stop(BotKey),
     MarkRead(BotKey),
     /// Download an agent-produced file; `open` opens it with the OS when done.
@@ -63,6 +64,8 @@ pub enum Cmd {
     CreateBot { conn: String, name: String, title: String, description: String },
     SetMeta { key: BotKey, patch: Value },
     RefreshRoster,
+    /// `GET /api/analytics/usage` for one profile (or the default store), answered with `Ev::Rpc`.
+    Usage { conn: String, profile: Option<String>, days: u32, tag: String },
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +88,8 @@ pub enum Ev {
     Notify { key: BotKey, title: String, body: String },
     Error { key: Option<BotKey>, message: String },
     Info { message: String },
+    /// Output of a slash command run through `slash.exec` (or why it could not run).
+    Slash { key: BotKey, command: String, output: String, error: bool },
     Rpc { tag: String, conn: String, result: Result<Value, String> },
 }
 
@@ -182,9 +187,9 @@ impl Svc {
                 s.st.lock().unwrap().focused = Some(key.clone());
                 tokio::spawn(async move { s.open_bot(key, true).await });
             }
-            Cmd::Send { key, text, files } => {
+            Cmd::Send { key, text, files, refresh } => {
                 tokio::spawn(async move {
-                    if let Err(m) = s.send(key.clone(), text, files).await {
+                    if let Err(m) = s.send(key.clone(), text, files, refresh).await {
                         s.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: Some(m) });
                     }
                 });
@@ -256,6 +261,15 @@ impl Svc {
                     if let Err(m) = s.set_meta(&key, patch).await {
                         s.emit(Ev::Error { key: Some(key), message: m });
                     }
+                });
+            }
+            Cmd::Usage { conn, profile, days, tag } => {
+                tokio::spawn(async move {
+                    let result = match s.rest(&conn) {
+                        Some(rest) => rest.usage(profile.as_deref(), days).await.map_err(|e| e.to_string()),
+                        None => Err("Not connected.".into()),
+                    };
+                    s.emit(Ev::Rpc { tag, conn, result });
                 });
             }
             Cmd::RefreshRoster => {
@@ -613,8 +627,15 @@ impl Svc {
                 let st = r.get("stored_session_id").and_then(Value::as_str).map(str::to_owned).unwrap_or(stored);
                 (rt, st)
             }
-            None => {
-                // Bot is born: create its forever-chat (official createCanonicalChat shape).
+            None => self.create_canonical(&gw, p).await?,
+        };
+        self.bind_live(key, &runtime, &stored);
+        Ok((gw, runtime, stored))
+    }
+
+    /// Create a canonical Bot Chat (official createCanonicalChat shape): a hidden session titled
+    /// "Bot Chat". Used when a bot is born and when a long break starts a fresh session.
+    async fn create_canonical(&self, gw: &Gateway, p: &str) -> Result<(String, String), String> {
                 let r = gw
                     .call(
                         "session.create",
@@ -634,17 +655,29 @@ impl Svc {
                             .await;
                     }
                 }
-                (rt, st)
-            }
-        };
-        {
-            let mut st = self.st.lock().unwrap();
-            if let Some(c) = st.conns.get_mut(&key.conn) {
-                c.by_runtime.insert(runtime.clone(), key.clone());
-                c.live.insert(key.slot(), Live { stored: stored.clone(), runtime: runtime.clone() });
-            }
+        Ok((rt, st))
+    }
+
+    /// Point this bot's live slot at another runtime session.
+    fn bind_live(&self, key: &BotKey, runtime: &str, stored: &str) {
+        let mut st = self.st.lock().unwrap();
+        if let Some(c) = st.conns.get_mut(&key.conn) {
+            c.by_runtime.insert(runtime.to_owned(), key.clone());
+            c.live.insert(key.slot(), Live { stored: stored.to_owned(), runtime: runtime.to_owned() });
         }
-        Ok((gw, runtime, stored))
+    }
+
+    /// `session.compress`, falling back to `session.mutate compress` where the shared gateway
+    /// refuses the former (docs: gateway method ledger).
+    async fn compress(&self, gw: &Gateway, sid: &str, p: &str, focus: Option<&str>) -> Result<(), String> {
+        let r = gw.call_timeout("session.compress", json!({"session_id": sid, "focus_topic": focus, "profile": p}), Duration::from_secs(300)).await;
+        let r = match r {
+            Err(e) if e.code == METHOD_NOT_FOUND || e.code == -32602 => {
+                gw.call_timeout("session.mutate", json!({"session_id": sid, "request_id": uuid::Uuid::new_v4().to_string(), "operation": "compress", "payload": {"focus": focus}, "profile": p}), Duration::from_secs(300)).await
+            }
+            other => other,
+        };
+        r.map(|_| ()).map_err(|e| e.message)
     }
 
     async fn open_bot(&self, key: BotKey, from_cache: bool) {
@@ -665,7 +698,12 @@ impl Svc {
         let Some(rest) = self.rest(&key.conn) else { return };
         match rest.messages(&stored, &key.profile, 120).await {
             Ok(rows) => {
-                let msgs = transcript::from_history(&rows);
+                let mut msgs = transcript::from_history(&rows);
+                // One continuous stream per bot: fold in its other stored sessions (CLI, messaging,
+                // earlier Bot Chats) so the UI reads like a single conversation.
+                if key.thread.is_none() {
+                    msgs = self.merge_other_sessions(&key, &stored, msgs).await;
+                }
                 let _ = self.store.save_chat(&key, Some(&stored), &msgs);
                 self.emit(Ev::History { key, messages: msgs, cached: false });
             }
@@ -673,29 +711,112 @@ impl Svc {
         }
     }
 
-    async fn send(&self, key: BotKey, text: String, files: Vec<LocalFile>) -> Result<(), String> {
-        let (gw, sid, _) = self.ensure_live(&key).await?;
+    /// The bot's other recent sessions (`session.list {profile}` plus each one's stored messages),
+    /// merged by time with the canonical chat. Sessions from other surfaces get a small marker
+    /// row so the stream says where they came from. Read-only: nothing on the server changes.
+    async fn merge_other_sessions(&self, key: &BotKey, canonical: &str, mut msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        const MAX_SESSIONS: usize = 12;
+        let (Some(gw), Some(rest)) = (self.gw(&key.conn), self.rest(&key.conn)) else { return msgs };
+        let Ok(r) = gw.call("session.list", json!({"profile": key.profile, "limit": MAX_SESSIONS + 1, "include_hidden": true})).await else { return msgs };
+        let rows = r.get("sessions").or_else(|| r.get("rows")).or(Some(&r)).and_then(Value::as_array).cloned().unwrap_or_default();
+        let wanted: Vec<(String, String, String)> = rows
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("resolved_id").or_else(|| row.get("session_id")).or_else(|| row.get("id")).and_then(Value::as_str)?;
+                let s = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+                (id != canonical).then(|| (id.to_owned(), s("title"), s("source")))
+            })
+            .take(MAX_SESSIONS)
+            .collect();
+        // Fetch concurrently so opening a bot stays quick.
+        let fetched = futures_util::future::join_all(wanted.iter().map(|(id, _, _)| rest.messages(id, &key.profile, 60))).await;
+        let mut extra = Vec::new();
+        for ((id, title, source), hist) in wanted.into_iter().zip(fetched) {
+            let Ok(hist) = hist else { continue };
+            let part = transcript::from_history(&hist);
+            let Some(first_ts) = part.iter().find_map(|m| m.timestamp) else { continue };
+            // Earlier canonical chats need no marker: they are the same conversation.
+            if title != BOT_CHAT_TITLE {
+                let label = match (title.is_empty(), source.is_empty()) {
+                    (false, false) => format!("{title} · from {source}"),
+                    (false, true) => title.clone(),
+                    (true, false) => format!("Conversation from {source}"),
+                    (true, true) => "Earlier conversation".to_owned(),
+                };
+                extra.push(ChatMessage::new(format!("sess-{id}"), Role::System, label, Some(first_ts - 0.001)));
+            }
+            extra.extend(part);
+        }
+        if !extra.is_empty() {
+            msgs.extend(extra);
+            msgs.sort_by(|a, b| a.timestamp.unwrap_or(0.0).total_cmp(&b.timestamp.unwrap_or(0.0)));
+        }
+        msgs
+    }
+
+    async fn send(&self, key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction>) -> Result<(), String> {
+        let (gw, mut sid, _) = self.ensure_live(&key).await?;
         let p = key.profile.clone();
         // /new and /reset would fork the forever-chat: compact instead (docs: Bot Mode).
         if files.is_empty() {
             if let Some(cmd) = roster::rewrite_bot_chat_command(&text) {
                 let focus = cmd.strip_prefix("/compact").map(str::trim).filter(|s| !s.is_empty());
-                let r = gw.call_timeout("session.compress", json!({"session_id": sid, "focus_topic": focus, "profile": p}), Duration::from_secs(300)).await;
-                let r = match r {
-                    Err(e) if e.code == METHOD_NOT_FOUND || e.code == -32602 => {
-                        gw.call_timeout("session.mutate", json!({"session_id": sid, "request_id": uuid::Uuid::new_v4().to_string(), "operation": "compress", "payload": {"focus": focus}, "profile": p}), Duration::from_secs(300)).await
-                    }
-                    other => other,
-                };
-                return match r {
-                    Ok(_) => {
+                return match self.compress(&gw, &sid, &p, focus).await {
+                    Ok(()) => {
                         self.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: None });
                         self.emit(Ev::Info { message: "Bot Chat compacted: fresh working context, same conversation.".into() });
                         Ok(())
                     }
-                    Err(e) => Err(format!("Couldn't compact: {}", e.message)),
+                    Err(m) => Err(format!("Couldn't compact: {m}")),
                 };
             }
+            // Any other slash command runs through the official `slash.exec` (docs: *Shared
+            // authority local slash commands*). Skills come back as a message to submit.
+            if let Some(cmd) = text.trim().strip_prefix('/').filter(|c| !c.is_empty() && !c.starts_with('/')) {
+                let command = format!("/{cmd}");
+                let name = command.split_whitespace().next().unwrap_or(&command).to_owned();
+                match gw.call_timeout("slash.exec", json!({"session_id": sid, "command": command, "profile": p}), Duration::from_secs(120)).await {
+                    Ok(r) if r.get("type").and_then(Value::as_str) == Some("skill") => {
+                        let msg = r.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
+                        if msg.is_empty() {
+                            return Err(format!("{name} returned nothing to send."));
+                        }
+                        return Box::pin(self.send(key, msg, vec![], refresh)).await;
+                    }
+                    Ok(r) => {
+                        let out = r.get("output").and_then(Value::as_str).map(str::to_owned).unwrap_or_else(|| r.to_string());
+                        self.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: None });
+                        self.emit(Ev::Slash { key, command: name, output: out, error: false });
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        let why = if e.code == METHOD_NOT_FOUND {
+                            "This Hermes doesn't run slash commands for desktop clients (slash.exec).".to_owned()
+                        } else if e.message.contains("unsupported_command") {
+                            format!("Hermes doesn't run {name} from desktop clients. Try it in the CLI or a messaging app.")
+                        } else {
+                            e.message.clone()
+                        };
+                        self.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: None });
+                        self.emit(Ev::Slash { key, command: name, output: why, error: true });
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        // Long break: refresh the working context before this prompt.
+        match refresh {
+            Some(GapAction::Compact) => {
+                if let Err(m) = self.compress(&gw, &sid, &p, None).await {
+                    log::warn!("long-break compaction failed: {m}");
+                }
+            }
+            Some(GapAction::Fresh) if key.thread.is_none() => {
+                let (rt, st) = self.create_canonical(&gw, &p).await?;
+                self.bind_live(&key, &rt, &st);
+                sid = rt;
+            }
+            _ => {}
         }
         let mut text = text;
         let mut attachments = Vec::new();

@@ -135,6 +135,7 @@ impl Mock {
             .route("/api/status", get(status))
             .route("/api/ws", get(ws))
             .route("/api/sessions/{id}/messages", get(messages))
+            .route("/api/analytics/usage", get(usage))
             .route("/api/chat/image-upload", post(image_upload))
             .route("/api/files/download", get(download))
             .route("/api/media", get(media))
@@ -187,6 +188,45 @@ async fn messages(State(m): State<Mock>, h: HeaderMap, Path(id): Path<String>) -
         Some(s) => Json(json!({"session_id": id, "profile": s.profile, "messages": s.messages, "pagination": {"limit": 120, "offset": 0, "order": "latest", "returned": s.messages.len()}})).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// `GET /api/analytics/usage` (shape of `hermes_cli/web_routers/analytics.py`), with
+/// deterministic made-up numbers per profile so the Usage page has something to draw.
+async fn usage(State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
+    if !authed(&m, &h) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let days: i64 = q.get("days").and_then(|d| d.parse().ok()).unwrap_or(30).clamp(1, 365);
+    let profile = q.get("profile").cloned().unwrap_or_else(|| "default".into());
+    let seed = profile.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64));
+    let weight = match profile.as_str() {
+        "default" => 1.0,
+        "coder" => 1.6,
+        "researcher" => 0.7,
+        _ => 0.15,
+    };
+    let today = chrono::Local::now().date_naive();
+    let mut daily = vec![];
+    let (mut ti, mut to, mut tc, mut ts, mut ta) = (0i64, 0i64, 0f64, 0i64, 0i64);
+    for d in (0..days).rev() {
+        let r = (seed.wrapping_mul(d as u64 + 3) >> 7) % 100;
+        if r < 22 {
+            continue; // quiet day
+        }
+        let input = ((r as f64 * 950.0 + 4000.0) * weight) as i64;
+        let output = input / 4;
+        let cost = (input as f64 * 3.0 + output as f64 * 15.0) / 1_000_000.0;
+        let sessions = 1 + (r % 3) as i64;
+        let calls = sessions * (3 + (r % 7) as i64);
+        let day = (today - chrono::Duration::days(d)).format("%Y-%m-%d").to_string();
+        daily.push(json!({"day": day, "input_tokens": input, "output_tokens": output, "cache_read_tokens": input / 3, "reasoning_tokens": 0,
+            "estimated_cost": cost, "actual_cost": 0, "sessions": sessions, "api_calls": calls}));
+        ti += input; to += output; tc += cost; ts += sessions; ta += calls;
+    }
+    let by_model = json!([{"model": "mock-model", "input_tokens": ti, "output_tokens": to, "estimated_cost": tc, "sessions": ts, "api_calls": ta}]);
+    Json(json!({"daily": daily, "by_model": by_model, "by_task": [], "period_days": days, "skills": [], "tools": [],
+        "totals": {"total_input": ti, "total_output": to, "total_cache_read": ti / 3, "total_reasoning": 0, "total_estimated_cost": tc,
+            "total_actual_cost": 0, "total_sessions": ts, "total_api_calls": ta}})).into_response()
 }
 
 async fn image_upload(State(m): State<Mock>, h: HeaderMap, Json(body): Json<Value>) -> Response {
@@ -443,6 +483,33 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             }
             let enabled: Vec<&str> = TOOLSETS.iter().map(|t| t.0).filter(|n| !i.toolsets_off.iter().any(|x| x == n)).collect();
             Ok(json!({"changed": p["names"], "enabled_toolsets": enabled, "missing_servers": [], "reset": false, "unknown": []}))
+        }
+        "commands.catalog" => {
+            let session = vec![json!(["/status", "Show session, model, token, and context info"]), json!(["/new", "Start a new session (fresh session ID + history)"]),
+                json!(["/compress", "Manually compress conversation context"]), json!(["/title", "Set a title for the current session"]), json!(["/retry", "Retry the last message (resend to agent)"])];
+            let info = vec![json!(["/help", "Show available commands"]), json!(["/usage", "Show token usage and rate limits for the current session"]),
+                json!(["/version", "Show Hermes version"]), json!(["/whoami", "Show your identity and access on this surface"])];
+            let config = vec![json!(["/model", "Switch model (session-scoped; --global to persist)"]), json!(["/personality", "Set a predefined personality"])];
+            let mut pairs: Vec<Value> = session.iter().chain(info.iter()).chain(config.iter()).cloned().collect();
+            pairs.push(json!(["/arxiv", "Search and summarise arXiv papers"]));
+            Ok(json!({"pairs": pairs, "canon": {}, "sub": {}, "commands": {"/model": {"argument_mode": "mixed", "desktop": "hidden"}},
+                "categories": [{"name": "Session", "pairs": session}, {"name": "Info", "pairs": info}, {"name": "Configuration", "pairs": config}],
+                "skills": {"/arxiv": {"usage": 3, "origin": "hub"}}, "skill_count": 1, "warning": "", "plugin_discovery_error": "", "plugin_commands": {}}))
+        }
+        "slash.exec" => {
+            let cmd = p["command"].as_str().unwrap_or_default().trim().to_owned();
+            let name = cmd.split_whitespace().next().unwrap_or_default();
+            let rt = p["session_id"].as_str().unwrap_or_default();
+            let stored = i.runtime.get(rt).cloned().unwrap_or_default();
+            let n = i.sessions.get(&stored).map(|s| s.messages.len()).unwrap_or(0);
+            match name {
+                "/status" => Ok(json!({"type": "exec", "output": format!("Session {stored}\nModel: mock-model (mock)\nMessages: {n}\nContext: 4,210 / 200,000 tokens (2%)")})),
+                "/version" => Ok(json!({"type": "exec", "output": "Hermes Agent (mock)"})),
+                "/whoami" => Ok(json!({"type": "exec", "output": "Local owner · session:read session:control session:submit"})),
+                "/help" | "/commands" => Ok(json!({"type": "exec", "output": "/status  /version  /whoami  /title  /help\nType / in the composer to see everything."})),
+                "/arxiv" => Ok(json!({"type": "skill", "name": "arxiv", "message": format!("Use the arxiv skill: {}", cmd.trim_start_matches("/arxiv").trim()), "display": cmd})),
+                _ => Err((4090, format!("unsupported_command: {name} is not available over this connection"))),
+            }
         }
         "skills.manage" => Ok(json!({"skills": {"research": ["arxiv", "paper_notes"], "software": ["git_workflow", "code_review"]}})),
         "session.compress" => {

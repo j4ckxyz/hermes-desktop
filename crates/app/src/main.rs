@@ -55,12 +55,15 @@ fn main() {
                     MenuItem::action("New Bot", app::NewBot),
                     MenuItem::action("Apps & Connectors", app::OpenApps),
                     MenuItem::action("Bot Info", app::ToggleInfo),
+                    MenuItem::action("Pin / Unpin Bot", app::TogglePin),
+                    MenuItem::action("Usage", app::OpenUsage),
                     MenuItem::separator(),
                     MenuItem::action("Next Bot", app::NextBot),
                     MenuItem::action("Previous Bot", app::PrevBot),
                 ],
                 disabled: false,
             },
+            Menu { name: "View".into(), items: vec![MenuItem::action("Toggle Sidebar", app::ToggleSidebar), MenuItem::action("Focus Composer", app::FocusComposer)], disabled: false },
             Menu {
                 name: "Chat".into(),
                 items: vec![MenuItem::action("Attach Files…", app::AttachFiles), MenuItem::action("Copy Conversation", app::CopyConversation), MenuItem::action("Stop Reply", app::StopTurn)],
@@ -71,7 +74,8 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions { title: Some("Hermes".into()), appears_transparent: true, traffic_light_position: Some(point(px(16.), px(16.))) }),
-            window_min_size: Some(size(px(720.), px(480.))),
+            // Small enough for a side-by-side half screen; below ~760 px the sidebar steps aside.
+            window_min_size: Some(size(px(app::MIN_W), px(app::MIN_H))),
             ..Default::default()
         };
         let service = std::rc::Rc::new(service);

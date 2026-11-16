@@ -16,14 +16,27 @@ Settings window (servers, appearance, notifications, chat, files, shortcuts, pri
 and an **Apps & Connectors** page built on Hermes' official connector, MCP, toolset and skill
 catalogs. More screenshots are in [docs/screenshots](docs/screenshots).
 
-| Shortcut | Action |
+Each bot is **one continuous chat**: all of its Hermes sessions (CLI, Telegram, Bot Chat…) are
+merged into a single stream with date dividers, and after a long break Hermes compacts the
+context (or starts a fresh session) behind the scenes to save tokens. Pin bots to the top, type
+`/` for every Hermes slash command with arguments and descriptions, and open **Usage** (next to
+your name) for tokens, cost, requests and sessions per bot.
+
+| Shortcut (Ctrl on Windows/Linux) | Action |
 |---|---|
-| ⌘K / Ctrl+K | Command palette |
+| ⌘K | Command palette and search |
 | ⌘N | New bot |
-| ⌘, | Settings |
+| ⌘1–9 | Jump to bot (hold ⌘ to see the numbers; pinned bots come first) |
+| ⇧⌘] / ⇧⌘[ (or ⌃Tab / ⌃⇧Tab) | Next / previous bot |
+| ⇧⌘P | Pin or unpin the bot |
+| ⌘B | Show or hide the sidebar (remembered) |
+| ⌘L | Focus the message box |
+| ⌘I | Bot info & threads |
 | ⇧⌘A | Apps & Connectors |
-| ⌘I | Bot info |
-| ⌘1–9, ⌥⌘↑/↓ | Jump to / next / previous bot |
+| ⇧⌘U | Usage |
+| ⌘, | Settings |
+| ⌘U / ⇧⌘C / ⇧⌘. | Attach files / copy conversation / stop reply |
+| / and @ | Slash commands / mention a bot |
 | Esc | Close the top overlay |
 
 ## Connect

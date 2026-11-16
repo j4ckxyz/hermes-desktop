@@ -120,7 +120,7 @@ mod tests {
         let s = Store::memory().unwrap();
         let row = serde_json::json!({"name":"a","ui_meta":{"hermes-bots":{"title":"A"}}});
         let b = Bot::from_row("c", "Mac", &row).unwrap();
-        s.save_roster("c", &[b.clone()]).unwrap();
+        s.save_roster("c", std::slice::from_ref(&b)).unwrap();
         assert_eq!(s.load_rosters(), vec![b.clone()]);
         let m = vec![ChatMessage::new("1", Role::User, "hi", Some(1.0))];
         s.save_chat(&b.key, Some("sess"), &m).unwrap();

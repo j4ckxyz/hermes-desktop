@@ -81,7 +81,7 @@ fn roster_chat_stream_mentions_files_compact() {
     assert!(matches!(&msgs[5].role, Role::Agent(n) if n.name == "Research Buddy"));
 
     // Stream a reply with tool activity.
-    svc.send(Cmd::Send { key: key.clone(), text: "please search for gpui".into(), files: vec![] });
+    svc.send(Cmd::Send { key: key.clone(), text: "please search for gpui".into(), files: vec![], refresh: None });
     let mut deltas = String::new();
     let mut saw_tool = false;
     let end = wait(&svc, 10, |e| match e {
@@ -103,7 +103,7 @@ fn roster_chat_stream_mentions_files_compact() {
 
     // @mention: note appended for message_agent, and the teammate's reply comes back as an
     // attributed agent notice.
-    svc.send(Cmd::Send { key: key.clone(), text: "ask @research-buddy about memory".into(), files: vec![] });
+    svc.send(Cmd::Send { key: key.clone(), text: "ask @research-buddy about memory".into(), files: vec![], refresh: None });
     let notice = wait(&svc, 10, |e| match e {
         Ev::Incoming { message, .. } => match &message.role {
             Role::Agent(n) => Some(n.clone()),
@@ -124,7 +124,7 @@ fn roster_chat_stream_mentions_files_compact() {
     let txt = dir.join("notes.txt");
     std::fs::write(&txt, "hello").unwrap();
     let files = vec![LocalFile::from_path(png).unwrap(), LocalFile::from_path(txt).unwrap()];
-    svc.send(Cmd::Send { key: key.clone(), text: "see attached".into(), files });
+    svc.send(Cmd::Send { key: key.clone(), text: "see attached".into(), files, refresh: None });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { error: None, .. }).then_some(()));
     let sent = mock.messages_of("default");
     let u = sent.iter().rev().find(|m| m["role"] == "user").unwrap();
@@ -132,7 +132,7 @@ fn roster_chat_stream_mentions_files_compact() {
     assert!(u["attachments"][0]["path"].as_str().unwrap().starts_with("/home/hermes/uploads/"));
 
     // /new in a Bot Chat compacts instead of forking.
-    svc.send(Cmd::Send { key: key.clone(), text: "/new".into(), files: vec![] });
+    svc.send(Cmd::Send { key: key.clone(), text: "/new".into(), files: vec![], refresh: None });
     wait(&svc, 10, |e| matches!(e, Ev::Info { message } if message.contains("compacted")).then_some(()));
     assert!(mock.messages_of("default").iter().any(|m| m["display_kind"] == "context_compaction"));
 }
@@ -150,7 +150,7 @@ fn creates_bot_chat_and_writes_meta() {
         _ => None,
     });
     assert!(msgs.is_empty());
-    svc.send(Cmd::Send { key: key.clone(), text: "hello".into(), files: vec![] });
+    svc.send(Cmd::Send { key: key.clone(), text: "hello".into(), files: vec![], refresh: None });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { .. }).then_some(()));
     assert_eq!(mock.messages_of("scribe").len(), 2);
 
@@ -186,7 +186,7 @@ fn approval_round_trip() {
     wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
     let key = BotKey::new("m4", "coder");
     svc.send(Cmd::OpenBot(key.clone()));
-    svc.send(Cmd::Send { key: key.clone(), text: "run rm -rf build".into(), files: vec![] });
+    svc.send(Cmd::Send { key: key.clone(), text: "run rm -rf build".into(), files: vec![], refresh: None });
     let (conn, id) = wait(&svc, 10, |e| match e {
         Ev::Approval { conn, request_id, command, .. } => {
             assert_eq!(command, "rm -rf build/");
@@ -265,7 +265,96 @@ fn threads_open_their_own_session() {
     });
     assert!(msgs.iter().any(|m| m.text.contains("bump the version")));
 
-    svc.send(Cmd::Send { key: key.clone(), text: "and after that?".into(), files: vec![] });
+    svc.send(Cmd::Send { key: key.clone(), text: "and after that?".into(), files: vec![], refresh: None });
     wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, .. } if *k == key).then_some(()));
     assert!(mock.messages_of("coder").iter().all(|m| m["content"] != "and after that?"), "the Bot Chat was not touched");
+}
+
+#[test]
+fn one_stream_per_bot_with_gap_refresh() {
+    let (_rt, _mock, url) = mock_rt();
+    let svc = start(&url, "m1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    // Code Monkey has two older sessions (CLI and Telegram) besides its Bot Chat: one stream.
+    let key = BotKey::new("m1", "coder");
+    svc.send(Cmd::OpenBot(key.clone()));
+    let msgs = wait(&svc, 10, |e| match e {
+        Ev::History { key: k, messages, cached: false } if *k == key => Some(messages.clone()),
+        _ => None,
+    });
+    let texts: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
+    assert!(texts.contains(&"Refactor auth · from cli"), "{texts:?}");
+    assert!(texts.contains(&"Deploy checklist · from telegram"), "{texts:?}");
+    assert!(msgs.windows(2).all(|w| w[0].timestamp.unwrap_or(0.0) <= w[1].timestamp.unwrap_or(0.0)), "sorted by time");
+
+    // A long break compacts before the prompt (official session.compress), then the turn runs.
+    svc.send(Cmd::Send { key: key.clone(), text: "back again".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Compact) });
+    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
+    svc.send(Cmd::OpenBot(key.clone()));
+    let msgs = wait(&svc, 10, |e| match e {
+        Ev::History { key: k, messages, cached: false } if *k == key => Some(messages.clone()),
+        _ => None,
+    });
+    assert!(msgs.iter().any(|m| m.role == Role::System && m.text == "Context compacted"));
+
+    // A fresh session keeps the old one in the stream.
+    svc.send(Cmd::Send { key: key.clone(), text: "new day".into(), files: vec![], refresh: Some(hermes_core::conn::GapAction::Fresh) });
+    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
+    svc.send(Cmd::OpenBot(key.clone()));
+    let msgs = wait(&svc, 10, |e| match e {
+        Ev::History { key: k, messages, cached: false } if *k == key => Some(messages.clone()),
+        _ => None,
+    });
+    let users: Vec<&str> = msgs.iter().filter(|m| m.role == Role::User).map(|m| m.text.as_str()).collect();
+    assert!(users.contains(&"back again") && users.contains(&"new day"), "{users:?}");
+}
+
+#[test]
+fn slash_commands_and_usage() {
+    let (_rt, _mock, url) = mock_rt();
+    let svc = start(&url, "m5", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let key = BotKey::new("m5", "default");
+
+    // Live catalog parses and merges with the embedded registry.
+    let cat = rpc(&svc, "commands.catalog", serde_json::json!({"profile": "default"})).unwrap();
+    let live = hermes_core::slash::from_catalog(&cat);
+    assert!(live.iter().any(|c| c.name == "arxiv" && c.category == "Skills"));
+    let all = hermes_core::slash::merged(&live);
+    assert!(all.iter().any(|c| c.name == "sethome"));
+
+    // An exec command comes back as output.
+    svc.send(Cmd::Send { key: key.clone(), text: "/status".into(), files: vec![], refresh: None });
+    let (cmd, out, err) = wait(&svc, 10, |e| match e {
+        Ev::Slash { command, output, error, .. } => Some((command.clone(), output.clone(), *error)),
+        _ => None,
+    });
+    assert_eq!(cmd, "/status");
+    assert!(out.contains("Model: mock-model") && !err);
+
+    // An unsupported one explains itself.
+    svc.send(Cmd::Send { key: key.clone(), text: "/sethome".into(), files: vec![], refresh: None });
+    let (out, err) = wait(&svc, 10, |e| match e {
+        Ev::Slash { output, error, .. } => Some((output.clone(), *error)),
+        _ => None,
+    });
+    assert!(err && out.contains("/sethome"), "{out}");
+
+    // A skill command turns into a normal turn.
+    svc.send(Cmd::Send { key: key.clone(), text: "/arxiv agent memory".into(), files: vec![], refresh: None });
+    let text = wait(&svc, 10, |e| match e {
+        Ev::TurnEnd { key: k, text, error: None } if *k == key && !text.is_empty() => Some(text.clone()),
+        _ => None,
+    });
+    assert!(text.contains("arxiv skill"), "{text}");
+
+    // Usage analytics over the dashboard REST API.
+    svc.send(Cmd::Usage { conn: "m5".into(), profile: Some("coder".into()), days: 30, tag: "u".into() });
+    let v = wait(&svc, 10, |e| match e {
+        Ev::Rpc { tag, result, .. } if tag == "u" => Some(result.clone()),
+        _ => None,
+    })
+    .unwrap();
+    let u = hermes_core::usage::parse(&v);
+    assert!(u.totals.input_tokens > 0 && u.totals.requests > 0 && !u.daily.is_empty());
 }

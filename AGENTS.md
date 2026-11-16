@@ -22,6 +22,8 @@ crates/core   hermes-core: protocol clients (gateway.rs WS JSON-RPC, rest.rs, ap
               transcript.rs (history rows, MEDIA tags), store.rs (SQLite cache),
               conn.rs (config + OS keychain), service.rs (actor: Cmd in, Ev out)
               apps.rs (Apps page: param builders + parsers for connectors/mcp/toolsets/skills)
+              slash.rs + slash_registry.json (slash commands; regenerate with
+              scripts/gen_slash_registry.py <hermes-agent checkout>), usage.rs (Usage page)
 crates/mock   hermes-mock: stand-in backend that follows the documented wire (tests + demos)
 crates/app    hermes-desktop: GPUI binary. app.rs = state, actions, shortcuts, RPC routing;
               view.rs = sidebar, chat, composer, info pane; overlays.rs = palette, settings,
@@ -52,7 +54,11 @@ Dev-only environment variables:
   `send`, `attach:path`, `share`, `hidden`, `newbot`, `setup`, `palette`, `query:text`,
   `settings:<section>`, `apps`, `category:<chip>`, `expand:<app id>`, `info`, `edit`,
   `thread:<session id>`, `theme:system|light|dark`, `size:WxH`, `unfold` (expand every event chip), `approve:<choice>`,
-  `saveas:<remote path>` (download into the demo home without a dialog), `close`) for reproducible demos.
+  `saveas:<remote path>` (download into the demo home without a dialog), `key:<binding>` (dispatch a
+  keystroke, e.g. `key:secondary-2`), `cmdheld[:off]` (show the ⌘ number badges), `usage`,
+  `usagebot:<profile>`, `pin:<profile>`, `sidebar`, `gap:<hours>` (age the chat to trigger the
+  long-break policy), `resizebench:<n>` (resize every frame and log render timings), `close`) for
+  reproducible demos.
 
 ## Rules
 

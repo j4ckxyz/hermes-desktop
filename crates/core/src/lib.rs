@@ -9,6 +9,8 @@ pub mod conn;
 pub mod gateway;
 pub mod rest;
 pub mod roster;
+pub mod slash;
+pub mod usage;
 pub mod service;
 pub mod store;
 pub mod transcript;

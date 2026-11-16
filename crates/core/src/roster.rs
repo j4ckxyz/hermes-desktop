@@ -198,8 +198,10 @@ impl Bot {
     /// The most recent activity, from whichever of the canonical chat and the last session is
     /// newer (as the official Bots plugin computes it).
     pub fn last_active(&self) -> f64 {
-        let a = self.canonical.as_ref().and_then(|s| s.last_active).unwrap_or(0.0);
-        let b = self.last_session.as_ref().and_then(|s| s.last_active).unwrap_or(0.0);
+        // An empty session (just created by opening the bot) is not activity, so viewing a bot
+        // never reorders the sidebar.
+        let act = |s: &Option<SessionSummary>| s.as_ref().filter(|s| s.message_count != Some(0)).and_then(|s| s.last_active).unwrap_or(0.0);
+        let (a, b) = (act(&self.canonical), act(&self.last_session));
         a.max(b)
     }
 

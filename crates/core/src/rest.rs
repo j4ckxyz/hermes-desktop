@@ -53,6 +53,16 @@ impl Rest {
         self.json(self.req(reqwest::Method::GET, "/api/status")).await
     }
 
+    /// `GET /api/analytics/usage?days=&profile=`: daily and per-model tokens, cost, sessions and
+    /// API calls from the profile's session store (source `hermes_cli/web_routers/analytics.py`).
+    pub async fn usage(&self, profile: Option<&str>, days: u32) -> Result<Value> {
+        let mut path = format!("/api/analytics/usage?days={days}");
+        if let Some(p) = profile {
+            path.push_str(&format!("&profile={}", enc(p)));
+        }
+        self.json(self.req(reqwest::Method::GET, &path)).await
+    }
+
     /// Stored history of a session, newest page (source `hermes_cli/web_routers/sessions.py`).
     pub async fn messages(&self, session_id: &str, profile: &str, limit: u32) -> Result<Vec<Value>> {
         let path = format!(

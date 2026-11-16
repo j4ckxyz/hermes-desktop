@@ -33,6 +33,8 @@ fn event_panel(pal: &crate::theme::Palette) -> Div {
 }
 
 pub const SIDEBAR_W: f32 = 280.;
+/// Below this window width the sidebar steps aside (the toggle then shows it as an overlay).
+pub const SIDEBAR_AUTO_HIDE: f32 = 760.;
 pub const INFO_W: f32 = 320.;
 /// Readable line length for the conversation column.
 pub const CONTENT_MAX_W: f32 = 760.;
@@ -78,7 +80,7 @@ pub fn play_sound() {
 }
 
 impl HermesApp {
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&mut self, peek: bool, cx: &mut Context<Self>) -> Div {
         let pal = self.pal;
         let current = self.current_bot().cloned();
         let any_hidden = self.bots.iter().any(|b| b.hidden());
@@ -97,9 +99,11 @@ impl HermesApp {
         };
         let loading = self.bots.is_empty() && !self.config.connections.is_empty();
         let searching = self.searching;
+        let cmd_held = self.cmd_held && !self.any_overlay();
 
         div()
             .w(px(SIDEBAR_W))
+            .when(peek, |d| d.shadow_lg())
             .flex_none()
             .h_full()
             .flex()
@@ -117,7 +121,7 @@ impl HermesApp {
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .child(avatar_for(current.as_ref(), "H", 28.))
+                    .child(icon_btn("sidebar-toggle", "panel-left", &pal).on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx))))
                     .child(div().flex_1().min_w_0().text_size(pal.t(15.)).font_weight(FontWeight::SEMIBOLD).truncate().child(current.as_ref().map(|b| b.title()).unwrap_or_else(|| "Hermes".into())))
                     .child(icon_btn("search", "search", &pal).when(searching, |d| d.bg(pal.selected)).on_click(cx.listener(|this, _, window, cx| {
                         this.searching = !this.searching;
@@ -166,7 +170,7 @@ impl HermesApp {
                     .flex()
                     .flex_col()
                     .gap(px(2.))
-                    .children(rows.into_iter().map(|b| self.render_row(b, cx)))
+                    .children(rows.into_iter().enumerate().map(|(i, b)| self.render_row(b, (cmd_held && i < 9).then_some(i + 1), cx)))
                     .when(loading, |d| d.children((0..5).map(|i| roster_skeleton(i, &pal))))
                     .when(self.config.connections.is_empty(), |d| {
                         d.child(div().p(px(12.)).text_size(pal.t(13.)).text_color(pal.faint).child("Connect to your Hermes to see your bots."))
@@ -219,11 +223,13 @@ impl HermesApp {
                                     ),
                             ),
                     )
+                    .child(icon_btn("usage", "chart-column", &pal).when(self.usage.is_some(), |d| d.bg(pal.selected)).on_click(cx.listener(|this, _, window, cx| this.open_usage(window, cx))))
                     .child(icon_btn("settings", "settings", &pal).on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx)))),
             )
     }
 
-    fn render_row(&mut self, b: Bot, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_row(&mut self, b: Bot, number: Option<usize>, cx: &mut Context<Self>) -> impl IntoElement {
+        let pinned = b.meta.pinned.unwrap_or(false);
         let pal = self.pal;
         let selected = self.selected.as_ref().is_some_and(|s| s.same_bot(&b.key));
         let unread = self.unread.contains(&b.key);
@@ -268,7 +274,12 @@ impl HermesApp {
                             .gap(px(8.))
                             .child(div().flex_1().min_w_0().truncate().text_size(pal.t(14.)).font_weight(if unread { FontWeight::SEMIBOLD } else { FontWeight::MEDIUM }).child(b.title()))
                             .when(multi, |d| d.child(div().flex_none().text_size(pal.t(10.)).text_color(pal.faint).child(b.conn_name.clone())))
-                            .child(div().flex_none().text_size(pal.t(11.)).text_color(if unread { pal.accent } else { pal.faint }).child(fmt_time(Some(b.last_active())))),
+                            .when(pinned && number.is_none(), |d| d.child(ico("pin", 12., pal.faint)))
+                            .child(match number {
+                                // Holding ⌘/Ctrl: the jump number replaces the time.
+                                Some(n) => kbd(keys(&format!("secondary-{n}")), &pal).into_any_element(),
+                                None => div().flex_none().text_size(pal.t(11.)).text_color(if unread { pal.accent } else { pal.faint }).child(fmt_time(Some(b.last_active()))).into_any_element(),
+                            }),
                     )
                     .child(
                         div()
@@ -290,7 +301,7 @@ impl HermesApp {
             )
     }
 
-    fn render_header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&mut self, sidebar_shown: bool, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.pal;
         let bot = self.current_bot().cloned();
         let chat = self.current_chat();
@@ -315,13 +326,15 @@ impl HermesApp {
         div()
             .h(px(TOP_INSET.max(8.) + 32.).max(px(56.)))
             .flex_none()
-            .pl(px(16.))
+            // With the sidebar gone, leave room for the macOS traffic lights.
+            .pl(px(if !sidebar_shown && cfg!(target_os = "macos") { 80. } else { 16. }))
             .pr(px(12.))
             .flex()
             .items_center()
             .gap(px(12.))
             .border_b_1()
             .border_color(pal.border)
+            .when(!sidebar_shown, |d| d.child(icon_btn("sidebar-show", "panel-left", &pal).on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))))
             .when(thread.is_some(), |d| {
                 d.child(icon_btn("back", "arrow-left", &pal).on_click(cx.listener(|this, _, window, cx| this.run_act(Act::BotChat, window, cx))))
             })
@@ -339,20 +352,31 @@ impl HermesApp {
             .when(bot.is_none(), |d| d.child(div().flex_1()))
             .child(icon_btn("apps", "layout-grid", &pal).on_click(cx.listener(|this, _, window, cx| this.open_apps(window, cx))))
             .child(icon_btn("info", "panel-right", &pal).when(self.info_open, |d| d.bg(pal.selected)).on_click(cx.listener(|this, _, window, cx| this.toggle_info(window, cx))))
-            .child(
-                button("share", "Share", Kind::Secondary, &pal)
-                    .child(ico("share", 14., pal.text))
-                    .flex_row_reverse()
-                    .on_click(cx.listener(|this, _, _, cx| this.share(cx))),
-            )
+            .when(compact, |d| d.child(icon_btn("share", "share", &pal).on_click(cx.listener(|this, _, _, cx| this.share(cx)))))
+            .when(!compact, |d| {
+                d.child(
+                    button("share", "Share", Kind::Secondary, &pal)
+                        .child(ico("share", 14., pal.text))
+                        .flex_row_reverse()
+                        .on_click(cx.listener(|this, _, _, cx| this.share(cx))),
+                )
+            })
     }
 
     pub fn render_item(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(key) = self.selected.clone() else { return div().into_any_element() };
         let n = self.chats.get(&key).map(|c| c.msgs.len()).unwrap_or(0);
         let inner = if ix >= n { self.render_footer(&key, window, cx).into_any_element() } else { self.render_message(&key, ix, cx) };
+        // One stream per bot: a subtle divider wherever the day changes.
+        let divider = (ix < n).then(|| {
+            let msgs = &self.chats[&key].msgs;
+            let day = |i: usize| msgs.get(i).and_then(|m| m.m.timestamp).filter(|t| *t > 0.0).and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0)).map(|t| t.with_timezone(&chrono::Local).date_naive());
+            let today = day(ix)?;
+            let prev = (0..ix).rev().find_map(day);
+            (prev != Some(today)).then(|| date_divider(today, &self.pal))
+        });
         // Centre a readable column inside the full-width list.
-        div().w_full().flex().justify_center().child(div().w_full().max_w(px(CONTENT_MAX_W)).child(inner)).into_any_element()
+        div().w_full().flex().justify_center().child(div().w_full().max_w(px(CONTENT_MAX_W)).children(divider.flatten()).child(inner)).into_any_element()
     }
 
     fn render_message(&mut self, key: &BotKey, ix: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -489,7 +513,9 @@ impl HermesApp {
             }
             Role::System => {
                 let lower = m.text.to_lowercase();
-                let icon = if lower.contains("compact") {
+                let icon = if m.id.starts_with("sess-") {
+                    "messages-square"
+                } else if lower.contains("compact") {
                     "history"
                 } else if lower.contains("model") {
                     "sparkles"
@@ -512,6 +538,9 @@ impl HermesApp {
                     "download" => "download",
                     "shield-check" => "shield-check",
                     "shield-x" => "shield-x",
+                    "history" => "history",
+                    "slash" => "slash",
+                    "terminal" => "terminal",
                     _ => "info",
                 };
                 let (text, object) = match m.text.split_once(" · ") {
@@ -871,6 +900,109 @@ impl HermesApp {
             })
     }
 
+    fn render_slash_popup(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let pal = self.pal;
+        let popup = self.slash.as_ref()?;
+        if popup.items.is_empty() {
+            return None;
+        }
+        let sel = popup.sel;
+        let items = popup.items.clone();
+        let mono = cx.theme().mono_font_family.clone();
+        let current = items.get(sel).cloned();
+        // Category headers while browsing ("/"); a filtered list is ranked by match instead.
+        let browsing = self.composer.read(cx).value().trim() == "/";
+        Some(
+            div()
+                .absolute()
+                .bottom_full()
+                .left_0()
+                .mb(px(8.))
+                .w(px(560.))
+                .max_w(relative(1.))
+                .rounded(px(12.))
+                .bg(pal.panel)
+                .border_1()
+                .border_color(pal.border)
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("slash-list")
+                        .max_h(px(296.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.slash_scroll)
+                        .p(px(4.))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .children(items.into_iter().enumerate().map(|(i, c)| {
+                            let c2 = c.clone();
+                            let show_cat = browsing && (i == 0 || self.slash.as_ref().and_then(|p| p.items.get(i - 1)).is_some_and(|p| p.category != c.category));
+                            div()
+                                .flex()
+                                .flex_col()
+                                .when(show_cat, |d| d.child(div().px(px(8.)).child(section_label(c.category.to_uppercase(), &pal))))
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("slash-{}", c.name)))
+                                        .h(px(36.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(8.))
+                                        .px(px(8.))
+                                        .rounded(px(8.))
+                                        .cursor_pointer()
+                                        .when(i == sel, |d| d.bg(pal.selected))
+                                        .hover(move |s| s.bg(pal.hover))
+                                        .on_click(cx.listener(move |this, _, window, cx| this.pick_slash(&c2, true, window, cx)))
+                                        .child(div().flex_none().font_family(mono.clone()).text_size(pal.t(13.)).font_weight(FontWeight::MEDIUM).child(format!("/{}", c.name)))
+                                        .when(!c.args.is_empty(), |d| d.child(div().flex_none().max_w(px(180.)).truncate().font_family(mono.clone()).text_size(pal.t(12.)).text_color(pal.faint).child(c.args.clone())))
+                                        .child(div().flex_1().min_w_0().truncate().text_size(pal.t(12.)).text_color(pal.muted).child(c.description.clone())),
+                                )
+                        })),
+                )
+                .when_some(current, |d, c| {
+                    let mut extra = vec![];
+                    if !c.aliases.is_empty() {
+                        extra.push(format!("Also /{}", c.aliases.join(", /")));
+                    }
+                    if !c.subcommands.is_empty() {
+                        extra.push(format!("Options: {}", c.subcommands.join(", ")));
+                    }
+                    if c.gateway_only {
+                        extra.push("Messaging apps only".into());
+                    }
+                    d.child(
+                        div()
+                            .px(px(12.))
+                            .py(px(8.))
+                            .border_t_1()
+                            .border_color(pal.border)
+                            .bg(pal.raised)
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex()
+                                    .gap(px(6.))
+                                    .text_size(pal.t(12.))
+                                    .child(div().flex_none().font_family(mono.clone()).font_weight(FontWeight::SEMIBOLD).child(format!("/{}", c.name)))
+                                    .when(!c.args.is_empty(), |d| d.child(div().flex_1().min_w_0().truncate().font_family(mono.clone()).text_color(pal.muted).child(c.args.clone()))),
+                            )
+                            .child(div().text_size(pal.t(12.)).text_color(pal.muted).child(c.description.clone()))
+                            .when(!extra.is_empty(), |d| d.child(div().text_size(pal.t(11.)).text_color(pal.faint).child(extra.join(" · "))))
+                            .child(div().pt(px(2.)).flex().gap(px(12.)).text_size(pal.t(11.)).text_color(pal.faint).child("↑↓ choose").child("Tab complete").child("↩ run").child("Esc close")),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
     fn render_composer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let pal = self.pal;
         let busy = self.current_chat().is_some_and(|c| c.streaming || c.awaiting);
@@ -880,14 +1012,27 @@ impl HermesApp {
         let (at, cursor) = self.mention.as_ref().map(|m| (m.at, m.cursor)).unwrap_or((0, 0));
         let view = cx.entity().downgrade();
         let can_send = busy || !self.composer.read(cx).value().trim().is_empty() || !pending.is_empty();
-        let placeholder_bot = self.current_bot().map(|b| b.title()).unwrap_or_default();
-        let _ = placeholder_bot;
+        let slash_popup = self.render_slash_popup(cx);
         div().flex_none().w_full().flex().justify_center().px(px(24.)).pb(px(16.)).pt(px(4.)).child(
             div()
                 .w_full()
                 .max_w(px(CONTENT_MAX_W - 48.))
                 .relative()
                 .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                    if this.slash.is_some() && this.mention.is_none() {
+                        match ev.keystroke.key.as_str() {
+                            "up" => this.move_slash(-1, cx),
+                            "down" => this.move_slash(1, cx),
+                            "tab" => this.complete_slash(false, window, cx),
+                            "escape" => {
+                                this.slash = None;
+                                cx.notify();
+                            }
+                            _ => return,
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
                     if this.mention.is_none() {
                         return;
                     }
@@ -903,6 +1048,8 @@ impl HermesApp {
                     }
                     cx.stop_propagation();
                 }))
+                // Slash command autocomplete.
+                .when_some(slash_popup, |d, p| d.child(p))
                 // @mention autocomplete.
                 .when(!mention_rows.is_empty(), |d| {
                     d.child(
@@ -1123,7 +1270,17 @@ impl HermesApp {
                             div()
                                 .pt(px(12.))
                                 .flex()
+                                .flex_wrap()
+                                .justify_center()
                                 .gap(px(8.))
+                                .child({
+                                    let k = bot.key.clone();
+                                    let pinned = bot.meta.pinned.unwrap_or(false);
+                                    button("info-pin", if pinned { "Unpin" } else { "Pin" }, Kind::Secondary, &pal)
+                                        .child(ico(if pinned { "pin-off" } else { "pin" }, 14., pal.text))
+                                        .flex_row_reverse()
+                                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_pin(&k, cx)))
+                                })
                                 .child(button("info-edit", "Edit", Kind::Secondary, &pal).child(ico("pencil", 14., pal.text)).flex_row_reverse().on_click(cx.listener(|this, _, window, cx| this.start_edit(window, cx))))
                                 .child(button("info-apps", "Apps", Kind::Secondary, &pal).child(ico("layout-grid", 14., pal.text)).flex_row_reverse().on_click(cx.listener(|this, _, window, cx| this.open_apps(window, cx))))
                                 .child(
@@ -1347,6 +1504,17 @@ fn typing_dots(pal: &Palette) -> impl IntoElement {
 
 impl Render for HermesApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let started = self.frame_stats.is_some().then(std::time::Instant::now);
+        let el = self.render_root(window, cx);
+        if let (Some(t), Some(v)) = (started, self.frame_stats.as_mut()) {
+            v.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        el
+    }
+}
+
+impl HermesApp {
+    fn render_root(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let pal = self.pal;
         let view = cx.entity();
         // An empty chat is centred in the pane; anything else is the bottom-anchored list.
@@ -1357,8 +1525,12 @@ impl Render for HermesApp {
             Some(k) => div().id("empty").flex_1().min_h_0().overflow_y_scroll().flex().flex_col().justify_center().items_center().child(div().w_full().max_w(px(CONTENT_MAX_W)).child(self.render_footer(&k, window, cx))).into_any_element(),
             None => list(self.list.clone(), move |ix, window, cx| view.update(cx, |this, cx| this.render_item(ix, window, cx))).flex_1().w_full().into_any_element(),
         };
-        // Narrow windows: the info pane gives way to the conversation.
-        let wide = window.viewport_size().width >= px(SIDEBAR_W + INFO_W + 420.);
+        // Narrow windows: the info pane gives way first, then the sidebar (which can still
+        // be shown as an overlay with the toggle).
+        let sidebar_shown = self.sidebar_visible(window);
+        let peek = !sidebar_shown && self.sidebar_peek;
+        let side_w = if sidebar_shown { SIDEBAR_W } else { 0. };
+        let wide = window.viewport_size().width >= px(side_w + INFO_W + 420.);
         let info = if wide { self.render_info(cx).map(|e| e.into_any_element()) } else { None };
         let overlays = self.render_overlays(window, cx);
         div()
@@ -1385,6 +1557,22 @@ impl Render for HermesApp {
             .on_action(cx.listener(|this, _: &CopyConversation, _, cx| this.share(cx)))
             .on_action(cx.listener(|this, _: &StopTurn, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &AttachFiles, _, cx| this.pick_files(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenUsage, window, cx| this.open_usage(window, cx)))
+            .on_action(cx.listener(|this, _: &TogglePin, _, cx| {
+                if let Some(k) = this.selected.clone() {
+                    this.toggle_pin(&k, cx);
+                }
+            }))
+            // Holding ⌘ (Ctrl elsewhere) shows the 1–9 jump numbers in the sidebar.
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, _, cx| {
+                let held = ev.modifiers.secondary(cx) && !ev.modifiers.shift && !ev.modifiers.alt;
+                if held != this.cmd_held {
+                    this.cmd_held = held;
+                    cx.notify();
+                }
+            }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
                 let k = &ev.keystroke;
                 if k.key == "escape" && this.mention.is_none() && this.close_top(window, cx) {
@@ -1406,8 +1594,8 @@ impl Render for HermesApp {
                 this.dragging = false;
                 this.add_paths(paths.paths(), cx);
             }))
-            .child(self.render_sidebar(cx))
-            .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(self.render_header(cx)).child(messages).child(self.render_composer(cx)))
+            .when(sidebar_shown, |d| d.child(self.render_sidebar(false, cx)))
+            .child(div().flex_1().min_w_0().h_full().flex().flex_col().child(self.render_header(sidebar_shown, window.viewport_size().width < px(side_w + 640.), cx)).child(messages).child(self.render_composer(cx)))
             .children(info)
             .when_some(self.toast.clone(), |d, (msg, err)| {
                 d.child(
@@ -1431,6 +1619,51 @@ impl Render for HermesApp {
                     ),
                 )
             })
+            .when(peek, |d| {
+                d.child(
+                    div()
+                        .id("sidebar-peek")
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .occlude()
+                        .child(self.render_sidebar(true, cx))
+                        .child(div().id("peek-scrim").flex_1().h_full().bg(pal.scrim).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.sidebar_peek = false;
+                                cx.notify();
+                            }),
+                        )),
+                )
+            })
             .children(overlays)
     }
+}
+
+/// "Today", "Yesterday", "Monday" (this week), "Mon 12 Nov" (this year), "12 Nov 2025".
+pub fn day_label(day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let ago = (today - day).num_days();
+    match ago {
+        0 => "Today".into(),
+        1 => "Yesterday".into(),
+        2..=6 => day.format("%A").to_string(),
+        _ if day.year() == today.year() => day.format("%a %-d %b").to_string(),
+        _ => day.format("%-d %b %Y").to_string(),
+    }
+}
+
+fn date_divider(day: chrono::NaiveDate, pal: &crate::theme::Palette) -> Div {
+    let line = || div().flex_1().h(px(1.)).bg(pal.border);
+    div()
+        .px(px(24.))
+        .pt(px(20.))
+        .pb(px(4.))
+        .flex()
+        .items_center()
+        .gap(px(12.))
+        .child(line())
+        .child(div().flex_none().text_size(pal.t(11.)).font_weight(FontWeight::MEDIUM).text_color(pal.faint).child(day_label(day, chrono::Local::now().date_naive())))
+        .child(line())
 }

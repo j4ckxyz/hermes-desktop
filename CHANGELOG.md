@@ -3,6 +3,38 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.4.0] - 2026-11-16
+
+### Added
+- **Keyboard shortcuts**: hold ⌘ (Ctrl on Windows/Linux) to see 1–9 badges on the top bots and
+  press ⌘1–9 to jump. New: ⇧⌘]/⇧⌘[ and ⌃Tab/⌃⇧Tab (next/previous bot), ⇧⌘P (pin), ⌘B (sidebar),
+  ⌘L (focus composer), ⇧⌘U (usage). Settings → Shortcuts lists every binding, plus a View menu.
+- **Pinning**: pin bots from the info pane, the palette or ⇧⌘P. Pinned bots sort first (stored in
+  Bot Mode `ui_meta["hermes-bots"].pinned`) and take the first number shortcuts.
+- **One continuous chat per bot**: all of a bot's sessions merge into one stream with "Today /
+  Yesterday / Mon 12 Nov" dividers and "Title · from telegram" markers. After a long break
+  (Settings → Chat: Keep going / Compact / New session, after 1 h–1 day, default Compact after
+  6 h) the app calls Hermes' `session.compress` or starts a fresh Bot Chat session before sending,
+  with a "Back after 8 hours · context compacted" chip. Mapping in docs/PROTOCOL.md.
+- **Slash commands**: typing `/` opens an autocomplete popover with all 71 gateway commands (from
+  the official registry) plus the bot's live `commands.catalog` (skills), showing category,
+  arguments, aliases and a description. Runs through `slash.exec`; output appears as a chip.
+- **Usage page** (button next to your name, ⇧⌘U, `/usage`): tokens, cost, requests and sessions per
+  bot and per day (7/30/90 days), a daily chart, per-bot and per-model tables, from
+  `GET /api/analytics/usage`. Unavailable data is listed on the page and in PROTOCOL.md.
+- **Collapsible sidebar** (button + ⌘B, remembered). Below 760 px wide it steps aside
+  automatically and the toggle shows it as an overlay.
+
+### Changed
+- Minimum window size is 560×420 on every platform; the info pane, then the sidebar, give way at
+  narrow widths and Share becomes an icon. Measured with `resizebench`: one frame per resize
+  step, view build p95 0.12 ms (layout/paint not included).
+- Opening a bot no longer reorders the sidebar (empty sessions don't count as activity).
+
+### Untested
+- Windows and Linux: Ctrl-based badges/shortcuts, minimum size and the traffic-light inset logic
+  (macOS-only padding) were only run on macOS.
+
 ## [0.3.0] - 2026-11-16
 
 ### Changed

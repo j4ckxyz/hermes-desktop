@@ -5,6 +5,7 @@ edition.workspace = true
 description = "A stand-in Hermes backend that follows the documented wire (dashboard REST, /api/ws JSON-RPC, /v1) for tests and offline development"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 axum.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

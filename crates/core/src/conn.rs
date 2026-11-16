@@ -57,6 +57,21 @@ pub enum Density {
     Spacious,
 }
 
+/// What to do before sending when the bot's stream has been quiet for a long time. Hermes
+/// itself never resets a conversation on inactivity (docs: *Session continuity*), so the client
+/// asks for it with official calls: `session.compress` or a fresh canonical `session.create`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GapAction {
+    /// Keep the same context.
+    Off,
+    /// Summarise older turns into a fresh working context, same session.
+    #[default]
+    Compact,
+    /// Start a new canonical Bot Chat session; the old one stays in the stream.
+    Fresh,
+}
+
 /// Local, per-machine preferences (Settings window). Every field has a default so older and newer
 /// config files both load.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -78,6 +93,10 @@ pub struct Prefs {
     pub hide_previews: bool,
     pub log_level: String,
     pub network_debug: bool,
+    pub gap_action: GapAction,
+    /// Quiet time, in hours, that counts as a long break.
+    pub gap_hours: u32,
+    pub sidebar_collapsed: bool,
 }
 
 impl Default for Prefs {
@@ -98,6 +117,9 @@ impl Default for Prefs {
             hide_previews: false,
             log_level: "warn".into(),
             network_debug: false,
+            gap_action: GapAction::Compact,
+            gap_hours: 6,
+            sidebar_collapsed: false,
         }
     }
 }

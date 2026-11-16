@@ -22,24 +22,45 @@ use crate::theme::{Palette, DEFAULT_ACCENT};
 
 actions!(
     hermes,
-    [Quit, OpenPalette, NewBot, OpenSettings, OpenApps, ToggleInfo, FocusSearch, NextBot, PrevBot, CopyConversation, StopTurn, AttachFiles]
+    [
+        Quit,
+        OpenPalette,
+        NewBot,
+        OpenSettings,
+        OpenApps,
+        OpenUsage,
+        ToggleInfo,
+        ToggleSidebar,
+        TogglePin,
+        FocusSearch,
+        FocusComposer,
+        NextBot,
+        PrevBot,
+        CopyConversation,
+        StopTurn,
+        AttachFiles
+    ]
 );
 
-/// Every shortcut, shown in Settings → Shortcuts and the palette.
-pub const SHORTCUTS: &[(&str, &str)] = &[
-    ("secondary-k", "Command palette"),
-    ("secondary-n", "New bot"),
-    ("secondary-,", "Settings"),
-    ("secondary-shift-a", "Apps & connectors"),
-    ("secondary-i", "Bot info & threads"),
-    ("secondary-f", "Search bots"),
-    ("secondary-1", "Jump to bot 1–9"),
-    ("secondary-alt-down", "Next bot"),
-    ("secondary-alt-up", "Previous bot"),
-    ("secondary-u", "Attach files"),
-    ("secondary-shift-c", "Copy conversation as Markdown"),
-    ("secondary-.", "Stop the reply"),
-    ("escape", "Close a dialog or panel"),
+/// Every shortcut, shown in Settings → Shortcuts and the palette: (bindings, description).
+/// Text inputs already bind ⌘⌥↑/↓, ⌘F, ⌘[ and ⌘], so bot switching uses ⇧⌘[ / ⇧⌘] and ⌃Tab.
+pub const SHORTCUTS: &[(&[&str], &str)] = &[
+    (&["secondary-k"], "Command palette and search"),
+    (&["secondary-n"], "New bot"),
+    (&["secondary-1"], "Jump to bot 1–9 (hold ⌘ to see numbers)"),
+    (&["secondary-shift-]", "ctrl-tab"], "Next bot"),
+    (&["secondary-shift-[", "ctrl-shift-tab"], "Previous bot"),
+    (&["secondary-shift-p"], "Pin or unpin bot"),
+    (&["secondary-b"], "Show or hide the sidebar"),
+    (&["secondary-l"], "Focus the message box"),
+    (&["secondary-i"], "Bot info & threads"),
+    (&["secondary-shift-a"], "Apps & connectors"),
+    (&["secondary-shift-u"], "Usage"),
+    (&["secondary-,"], "Settings"),
+    (&["secondary-u"], "Attach files"),
+    (&["secondary-shift-c"], "Copy conversation as Markdown"),
+    (&["secondary-shift-."], "Stop the reply"),
+    (&["escape"], "Close a dialog or panel"),
 ];
 
 /// `secondary` is Cmd on macOS and Ctrl elsewhere.
@@ -56,18 +77,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new(ks("secondary-n"), NewBot, c),
         KeyBinding::new(ks("secondary-,"), OpenSettings, c),
         KeyBinding::new(ks("secondary-shift-a"), OpenApps, c),
+        KeyBinding::new(ks("secondary-shift-u"), OpenUsage, c),
         KeyBinding::new(ks("secondary-i"), ToggleInfo, c),
-        KeyBinding::new(ks("secondary-f"), FocusSearch, c),
-        KeyBinding::new(ks("secondary-alt-down"), NextBot, c),
-        KeyBinding::new(ks("secondary-alt-up"), PrevBot, c),
+        KeyBinding::new(ks("secondary-b"), ToggleSidebar, c),
+        KeyBinding::new(ks("secondary-shift-p"), TogglePin, c),
+        KeyBinding::new(ks("secondary-l"), FocusComposer, c),
+        KeyBinding::new(ks("secondary-shift-]"), NextBot, c),
+        KeyBinding::new(ks("secondary-shift-["), PrevBot, c),
+        KeyBinding::new("ctrl-tab", NextBot, c),
+        KeyBinding::new("ctrl-shift-tab", PrevBot, c),
         KeyBinding::new(ks("secondary-u"), AttachFiles, c),
         KeyBinding::new(ks("secondary-shift-c"), CopyConversation, c),
-        KeyBinding::new(ks("secondary-."), StopTurn, c),
+        KeyBinding::new(ks("secondary-shift-."), StopTurn, c),
     ]);
 }
 
 pub fn shortcut_for(desc: &str) -> Option<&'static str> {
-    SHORTCUTS.iter().find(|(_, d)| *d == desc).map(|(k, _)| *k)
+    SHORTCUTS.iter().find(|(_, d)| *d == desc).map(|(k, _)| k[0])
 }
 
 pub struct MsgVm {
@@ -92,6 +118,31 @@ pub struct Approval {
     pub command: String,
     pub description: String,
     pub choices: Vec<String>,
+}
+
+/// The `/` command popover: matching commands for what follows the slash.
+/// Minimum window size on every platform: the composer, header and one chat column still fit.
+pub const MIN_W: f32 = 560.;
+pub const MIN_H: f32 = 420.;
+
+pub struct SlashPopup {
+    pub items: Vec<hermes_core::slash::SlashCmd>,
+    pub sel: usize,
+}
+
+/// Usage page: one `GET /api/analytics/usage` per bot (profile) on each connection.
+pub struct UsageState {
+    pub days: u32,
+    /// `None` = all bots.
+    pub bot: Option<BotKey>,
+    pub gen: u64,
+    pub data: HashMap<BotKey, Result<hermes_core::usage::Usage, String>>,
+}
+
+impl UsageState {
+    pub fn loading(&self, bots: &[Bot]) -> bool {
+        bots.iter().any(|b| !self.data.contains_key(&b.key.base()))
+    }
 }
 
 pub struct MentionPopup {
@@ -175,6 +226,9 @@ pub struct PaletteState {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Act {
     NewBot,
+    Usage,
+    Pin,
+    Sidebar,
     Settings,
     Apps,
     Info,
@@ -293,6 +347,17 @@ pub struct HermesApp {
     pub searching: bool,
     pub pending: Vec<LocalFile>,
     pub mention: Option<MentionPopup>,
+    pub slash: Option<SlashPopup>,
+    pub slash_scroll: ScrollHandle,
+    /// Live `commands.catalog` per bot (`conn:profile`); the embedded registry fills gaps.
+    pub slash_cmds: HashMap<String, Vec<hermes_core::slash::SlashCmd>>,
+    pub usage: Option<UsageState>,
+    /// The primary modifier (⌘ / Ctrl) is held: sidebar rows show their 1–9 shortcut.
+    pub cmd_held: bool,
+    /// Sidebar shown over the chat on a narrow window.
+    pub sidebar_peek: bool,
+    /// Dev only (`resizebench` script step): render durations in ms.
+    pub frame_stats: Option<Vec<f64>>,
     pub show_hidden: bool,
     pub toast: Option<(SharedString, bool)>,
     toast_gen: u64,
@@ -359,11 +424,16 @@ impl HermesApp {
                 let submit = *secondary || (this.config.prefs.enter_to_send && !*shift);
                 if this.mention.is_some() && !*secondary {
                     this.complete_mention(window, cx);
+                } else if this.slash.is_some() && !*secondary {
+                    this.complete_slash(true, window, cx);
                 } else if submit {
                     this.send(window, cx);
                 }
             }
-            InputEvent::Change => this.update_mention(cx),
+            InputEvent::Change => {
+                this.update_mention(cx);
+                this.update_slash(cx);
+            }
             _ => {}
         }));
         subs.push(cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
@@ -374,6 +444,8 @@ impl HermesApp {
         subs.push(cx.observe_window_appearance(window, |this, window, cx| this.apply_prefs(window, cx)));
         subs.push(cx.observe_window_activation(window, |this, window, cx| {
             this.window_active = window.is_window_active();
+            // A ⌘ released while another app had focus never reaches us.
+            this.cmd_held = false;
             cx.notify();
         }));
 
@@ -394,6 +466,13 @@ impl HermesApp {
             searching: false,
             pending: vec![],
             mention: None,
+            slash: None,
+            slash_cmds: HashMap::new(),
+            usage: None,
+            cmd_held: false,
+            sidebar_peek: false,
+            frame_stats: None,
+            slash_scroll: ScrollHandle::new(),
             show_hidden: false,
             toast: None,
             toast_gen: 0,
@@ -523,8 +602,65 @@ impl HermesApp {
                     s.focus(window, cx);
                 });
                 self.update_mention(cx);
+                self.update_slash(cx);
             }
             "send" => self.send(window, cx),
+            "key" => {
+                // Deferred: dispatching re-enters this view, which is mid-update here.
+                // Like a user, type from the composer (with no focus the key context is missed).
+                if window.focused(cx).is_none() {
+                    self.composer.update(cx, |s, cx| s.focus(window, cx));
+                }
+                if let Ok(k) = Keystroke::parse(ks(arg)) {
+                    window.defer(cx, move |window, cx| {
+                        window.dispatch_keystroke(k, cx);
+                    });
+                }
+            }
+            // Dev: resize back and forth N times, one size per frame, and log frame timings.
+            "resizebench" => {
+                let n: usize = arg.parse().unwrap_or(120);
+                self.frame_stats = Some(Vec::with_capacity(n));
+                cx.spawn_in(window, async move |this, cx| {
+                    for i in 0..n {
+                        let w = 700.0 + 500.0 * ((i as f32 / 30.0) * std::f32::consts::PI).sin().abs();
+                        let _ = this.update_in(cx, |_, window, _| window.resize(size(px(w), px(760.))));
+                        cx.background_executor().timer(std::time::Duration::from_millis(16)).await;
+                    }
+                    let _ = this.update(cx, |this, _| {
+                        if let Some(v) = this.frame_stats.take() {
+                            let mut v = v;
+                            v.sort_by(f64::total_cmp);
+                            let p = |q: f64| v.get(((v.len() as f64 - 1.0) * q) as usize).copied().unwrap_or(0.0);
+                            log::warn!("resizebench: {} renders, render ms p50 {:.2} p95 {:.2} max {:.2}", v.len(), p(0.5), p(0.95), p(1.0));
+                        }
+                    });
+                })
+                .detach();
+            }
+            "cmdheld" => self.cmd_held = arg != "off",
+            "usage" => self.open_usage(window, cx),
+            "usagebot" => {
+                if let Some(u) = &mut self.usage {
+                    u.bot = self.bots.iter().find(|b| b.name == arg).map(|b| b.key.base());
+                }
+            }
+            "pin" => {
+                if let Some(k) = self.bots.iter().find(|b| b.name == arg).map(|b| b.key.clone()) {
+                    self.toggle_pin(&k, cx);
+                }
+            }
+            "sidebar" => self.toggle_sidebar(window, cx),
+            "gap" => {
+                // Demo: pretend the stream went quiet `arg` hours ago.
+                let h: f64 = arg.parse().unwrap_or(12.0);
+                if let Some(chat) = self.selected.clone().and_then(|k| self.chats.get_mut(&k)) {
+                    let shift = hermes_core::service::now() - h * 3600.0 - chat.msgs.iter().filter_map(|m| m.m.timestamp).fold(0.0, f64::max);
+                    for m in &mut chat.msgs {
+                        m.m.timestamp = m.m.timestamp.map(|t| t + shift);
+                    }
+                }
+            }
             "unfold" => {
                 if let Some(chat) = self.selected.as_ref().and_then(|k| self.chats.get(k)) {
                     for vm in &chat.msgs {
@@ -684,6 +820,8 @@ impl HermesApp {
             let bot_changed = !self.selected.as_ref().is_some_and(|s| s.same_bot(&key));
             self.selected = Some(key.clone());
             self.mention = None;
+            self.slash = None;
+            self.sidebar_peek = false;
             if key.thread.is_none() {
                 let _ = self.svc.store.set_kv("selected", &serde_json::to_string(&key).unwrap_or_default());
             }
@@ -694,6 +832,7 @@ impl HermesApp {
             }
         }
         self.unread.remove(&key.base());
+        self.load_slash_catalog(&key);
         self.svc.send(Cmd::MarkRead(key.base()));
         self.svc.send(Cmd::OpenBot(key));
         self.composer.update(cx, |s, cx| s.focus(window, cx));
@@ -895,6 +1034,13 @@ impl HermesApp {
                 _ => self.show_toast(message, true, cx),
             },
             Ev::Info { message } => self.show_toast(message, false, cx),
+            Ev::Slash { key, command, output, error } => {
+                self.chat_mut(&key).awaiting = false;
+                let icon = if error { "circle-alert" } else { "slash" };
+                let text = if error { format!("{command} · not available here") } else { format!("Ran {command}") };
+                let id = self.push_local(&key, text, icon, error.then(|| output.clone()), (!error).then_some(output), None);
+                self.expanded_events.insert(id);
+            }
             Ev::Rpc { tag, result, .. } => self.on_rpc(&tag, result, cx),
         }
     }
@@ -940,15 +1086,37 @@ impl HermesApp {
             .map(|f| Attachment { name: f.name.clone(), mime: f.mime.clone(), kind: transcript::kind_of(&f.mime), remote_path: None, local_path: Some(f.path.display().to_string()), size: Some(f.size) })
             .collect();
         let is_command = key.thread.is_none() && roster::rewrite_bot_chat_command(&text).is_some() && files.is_empty();
+        let slash = files.is_empty() && text.starts_with('/') && !text.starts_with("//") && !is_command;
+        if slash && self.local_slash(&text, window, cx) {
+            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            self.slash = None;
+            cx.notify();
+            return;
+        }
+        // Long break since the last message: refresh the context first (Settings → Chat).
+        let gap = (!slash && !is_command).then(|| self.gap_refresh(&key)).flatten();
+        let refresh = gap.map(|(a, _)| a);
+        if let Some((action, secs)) = gap {
+            let away = fmt_gap(secs);
+            let label = match action {
+                hermes_core::conn::GapAction::Fresh => format!("Back after {away} · new session started"),
+                _ => format!("Back after {away} · context compacted"),
+            };
+            let detail = "Saves tokens: Hermes summarises or sets aside the older context. The whole conversation stays here.".to_owned();
+            self.push_local(&key, label, "history", Some(detail), None, None);
+        }
         let chat = self.chat_mut(&key);
-        if !is_command {
+        if !is_command && !slash {
             chat.msgs.push(MsgVm { m, md: None });
+        }
+        if !is_command {
             chat.awaiting = true;
         }
         chat.error = None;
-        self.svc.send(Cmd::Send { key, text, files });
+        self.svc.send(Cmd::Send { key, text, files, refresh });
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.mention = None;
+        self.slash = None;
         self.sync_list();
         self.list.scroll_to_end();
         cx.notify();
@@ -1051,9 +1219,10 @@ impl HermesApp {
     }
 
     /// Add a session-only event chip (Hermes history does not record approvals or local saves).
-    pub fn push_local(&mut self, key: &BotKey, text: String, icon: &str, detail: Option<String>, code: Option<String>, path: Option<String>) {
+    pub fn push_local(&mut self, key: &BotKey, text: String, icon: &str, detail: Option<String>, code: Option<String>, path: Option<String>) -> String {
         let ev = transcript::LocalEvent { icon: icon.to_owned(), detail, code, path };
-        let m = ChatMessage::new(format!("local-{}", uuid::Uuid::new_v4()), Role::Local(ev), text, Some(hermes_core::service::now()));
+        let id = format!("local-{}", uuid::Uuid::new_v4());
+        let m = ChatMessage::new(id.clone(), Role::Local(ev), text, Some(hermes_core::service::now()));
         let chat = self.chat_mut(key);
         // Keep a live reply last so streaming keeps appending to it.
         let at = if chat.msgs.last().is_some_and(|m| m.m.streaming) { chat.msgs.len() - 1 } else { chat.msgs.len() };
@@ -1061,6 +1230,171 @@ impl HermesApp {
         if self.selected.as_ref() == Some(key) {
             self.list_count = usize::MAX;
         }
+        id
+    }
+
+    // ---- long breaks, pinning, sidebar ------------------------------------------------------
+
+    /// The refresh to apply when the bot's stream has been quiet longer than the setting.
+    /// The refresh to apply before sending, and how long the break was (seconds).
+    fn gap_refresh(&self, key: &BotKey) -> Option<(hermes_core::conn::GapAction, f64)> {
+        use hermes_core::conn::GapAction;
+        let p = &self.config.prefs;
+        if p.gap_action == GapAction::Off || key.thread.is_some() {
+            return None;
+        }
+        let last = self.chats.get(key)?.msgs.iter().rev().filter(|m| matches!(m.m.role, Role::User | Role::Assistant | Role::Agent(_))).find_map(|m| m.m.timestamp)?;
+        let gap = hermes_core::service::now() - last;
+        (gap > p.gap_hours as f64 * 3600.0).then_some((p.gap_action, gap))
+    }
+
+    /// Pin state lives in the bot's Bot Mode metadata (`ui_meta["hermes-bots"].pinned`), so every
+    /// desktop on that Hermes sees it. Applied locally at once, then written with `SetMeta`.
+    pub fn toggle_pin(&mut self, key: &BotKey, cx: &mut Context<Self>) {
+        let Some(b) = self.bots.iter_mut().find(|b| b.key.same_bot(key)) else { return };
+        let pinned = !b.meta.pinned.unwrap_or(false);
+        b.meta.pinned = pinned.then_some(true);
+        let title = b.title();
+        roster::sort_roster(&mut self.bots);
+        self.svc.send(Cmd::SetMeta { key: key.base(), patch: json!({"pinned": if pinned { Value::Bool(true) } else { Value::Null }}) });
+        self.show_toast(if pinned { format!("Pinned {title}") } else { format!("Unpinned {title}") }, false, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar_auto_hidden(window) {
+            self.sidebar_peek = !self.sidebar_peek;
+            cx.notify();
+            return;
+        }
+        self.set_pref(|p| p.sidebar_collapsed = !p.sidebar_collapsed, window, cx);
+    }
+
+    /// Below this width the sidebar steps aside so the conversation keeps a usable column.
+    pub fn sidebar_auto_hidden(&self, window: &Window) -> bool {
+        window.viewport_size().width < px(crate::view::SIDEBAR_AUTO_HIDE)
+    }
+
+    pub fn sidebar_visible(&self, window: &Window) -> bool {
+        !self.config.prefs.sidebar_collapsed && !self.sidebar_auto_hidden(window)
+    }
+
+    pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |s, cx| s.focus(window, cx));
+    }
+
+    // ---- slash commands ----------------------------------------------------------------------
+
+    fn slash_key(key: &BotKey) -> String {
+        format!("{}:{}", key.conn, key.profile)
+    }
+
+    /// Ask the bot's Hermes for its live command catalog (once per bot).
+    pub fn load_slash_catalog(&mut self, key: &BotKey) {
+        let k = Self::slash_key(key);
+        if !self.slash_cmds.contains_key(&k) {
+            self.slash_cmds.insert(k.clone(), vec![]);
+            self.rpc(&key.conn, "commands.catalog", json!({"profile": key.profile}), format!("slash:{k}"));
+        }
+    }
+
+    pub fn slash_commands(&self) -> Vec<hermes_core::slash::SlashCmd> {
+        let live = self.selected.as_ref().and_then(|k| self.slash_cmds.get(&Self::slash_key(k))).cloned().unwrap_or_default();
+        hermes_core::slash::merged(&live)
+    }
+
+    pub fn update_slash(&mut self, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().to_string();
+        let prev = self.slash.as_ref().map(|s| s.sel).unwrap_or(0);
+        self.slash = None;
+        if let Some(q) = text.strip_prefix('/') {
+            if !q.contains(char::is_whitespace) && !q.starts_with('/') {
+                let all = self.slash_commands();
+                let items: Vec<_> = hermes_core::slash::filter(&all, q).into_iter().take(50).cloned().collect();
+                if !items.is_empty() {
+                    let sel = prev.min(items.len() - 1);
+                    self.slash = Some(SlashPopup { items, sel });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn move_slash(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if let Some(s) = &mut self.slash {
+            let n = s.items.len() as i32;
+            s.sel = ((s.sel as i32 + delta).rem_euclid(n)) as usize;
+            self.slash_scroll.scroll_to_item(s.sel);
+            cx.notify();
+        }
+    }
+
+    /// Fill in the highlighted command. With `run`, a command that takes no arguments is sent
+    /// straight away; one that does gets a trailing space so the user can type them.
+    pub fn complete_slash(&mut self, run: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = self.slash.as_ref().and_then(|s| s.items.get(s.sel)).cloned() else { return };
+        self.pick_slash(&c, run, window, cx);
+    }
+
+    pub fn pick_slash(&mut self, c: &hermes_core::slash::SlashCmd, run: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let takes_args = !c.args.is_empty() || !c.subcommands.is_empty();
+        let text = if takes_args { format!("/{} ", c.name) } else { format!("/{}", c.name) };
+        let end = text.len();
+        self.composer.update(cx, |s, cx| {
+            s.set_value(text, window, cx);
+            s.set_selected_range(end..end, cx);
+            s.focus(window, cx);
+        });
+        self.slash = None;
+        if run && !takes_args {
+            self.send(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Commands the app answers itself. Returns true when handled.
+    fn local_slash(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let name = text.split_whitespace().next().unwrap_or_default();
+        match name {
+            "/usage" | "/insights" => {
+                self.open_usage(window, cx);
+                true
+            }
+            "/stop" => {
+                self.stop(cx);
+                true
+            }
+            "/approve" | "/deny" => {
+                if let Some(id) = self.approvals.first().map(|a| a.request_id.clone()) {
+                    self.approve(&id, if name == "/deny" { "deny" } else { "once" }, cx);
+                } else {
+                    self.show_toast("Nothing is waiting for approval.", false, cx);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // ---- usage -------------------------------------------------------------------------------
+
+    pub fn open_usage(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.close_overlays(cx);
+        self.usage = Some(UsageState { days: 30, bot: None, gen: 0, data: HashMap::new() });
+        self.reload_usage(cx);
+        cx.notify();
+    }
+
+    pub fn reload_usage(&mut self, cx: &mut Context<Self>) {
+        let bots: Vec<BotKey> = self.bots.iter().map(|b| b.key.base()).collect();
+        let Some(u) = &mut self.usage else { return };
+        u.gen += 1;
+        u.data.clear();
+        let (gen, days) = (u.gen, u.days);
+        for k in bots {
+            self.svc.send(Cmd::Usage { conn: k.conn.clone(), profile: Some(k.profile.clone()), days, tag: format!("usage:{gen}:{}:{}", k.conn, k.profile) });
+        }
+        cx.notify();
     }
 
     /// Expand or collapse an event chip; `ix` is its list row, which must be re-measured.
@@ -1184,6 +1518,15 @@ impl HermesApp {
         } else if self.settings.is_some() {
             self.settings = None;
             true
+        } else if self.usage.is_some() {
+            self.usage = None;
+            true
+        } else if self.slash.is_some() {
+            self.slash = None;
+            true
+        } else if self.sidebar_peek {
+            self.sidebar_peek = false;
+            true
         } else if self.info.as_ref().is_some_and(|i| i.edit.is_some()) {
             self.info.as_mut().unwrap().edit = None;
             true
@@ -1206,6 +1549,7 @@ impl HermesApp {
         self.palette = None;
         self.apps = None;
         self.settings = None;
+        self.usage = None;
         self.new_bot = None;
         if !self.config.connections.is_empty() {
             self.setup = None;
@@ -1321,8 +1665,12 @@ impl HermesApp {
             hermes_core::conn::ThemePref::Dark => "Switch to light theme",
             hermes_core::conn::ThemePref::Light => "Follow the system theme",
         };
-        let acts: [(Act, &str, Option<&'static str>); 10] = [
+        let pinned = self.current_bot().is_some_and(|b| b.meta.pinned.unwrap_or(false));
+        let acts: [(Act, &str, Option<&'static str>); 13] = [
             (Act::NewBot, "New bot", shortcut_for("New bot")),
+            (Act::Usage, "Usage and cost", shortcut_for("Usage")),
+            (Act::Pin, if pinned { "Unpin this bot" } else { "Pin this bot to the top" }, shortcut_for("Pin or unpin bot")),
+            (Act::Sidebar, "Show or hide the sidebar", shortcut_for("Show or hide the sidebar")),
             (Act::Apps, "Apps & connectors", shortcut_for("Apps & connectors")),
             (Act::Info, "Bot info & threads", shortcut_for("Bot info & threads")),
             (Act::Settings, "Settings", shortcut_for("Settings")),
@@ -1360,6 +1708,13 @@ impl HermesApp {
     pub fn run_act(&mut self, a: Act, window: &mut Window, cx: &mut Context<Self>) {
         match a {
             Act::NewBot => self.open_new_bot(window, cx),
+            Act::Usage => self.open_usage(window, cx),
+            Act::Pin => {
+                if let Some(k) = self.selected.clone() {
+                    self.toggle_pin(&k, cx);
+                }
+            }
+            Act::Sidebar => self.toggle_sidebar(window, cx),
             Act::Settings => self.open_settings(window, cx),
             Act::Apps => self.open_apps(window, cx),
             Act::Info => self.toggle_info(window, cx),
@@ -1378,7 +1733,7 @@ impl HermesApp {
             Act::Hidden => self.show_hidden = !self.show_hidden,
             Act::Compact => {
                 if let Some(k) = self.selected.clone() {
-                    self.svc.send(Cmd::Send { key: k.base(), text: "/compact".into(), files: vec![] });
+                    self.svc.send(Cmd::Send { key: k.base(), text: "/compact".into(), files: vec![], refresh: None });
                 }
             }
             Act::AddServer => self.open_setup(None, window, cx),
@@ -1528,6 +1883,24 @@ impl HermesApp {
     }
 
     fn on_rpc(&mut self, tag: &str, result: Result<Value, String>, cx: &mut Context<Self>) {
+        if let Some(k) = tag.strip_prefix("slash:") {
+            // A Hermes without `commands.catalog` keeps the embedded registry.
+            if let Ok(v) = &result {
+                self.slash_cmds.insert(k.to_owned(), hermes_core::slash::from_catalog(v));
+            }
+            return;
+        }
+        if let Some(rest) = tag.strip_prefix("usage:") {
+            let mut it = rest.splitn(3, ':');
+            let (gen, conn, profile) = (it.next().and_then(|g| g.parse::<u64>().ok()).unwrap_or(0), it.next().unwrap_or_default(), it.next().unwrap_or_default());
+            if let Some(u) = &mut self.usage {
+                if u.gen == gen {
+                    u.data.insert(BotKey::new(conn, profile), result.map(|v| hermes_core::usage::parse(&v)));
+                    cx.notify();
+                }
+            }
+            return;
+        }
         let mut parts = tag.splitn(3, ':');
         let (kind, a1, a2) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         match kind {
@@ -1713,5 +2086,15 @@ fn upsert(list: &mut Vec<Activity>, a: Activity) {
             }
         }
         None => list.push(a),
+    }
+}
+
+/// "8 hours", "3 days".
+fn fmt_gap(secs: f64) -> String {
+    let h = (secs / 3600.0).floor() as i64;
+    match h {
+        0 | 1 => "an hour".into(),
+        2..=47 => format!("{h} hours"),
+        _ => format!("{} days", h / 24),
     }
 }

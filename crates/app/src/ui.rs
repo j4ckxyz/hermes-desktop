@@ -160,6 +160,7 @@ pub fn keys(binding: &str) -> String {
         "down" => "↓".to_owned(),
         "enter" => "↩".to_owned(),
         "escape" => "Esc".to_owned(),
+        "tab" => "Tab".to_owned(),
         "," => ",".to_owned(),
         k => k.to_uppercase(),
     };
