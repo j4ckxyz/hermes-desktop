@@ -1,5 +1,8 @@
 //! Hermes Desktop: a fast native client for Hermes Agent, built on GPUI.
 
+// Release builds on Windows are GUI apps: no console window opens beside them.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 mod chrome;
@@ -81,6 +84,8 @@ fn main() {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(chrome::titlebar_options()),
             window_decorations: chrome::window_decorations(),
+            // A scripted (dev-only) demo opens behind other windows and never takes focus.
+            focus: app::scripted().is_none(),
             // Small enough for a side-by-side half screen; below ~760 px the sidebar steps aside.
             window_min_size: Some(size(px(app::MIN_W), px(app::MIN_H))),
             ..Default::default()
@@ -91,6 +96,8 @@ fn main() {
             cx.new(|cx| Root::new(view, window, cx))
         })
         .expect("open window");
-        cx.activate(true);
+        if app::scripted().is_none() {
+            cx.activate(true);
+        }
     });
 }

@@ -47,7 +47,7 @@ impl HermesApp {
         let any_hidden = self.bots.iter().any(|b| b.hidden());
         let hidden_unread = self.bots.iter().any(|b| b.hidden() && self.unread.contains(&b.key));
         let rows: Vec<Bot> = self.visible_bots(cx).into_iter().cloned().collect();
-        let user = self.config.user_name.clone().or_else(|| std::env::var("USER").ok()).unwrap_or_else(|| "You".into());
+        let user = self.config.user_name.clone().or_else(|| std::env::var("USER").or_else(|_| std::env::var("USERNAME")).ok()).unwrap_or_else(|| "You".into());
         let link_ok = self.links.values().any(|l| *l == LinkState::Connected);
         let link_label = if self.config.connections.is_empty() {
             "Not connected".to_owned()

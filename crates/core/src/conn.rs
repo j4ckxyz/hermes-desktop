@@ -156,15 +156,25 @@ mod prefs_tests {
     }
 }
 
+/// A developer/test override from the environment. Release builds ignore every one of them, so
+/// an end user's environment can't inject a server, token, script or alternate home.
+pub fn dev_env(name: &str) -> Option<String> {
+    if cfg!(debug_assertions) {
+        std::env::var(name).ok()
+    } else {
+        None
+    }
+}
+
 pub fn config_path() -> PathBuf {
-    if let Ok(p) = std::env::var("HERMES_DESKTOP_HOME") {
+    if let Some(p) = dev_env("HERMES_DESKTOP_HOME") {
         return PathBuf::from(p).join("config.json");
     }
     dirs().map(|d| d.config_dir().join("config.json")).unwrap_or_else(|| PathBuf::from("hermes-desktop-config.json"))
 }
 
 pub fn data_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("HERMES_DESKTOP_HOME") {
+    if let Some(p) = dev_env("HERMES_DESKTOP_HOME") {
         return PathBuf::from(p);
     }
     dirs().map(|d| d.data_dir().to_path_buf()).unwrap_or_else(|| PathBuf::from("."))
@@ -191,7 +201,7 @@ pub struct Secrets;
 /// process memory instead of the real keychain (never on disk either way).
 fn ephemeral() -> Option<&'static std::sync::Mutex<std::collections::HashMap<String, String>>> {
     static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
-    std::env::var_os("HERMES_DESKTOP_EPHEMERAL_SECRETS").map(|_| M.get_or_init(Default::default))
+    dev_env("HERMES_DESKTOP_EPHEMERAL_SECRETS").map(|_| M.get_or_init(Default::default))
 }
 
 impl Secrets {
@@ -200,7 +210,7 @@ impl Secrets {
     }
     pub fn get(conn_id: &str) -> Option<String> {
         // Dev/test override; never persisted.
-        if let Ok(t) = std::env::var(format!("HERMES_TOKEN_{}", conn_id.to_uppercase().replace('-', "_"))) {
+        if let Some(t) = dev_env(&format!("HERMES_TOKEN_{}", conn_id.to_uppercase().replace('-', "_"))) {
             return Some(t);
         }
         if let Some(m) = ephemeral() {
@@ -278,6 +288,13 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dev_overrides_exist_only_in_debug_builds() {
+        std::env::set_var("HERMES_DESKTOP_TEST_PROBE", "1");
+        assert_eq!(dev_env("HERMES_DESKTOP_TEST_PROBE").is_some(), cfg!(debug_assertions));
+        assert!(dev_env("HERMES_DESKTOP_TEST_UNSET").is_none());
+    }
+
     use super::*;
 
     #[test]

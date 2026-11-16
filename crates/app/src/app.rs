@@ -10,7 +10,7 @@ use gpui_component::input::{InputEvent, InputState, TextareaState};
 use gpui_component::text::TextViewState;
 use gpui_component::{Theme, ThemeMode};
 use hermes_core::apps::{self, AppItem, AppKind, AppsSnapshot};
-use hermes_core::conn::{ConnKind, Config, Connection, Prefs};
+use hermes_core::conn::{dev_env, ConnKind, Config, Connection, Prefs};
 use hermes_core::gateway::LinkState;
 use hermes_core::roster::{self, Bot, BotKey};
 use hermes_core::service::{Cmd, Ev, LocalFile, MAX_FILE_BYTES};
@@ -395,13 +395,18 @@ pub struct HermesApp {
 
 /// Seed a connection from the environment (`HERMES_DESKTOP_URL` + `HERMES_DESKTOP_TOKEN`) for
 /// development and testing. The token is never written to disk.
+/// The demo script, in development builds only.
+pub fn scripted() -> Option<String> {
+    dev_env("HERMES_DESKTOP_SCRIPT")
+}
+
 pub fn bootstrap_config(mut c: Config) -> Config {
-    if let Ok(url) = std::env::var("HERMES_DESKTOP_URL") {
-        if let Ok(t) = std::env::var("HERMES_DESKTOP_TOKEN") {
+    if let Some(url) = dev_env("HERMES_DESKTOP_URL") {
+        if let Some(t) = dev_env("HERMES_DESKTOP_TOKEN") {
             std::env::set_var("HERMES_TOKEN_ENV", t);
         }
         c.connections.retain(|x| x.id != "env");
-        c.connections.insert(0, Connection { id: "env".into(), name: std::env::var("HERMES_DESKTOP_NAME").unwrap_or_else(|_| "Hermes".into()), base_url: url, kind: ConnKind::Gateway });
+        c.connections.insert(0, Connection { id: "env".into(), name: dev_env("HERMES_DESKTOP_NAME").unwrap_or_else(|| "Hermes".into()), base_url: url, kind: ConnKind::Gateway });
     }
     c
 }
@@ -522,7 +527,7 @@ impl HermesApp {
             this.svc.send(Cmd::OpenBot(k));
         }
         this.pump_events(cx);
-        if let Ok(script) = std::env::var("HERMES_DESKTOP_SCRIPT") {
+        if let Some(script) = scripted() {
             this.run_script(script, window, cx);
         }
         this
@@ -594,9 +599,7 @@ impl HermesApp {
     }
 
     fn script_step(&mut self, cmd: &str, arg: &str, window: &mut Window, cx: &mut Context<Self>) {
-        // Demos run unattended: keep the window frontmost so it keeps painting.
-        cx.activate(true);
-        window.activate_window();
+        // Never activate or raise the window: a demo must not steal focus from whoever is working.
         window.refresh();
         match cmd {
             "select" => {

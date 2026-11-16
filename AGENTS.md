@@ -48,7 +48,7 @@ HERMES_DESKTOP_URL=http://127.0.0.1:9119 HERMES_DESKTOP_TOKEN=dev-token cargo ru
 scripts/screenshots.sh                       # macOS: scripted demo + window-only screenshots
 ```
 
-Dev-only environment variables:
+Dev-only environment variables (read through `conn::dev_env`; release builds ignore all of them):
 * `HERMES_DESKTOP_URL` / `HERMES_DESKTOP_TOKEN` / `HERMES_DESKTOP_NAME` seed a connection. The
   token stays in memory and is never written to disk.
 * `HERMES_DESKTOP_HOME` puts config and cache in a different directory.
@@ -65,7 +65,8 @@ Dev-only environment variables:
   `addr:<url>` (type an address and probe it), `pick:<n>` (choose a local server), `creds:user|pass`,
   `showpw`, `tokenfield:<token>`, `bottitle:<name>`, `next` (the flow's primary button),
   `signout[:<server>]`, `resignin[:<server>]`, `close`) for
-  reproducible demos.
+  reproducible demos. A scripted window opens unfocused and never activates the app or raises
+  itself; `scripts/screenshots.sh` therefore uses the debug build.
 
 ## Rules
 
