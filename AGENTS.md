@@ -21,8 +21,11 @@ crates/core   hermes-core: protocol clients (gateway.rs WS JSON-RPC, rest.rs, ap
               roster.rs (Bot Mode: bots = profiles, mentions, agent notices),
               transcript.rs (history rows, MEDIA tags), store.rs (SQLite cache),
               conn.rs (config + OS keychain), service.rs (actor: Cmd in, Ev out)
+              apps.rs (Apps page: param builders + parsers for connectors/mcp/toolsets/skills)
 crates/mock   hermes-mock: stand-in backend that follows the documented wire (tests + demos)
-crates/app    hermes-desktop: GPUI binary. app.rs = state/logic, view.rs = rendering
+crates/app    hermes-desktop: GPUI binary. app.rs = state, actions, shortcuts, RPC routing;
+              view.rs = sidebar, chat, composer, info pane; overlays.rs = palette, settings,
+              apps, new bot, setup; ui.rs = shared controls; theme.rs = palette + prefs
 docs/         PROTOCOL.md (wire notes and API gaps), ci/ (drafted CI), screenshots/
 ```
 
@@ -46,7 +49,9 @@ Dev-only environment variables:
   token stays in memory and is never written to disk.
 * `HERMES_DESKTOP_HOME` puts config and cache in a different directory.
 * `HERMES_DESKTOP_SCRIPT` holds `;`-separated steps (`wait:ms`, `select:profile`, `type:text`,
-  `send`, `attach:path`, `share`, `hidden`, `newbot`, `close`) for reproducible demos.
+  `send`, `attach:path`, `share`, `hidden`, `newbot`, `setup`, `palette`, `query:text`,
+  `settings:<section>`, `apps`, `category:<chip>`, `expand:<app id>`, `info`, `edit`,
+  `thread:<session id>`, `theme:system|light|dark`, `close`) for reproducible demos.
 
 ## Rules
 
@@ -58,6 +63,11 @@ Dev-only environment variables:
   `cx.notify()` on change. The roster poll (5 s) emits only when something changed.
 * **Tests**: every protocol behaviour gets a mock-backed test in `crates/core/tests/e2e.rs`. When
   you change the mock, keep it faithful to the docs.
+* **UI**: build on `ui.rs` controls. Sizes sit on the 4/8 px grid (controls 24/28/32/36 px,
+  icons 16 px in 32 px boxes); scale text with `Palette::t` and spacing with `Palette::g`. Check
+  both themes and a narrow window with window-only screenshots before committing UI changes.
+* **Gateway methods** that the shared gateway may refuse (`connectors.*`, `mcp.*`, ...) go through
+  `Cmd::Rpc`; a -32601 becomes a friendly notice, never a fallback of our own.
 * **CI** is drafted in `docs/ci/`. The pushing token lacks the `workflow` scope, so do not add
   `.github/workflows/` until it has it.
 

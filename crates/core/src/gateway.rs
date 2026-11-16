@@ -264,6 +264,11 @@ async fn pump(s: &Arc<Shared>, ws: Ws) -> Option<String> {
                 }
             }
             Some(text) = rx.recv() => {
+                if log::log_enabled!(target: "hermes_net", log::Level::Debug) {
+                    // Network debug logs names only, never payloads (they can hold prompts or secrets).
+                    let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                    log::debug!(target: "hermes_net", "→ {} id={}", v.get("method").and_then(Value::as_str).unwrap_or("response"), v.get("id").map(|i| i.to_string()).unwrap_or_default());
+                }
                 if let Err(e) = sink.send(Message::Text(text.into())).await {
                     return Some(friendly(&e));
                 }
@@ -294,6 +299,10 @@ async fn pump(s: &Arc<Shared>, ws: Ws) -> Option<String> {
 fn route(s: &Arc<Shared>, text: &str) -> Option<bool> {
     let frame: Value = serde_json::from_str(text).ok()?;
     let method = frame.get("method").and_then(Value::as_str);
+    if log::log_enabled!(target: "hermes_net", log::Level::Debug) {
+        let kind = frame.pointer("/params/type").and_then(Value::as_str).or(method).unwrap_or("response");
+        log::debug!(target: "hermes_net", "← {kind} id={} {}B", frame.get("id").map(|i| i.to_string()).unwrap_or_default(), text.len());
+    }
     match (method, frame.get("id")) {
         (Some("event"), _) => {
             let p = frame.get("params").cloned().unwrap_or(Value::Null);

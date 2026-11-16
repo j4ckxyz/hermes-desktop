@@ -20,11 +20,32 @@ pub const UI_META_KEY: &str = "hermes-bots";
 pub struct BotKey {
     pub conn: String,
     pub profile: String,
+    /// A stored session other than the canonical Bot Chat (a "thread": a CLI, Telegram or older
+    /// desktop conversation of the same profile). `None` is the Bot Chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
 }
 
 impl BotKey {
     pub fn new(conn: impl Into<String>, profile: impl Into<String>) -> Self {
-        Self { conn: conn.into(), profile: profile.into() }
+        Self { conn: conn.into(), profile: profile.into(), thread: None }
+    }
+    pub fn with_thread(&self, thread: Option<String>) -> Self {
+        Self { conn: self.conn.clone(), profile: self.profile.clone(), thread }
+    }
+    /// The bot this key belongs to (drops the thread).
+    pub fn base(&self) -> Self {
+        self.with_thread(None)
+    }
+    /// Per-socket slot name: the profile for the Bot Chat, `profile#session` for a thread.
+    pub fn slot(&self) -> String {
+        match &self.thread {
+            Some(t) => format!("{}#{t}", self.profile),
+            None => self.profile.clone(),
+        }
+    }
+    pub fn same_bot(&self, other: &BotKey) -> bool {
+        self.conn == other.conn && self.profile == other.profile
     }
 }
 

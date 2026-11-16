@@ -35,10 +35,103 @@ pub struct Config {
     pub accent: Option<String>,
     #[serde(default)]
     pub user_name: Option<String>,
+    #[serde(default)]
+    pub prefs: Prefs,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePref {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Density {
+    Compact,
+    #[default]
+    Comfortable,
+    Spacious,
+}
+
+/// Local, per-machine preferences (Settings window). Every field has a default so older and newer
+/// config files both load.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Prefs {
+    pub theme: ThemePref,
+    /// UI font size in px (12 to 18).
+    pub font_size: f32,
+    pub density: Density,
+    pub notifications: bool,
+    pub notify_only_unfocused: bool,
+    pub sounds: bool,
+    pub enter_to_send: bool,
+    pub render_markdown: bool,
+    pub show_timestamps: bool,
+    pub show_tool_activity: bool,
+    pub download_dir: Option<String>,
+    pub image_previews: bool,
+    pub hide_previews: bool,
+    pub log_level: String,
+    pub network_debug: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Prefs {
+            theme: ThemePref::System,
+            font_size: 14.0,
+            density: Density::Comfortable,
+            notifications: true,
+            notify_only_unfocused: true,
+            sounds: false,
+            enter_to_send: true,
+            render_markdown: true,
+            show_timestamps: true,
+            show_tool_activity: true,
+            download_dir: None,
+            image_previews: true,
+            hide_previews: false,
+            log_level: "warn".into(),
+            network_debug: false,
+        }
+    }
+}
+
+impl Prefs {
+    pub fn font_size(&self) -> f32 {
+        self.font_size.clamp(12.0, 18.0)
+    }
+    /// Spacing multiplier for the chosen density.
+    pub fn space(&self) -> f32 {
+        match self.density {
+            Density::Compact => 0.75,
+            Density::Comfortable => 1.0,
+            Density::Spacious => 1.25,
+        }
+    }
 }
 
 pub fn dirs() -> Option<directories::ProjectDirs> {
     directories::ProjectDirs::from("dev", "hermes-desktop", "Hermes Desktop")
+}
+
+#[cfg(test)]
+mod prefs_tests {
+    use super::*;
+    #[test]
+    fn old_configs_get_default_prefs_and_partial_prefs_merge() {
+        let c: Config = serde_json::from_str(r#"{"connections": []}"#).unwrap();
+        assert_eq!(c.prefs, Prefs::default());
+        let c: Config = serde_json::from_str(r#"{"connections": [], "prefs": {"theme": "light", "font_size": 40}}"#).unwrap();
+        assert_eq!(c.prefs.theme, ThemePref::Light);
+        assert_eq!(c.prefs.font_size(), 18.0);
+        assert!(c.prefs.enter_to_send);
+    }
 }
 
 pub fn config_path() -> PathBuf {

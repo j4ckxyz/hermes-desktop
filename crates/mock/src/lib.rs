@@ -50,6 +50,10 @@ struct Inner {
     files: HashMap<String, Vec<u8>>,
     /// Delay between streamed words (ms).
     pace_ms: u64,
+    /// Apps state (per mock, not per profile, to keep it simple).
+    connected: Vec<String>,
+    mcp_installed: Vec<String>,
+    toolsets_off: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -97,6 +101,10 @@ impl Mock {
             "s-coder-old".to_owned(),
             Session { profile: "coder".into(), title: "Refactor auth".into(), messages: vec![row(20, "user", "refactor the auth module", t - 4000.0), row(21, "assistant", "Done: split into `token.rs` and `session.rs`.", t - 3900.0)], last_active: t - 3900.0 },
         );
+        sessions.insert(
+            "s-coder-tg".to_owned(),
+            Session { profile: "coder".into(), title: "Deploy checklist".into(), messages: vec![row(30, "user", "what's left before we deploy?", t - 90000.0), row(31, "assistant", "Two things: bump the version and run the migration.", t - 89900.0)], last_active: t - 89900.0 },
+        );
         Mock(Arc::new(Mutex::new(Inner {
             token: token.to_owned(),
             profiles,
@@ -107,6 +115,9 @@ impl Mock {
             pending_approvals: HashMap::new(),
             files: HashMap::from([("/home/hermes/out/chart.png".to_owned(), demo_png(320, 180)), ("/home/hermes/out/report.pdf".to_owned(), b"%PDF-1.4\n% mock report\n".to_vec())]),
             pace_ms: 25,
+            connected: vec!["github".into()],
+            mcp_installed: vec!["filesystem".into()],
+            toolsets_off: vec!["image_gen".into()],
         })))
     }
 
@@ -255,6 +266,30 @@ async fn socket(m: Mock, s: WebSocket) {
     }
 }
 
+const CONNECTORS: &[(&str, &str, &str, &str)] = &[
+    ("github", "GitHub", "developer", "Repos, issues and pull requests"),
+    ("linear", "Linear", "developer", "Plan and track issues"),
+    ("gmail", "Gmail", "productivity", "Read, search and draft email"),
+    ("google_calendar", "Google Calendar", "productivity", "Events and availability"),
+    ("notion", "Notion", "productivity", "Pages and databases"),
+    ("slack", "Slack", "communication", "Channels and messages"),
+    ("figma", "Figma", "design", "Files, frames and comments"),
+    ("stripe", "Stripe", "finance", "Payments and customers"),
+];
+const MCP: &[(&str, &str, &[&str])] = &[
+    ("filesystem", "Read and write files in allowed folders", &[]),
+    ("playwright", "Drive a headless browser", &[]),
+    ("brave_search", "Web search through Brave", &["BRAVE_API_KEY"]),
+    ("postgres", "Query a Postgres database", &["DATABASE_URL"]),
+];
+const TOOLSETS: &[(&str, &str, u32)] = &[
+    ("web", "Search and fetch web pages", 3),
+    ("terminal", "Run shell commands", 2),
+    ("file", "Read and edit files", 4),
+    ("image_gen", "Generate images", 1),
+    ("memory", "Long-term memory", 2),
+];
+
 fn summary(id: &str, s: &Session) -> Value {
     let last = s.messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default();
     let preview: String = last.chars().take(80).collect();
@@ -289,6 +324,9 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                     return Ok(json!({"ok": false, "applied": {"ui_meta_conflicts": {"hermes-bots": {"expected": exp, "actual": pr.revision}}}}));
                 }
             }
+            if let Some(d) = p["description"].as_str() {
+                pr.description = d.to_owned();
+            }
             if let Some(new) = p.pointer("/ui_meta/hermes-bots") {
                 pr.ui_meta["hermes-bots"] = new.clone();
                 pr.revision += 1;
@@ -309,8 +347,15 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                 .sessions
                 .iter()
                 .filter(|(_, s)| s.profile == profile && title.is_none_or(|t| s.title == t))
-                .map(|(id, s)| json!({"session_id": id, "id": id, "title": s.title, "root_title": s.title, "message_count": s.messages.len(), "last_active_at": s.last_active, "running": false}))
+                .filter(|(_, s)| p["include_hidden"].as_bool().unwrap_or(false) || title.is_some() || s.title != "Bot Chat")
+                .map(|(id, s)| {
+                    let preview: String = s.messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default().chars().take(80).collect();
+                    let source = if id.ends_with("-tg") { "telegram" } else { "cli" };
+                    json!({"session_id": id, "id": id, "title": s.title, "root_title": s.title, "preview": preview, "source": source, "started_at": s.messages.first().map(|m| m["timestamp"].clone()), "message_count": s.messages.len(), "last_active_at": s.last_active, "running": false})
+                })
                 .collect();
+            let mut rows = rows;
+            rows.sort_by(|a, b| b["last_active_at"].as_f64().unwrap_or(0.0).total_cmp(&a["last_active_at"].as_f64().unwrap_or(0.0)));
             Ok(json!({"sessions": rows}))
         }
         "session.create" => {
@@ -342,6 +387,59 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             Ok(json!({"session_id": rt, "stored_session_id": stored, "running": false, "info": {"title": title, "model": "mock-model"}, "open_requests": []}))
         }
         "session.interrupt" => Ok(json!({"ok": true})),
+        "profiles.describe" => {
+            let name = p["name"].as_str().unwrap_or(&profile).to_owned();
+            let pr = i.profiles.iter().find(|x| x.name == name).ok_or((4004, "unknown profile".to_owned()))?;
+            let toolsets: Vec<Value> = TOOLSETS.iter().map(|(n, d, c)| json!({"name": n, "label": n, "description": d, "tool_count": c, "enabled": !i.toolsets_off.iter().any(|x| x == n)})).collect();
+            Ok(json!({"name": pr.name, "description": pr.description, "soul": format!("You are {}, a helpful bot.", pr.name), "model": {"provider": "mock", "default": "mock-model"},
+                "skills": [{"name": "arxiv", "enabled": true}, {"name": "git_workflow", "enabled": true}], "toolsets": toolsets, "toolsets_pinned": false,
+                "mcp_servers": i.mcp_installed.iter().map(|n| json!({"name": n, "enabled": true, "transport": "stdio"})).collect::<Vec<_>>()}))
+        }
+        "connectors.catalog" => Ok(json!({"connectors": CONNECTORS.iter().map(|(slug, name, cat, desc)| json!({"slug": slug, "name": name, "category": cat, "description": desc, "logo_url": null})).collect::<Vec<_>>()})),
+        "connectors.list" => Ok(json!({"available": true, "connectors": i.connected.iter().map(|c| json!({"connector": c, "enabled": true, "connected": true, "connection_status": "active", "status_reason": null, "gateway_disabled_tools": []})).collect::<Vec<_>>()})),
+        "connectors.connect" => {
+            let slug = p["connectors"][0].as_str().unwrap_or_default().to_owned();
+            if !CONNECTORS.iter().any(|c| c.0 == slug) {
+                return Err((4004, "CONNECTOR_NOT_FOUND".into()));
+            }
+            if !i.connected.contains(&slug) {
+                i.connected.push(slug.clone());
+            }
+            Ok(json!({"op_id": "op-1", "seq": 1, "deadline_at": now() + 600.0, "settled": false, "status": "initiated",
+                "targets": [{"name": slug, "kind": "connector", "action": "authorize", "state": "initiated", "connect_url": format!("https://connect.example.invalid/{slug}")}]}))
+        }
+        "connectors.tools" => {
+            let slug = p["slug"].as_str().unwrap_or_default();
+            Ok(json!({"connector": slug, "toolkit_version": "1", "etag": "e", "fetched_at": now(), "source": "cache", "stale": false,
+                "tools": [{"slug": format!("{slug}_search"), "name": "Search", "description": "Search items", "facet": "read", "hints": [], "categories": [], "no_auth": false, "deprecated": false},
+                          {"slug": format!("{slug}_create"), "name": "Create", "description": "Create an item", "facet": "write", "hints": [], "categories": [], "no_auth": false, "deprecated": false}]}))
+        }
+        "mcp.catalog" => Ok(json!({"servers": MCP.iter().map(|(n, d, req)| json!({"name": n, "description": d, "connector_slug": null, "installed": i.mcp_installed.iter().any(|x| x == n), "enabled": true, "requires": req, "transport": "stdio"})).collect::<Vec<_>>()})),
+        "mcp.servers.add" => {
+            let name = p["preset"].as_str().or(p["name"].as_str()).unwrap_or_default().to_owned();
+            if !i.mcp_installed.contains(&name) {
+                i.mcp_installed.push(name.clone());
+            }
+            Ok(json!({"ok": true, "name": name, "server": {"name": name, "transport": "stdio", "args": [], "env": [], "enabled": true, "source": "config"}}))
+        }
+        "mcp.servers.remove" => {
+            let name = p["name"].as_str().unwrap_or_default().to_owned();
+            i.mcp_installed.retain(|x| *x != name);
+            Ok(json!({"ok": true, "name": name}))
+        }
+        "toolsets.list" => Ok(json!({"toolsets": TOOLSETS.iter().map(|(n, d, c)| json!({"name": n, "description": d, "tool_count": c, "enabled": !i.toolsets_off.iter().any(|x| x == n)})).collect::<Vec<_>>()})),
+        "tools.configure" => {
+            let enable = p["action"] == "enable";
+            for n in p["names"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                i.toolsets_off.retain(|x| x != n);
+                if !enable {
+                    i.toolsets_off.push(n.to_owned());
+                }
+            }
+            let enabled: Vec<&str> = TOOLSETS.iter().map(|t| t.0).filter(|n| !i.toolsets_off.iter().any(|x| x == n)).collect();
+            Ok(json!({"changed": p["names"], "enabled_toolsets": enabled, "missing_servers": [], "reset": false, "unknown": []}))
+        }
+        "skills.manage" => Ok(json!({"skills": {"research": ["arxiv", "paper_notes"], "software": ["git_workflow", "code_review"]}})),
         "session.compress" => {
             let rt = p["session_id"].as_str().unwrap_or_default();
             let stored = i.runtime.get(rt).cloned().ok_or((4004, "unknown session".to_owned()))?;
@@ -511,7 +609,7 @@ pub fn demo_png(w: u32, h: u32) -> Vec<u8> {
     for y in 0..h {
         raw.push(0u8);
         for x in 0..w {
-            let bar = (x / 40) as u32;
+            let bar = x / 40;
             let height = 30 + (bar * 37 % 120);
             let in_bar = x % 40 > 8 && h - y < height;
             let (r, g, b) = if in_bar { (124u8, 92u8, 255u8) } else { (30 + (y * 20 / h) as u8, 30, 38 + (x * 30 / w) as u8) };

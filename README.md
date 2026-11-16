@@ -11,6 +11,21 @@ cards. Bots on other machines appear as additional connections.
 
 ![chat](docs/screenshots/chat.png)
 
+Also included: a ⌘K command palette, per-bot info pane with threads and editing, a sectioned
+Settings window (servers, appearance, notifications, chat, files, shortcuts, privacy, advanced),
+and an **Apps & Connectors** page built on Hermes' official connector, MCP, toolset and skill
+catalogs. More screenshots are in [docs/screenshots](docs/screenshots).
+
+| Shortcut | Action |
+|---|---|
+| ⌘K / Ctrl+K | Command palette |
+| ⌘N | New bot |
+| ⌘, | Settings |
+| ⇧⌘A | Apps & Connectors |
+| ⌘I | Bot info |
+| ⌘1–9, ⌥⌘↑/↓ | Jump to / next / previous bot |
+| Esc | Close the top overlay |
+
 ## Connect
 
 Run `hermes dashboard` (or `hermes serve`) on the machine that hosts your agent. Open

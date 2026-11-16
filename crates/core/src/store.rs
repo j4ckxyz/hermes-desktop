@@ -59,14 +59,14 @@ impl Store {
         let json = serde_json::to_string(&tail)?;
         self.db.lock().unwrap().execute(
             "INSERT OR REPLACE INTO chat(conn, profile, session, json) VALUES(?1, ?2, ?3, ?4)",
-            params![key.conn, key.profile, session, json],
+            params![key.conn, key.slot(), session, json],
         )?;
         Ok(())
     }
 
     pub fn load_chat(&self, key: &BotKey) -> Option<(Option<String>, Vec<ChatMessage>)> {
         let db = self.db.lock().unwrap();
-        db.query_row("SELECT session, json FROM chat WHERE conn=?1 AND profile=?2", params![key.conn, key.profile], |r| {
+        db.query_row("SELECT session, json FROM chat WHERE conn=?1 AND profile=?2", params![key.conn, key.slot()], |r| {
             Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))
         })
         .optional()
@@ -102,6 +102,12 @@ impl Store {
         self.db.lock().unwrap().execute("INSERT OR REPLACE INTO kv(k, v) VALUES(?1, ?2)", params![k, v])?;
         Ok(())
     }
+
+    /// Privacy: drop cached rosters and messages (unread watermarks and UI state stay).
+    pub fn clear_cache(&self) -> Result<()> {
+        self.db.lock().unwrap().execute_batch("DELETE FROM roster; DELETE FROM chat; VACUUM;")?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -124,6 +130,9 @@ mod tests {
         assert_eq!(s.seen(&b.key), None);
         s.set_seen(&b.key, 5.0).unwrap();
         s.set_seen(&b.key, 3.0).unwrap();
+        assert_eq!(s.seen(&b.key), Some(5.0));
+        s.clear_cache().unwrap();
+        assert!(s.load_chat(&b.key).is_none());
         assert_eq!(s.seen(&b.key), Some(5.0));
     }
 }

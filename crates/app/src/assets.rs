@@ -13,6 +13,9 @@ macro_rules! icons {
 static ICONS: &[(&str, &[u8])] = icons![
     "plus", "search", "arrow-up", "mic", "share", "settings", "paperclip", "file-text", "eye", "eye-off", "copy",
     "download", "bot", "check", "x", "loader-circle", "wrench", "external-link", "square", "users", "sparkles",
+    "server", "palette", "bell", "message-circle", "folder", "keyboard", "shield", "sliders-horizontal", "info",
+    "chevron-left", "chevron-right", "pencil", "plug", "arrow-left", "messages-square", "panel-right", "command",
+    "sun", "moon", "trash-2", "refresh-cw", "circle-alert", "layout-grid",
 ];
 
 pub struct Assets;

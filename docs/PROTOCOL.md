@@ -44,6 +44,26 @@ The full reasoning is in [PLAN.md](../PLAN.md).
 * Agent output arrives as `MEDIA:/abs/path` tags. These are previewed (images inline) and can be
   opened or saved. Downloads stream to a `.part` file, which is renamed when complete.
 
+## Apps & Connectors
+Research result: Hermes has official directories, and the app uses only those.
+* **Hosted connectors**: `connectors.catalog {profile}` → `{connectors:[{slug,name,description,
+  category,logo_url}]}`; `connectors.list {profile, owner:{type:"account"}}` for state;
+  `connectors.connect {profile, owner, connectors:[slug], reconnect?}` returns targets whose
+  `connect_url` is opened in the browser (OAuth happens on the official site); `connectors.tools`.
+  Source: `tui_gateway/contracts/connectors.py`, `connectors_operation.py`. May need a Nous
+  account (`NEEDS_NOUS_AUTH`, `CATALOG_UNAVAILABLE`).
+* **Curated MCP presets**: `mcp.catalog`, `mcp.servers.add {name, preset}` / `remove`. Presets
+  that need API keys list them in `requires`; the app tells the user to set them on the host
+  and never sends secrets.
+* **Toolsets**: `toolsets.list`, `tools.configure {action, names, profile}`.
+* **Skills**: `skills.manage {action:"list"}`.
+* **Plugin catalog** (human-reviewed YAML in `plugin-catalog/`, `plugins.catalog.lookup`): exists
+  but is **not shown yet**.
+* On the shared gateway these are "older handler" methods. They answer only when the
+  connection's ticket carries the full interactive grant, otherwise -32601. The page shows a
+  per-source notice in that case.
+* Threads: `session.list {profile, limit}` (non-hidden sessions) and `profiles.describe {name}`.
+
 ## Gaps (no official API, so nothing was invented)
 * **Cross-machine bot DMs via the Desktop relay** (`bot_relay.*`). The official Desktop acts as a
   courier here. This is not implemented; `hermes peer` covers gateway-to-gateway messaging.
@@ -55,3 +75,5 @@ The full reasoning is in [PLAN.md](../PLAN.md).
 * **Avatars** (`profiles.get_asset`) are available but not displayed yet. Bots get coloured
   initials instead.
 * **Routines and groups** have official calls (`cron.*`, `groups.*`) but no UI yet.
+* **Plugin catalog** browsing in Apps; **MCP env/keys entry** (must be set on the host).
+* **Updates**: there is no official update feed for this client, so About links to the repo.

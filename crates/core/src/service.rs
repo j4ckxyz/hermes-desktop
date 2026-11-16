@@ -57,6 +57,9 @@ pub enum Cmd {
     /// Fetch an image for inline display (cached on disk).
     FetchMedia { key: BotKey, remote: String },
     Approve { conn: String, request_id: String, choice: String },
+    /// Any official gateway method, answered with `Ev::Rpc { tag }`. Used by the Apps page, bot
+    /// settings and the thread list, whose wire shapes live in `apps.rs` / `roster.rs`.
+    Rpc { conn: String, method: String, params: Value, tag: String },
     CreateBot { conn: String, name: String, title: String, description: String },
     SetMeta { key: BotKey, patch: Value },
     RefreshRoster,
@@ -82,6 +85,7 @@ pub enum Ev {
     Notify { key: BotKey, title: String, body: String },
     Error { key: Option<BotKey>, message: String },
     Info { message: String },
+    Rpc { tag: String, conn: String, result: Result<Value, String> },
 }
 
 struct Live {
@@ -96,7 +100,7 @@ struct ConnState {
     ready: Value,
     roster: Vec<Bot>,
     live: HashMap<String, Live>,
-    by_runtime: HashMap<String, String>,
+    by_runtime: HashMap<String, BotKey>,
     last_roster_json: String,
     turn_text: HashMap<String, String>,
 }
@@ -226,6 +230,24 @@ impl Svc {
                     gw.respond(&request_id, json!({"choice": choice}));
                 }
             }
+            Cmd::Rpc { conn, method, params, tag } => {
+                tokio::spawn(async move {
+                    let result = match s.gw(&conn) {
+                        None => Err("Not connected.".to_owned()),
+                        Some(gw) => gw.call_timeout(&method, params, Duration::from_secs(60)).await.map_err(|e| {
+                            if e.code == METHOD_NOT_FOUND {
+                                format!("This Hermes doesn't offer {method} on this connection.")
+                            } else {
+                                e.message
+                            }
+                        }),
+                    };
+                    if method.starts_with("profiles.") && result.is_ok() {
+                        s.clone().refresh_roster(conn.clone()).await;
+                    }
+                    s.emit(Ev::Rpc { tag, conn, result });
+                });
+            }
             Cmd::CreateBot { conn, name, title, description } => {
                 tokio::spawn(async move { s.create_bot(conn, name, title, description).await });
             }
@@ -252,12 +274,12 @@ impl Svc {
         self.st.lock().unwrap().conns.get(conn).map(|c| c.rest.clone())
     }
     fn bot(&self, key: &BotKey) -> Option<Bot> {
-        self.st.lock().unwrap().conns.get(&key.conn)?.roster.iter().find(|b| b.key == *key).cloned()
+        self.st.lock().unwrap().conns.get(&key.conn)?.roster.iter().find(|b| b.key.same_bot(key)).cloned()
     }
     fn live_of(&self, key: &BotKey) -> Option<(Gateway, String)> {
         let st = self.st.lock().unwrap();
         let c = st.conns.get(&key.conn)?;
-        Some((c.gw.clone(), c.live.get(&key.profile)?.runtime.clone()))
+        Some((c.gw.clone(), c.live.get(&key.slot())?.runtime.clone()))
     }
     fn all_bots(&self) -> Vec<Bot> {
         self.st.lock().unwrap().conns.values().flat_map(|c| c.roster.clone()).collect()
@@ -353,7 +375,7 @@ impl Svc {
 
     fn key_for(&self, conn: &str, runtime_sid: &str) -> Option<BotKey> {
         let st = self.st.lock().unwrap();
-        st.conns.get(conn)?.by_runtime.get(runtime_sid).map(|p| BotKey::new(conn, p))
+        st.conns.get(conn)?.by_runtime.get(runtime_sid).cloned()
     }
 
     fn event(&self, conn: &str, kind: &str, sid: &str, p: Value) {
@@ -374,7 +396,7 @@ impl Svc {
                 {
                     let mut st = self.st.lock().unwrap();
                     if let Some(c) = st.conns.get_mut(conn) {
-                        c.turn_text.insert(key.profile.clone(), String::new());
+                        c.turn_text.insert(key.slot(), String::new());
                     }
                 }
                 let dk = s("display_kind");
@@ -462,7 +484,7 @@ impl Svc {
             "message.complete" => {
                 let streamed = {
                     let mut st = self.st.lock().unwrap();
-                    st.conns.get_mut(conn).and_then(|c| c.turn_text.remove(&key.profile)).unwrap_or_default()
+                    st.conns.get_mut(conn).and_then(|c| c.turn_text.remove(&key.slot())).unwrap_or_default()
                 };
                 let mut text = s("text");
                 if text.is_empty() {
@@ -489,7 +511,7 @@ impl Svc {
     fn append_turn(&self, conn: &str, key: &BotKey, t: &str) {
         let mut st = self.st.lock().unwrap();
         if let Some(c) = st.conns.get_mut(conn) {
-            c.turn_text.entry(key.profile.clone()).or_default().push_str(t);
+            c.turn_text.entry(key.slot()).or_default().push_str(t);
         }
     }
 
@@ -553,13 +575,17 @@ impl Svc {
     /// Find (or create) the canonical Bot Chat and bind it to this socket.
     async fn ensure_live(&self, key: &BotKey) -> Result<(Gateway, String, String), String> {
         if let Some((gw, rt)) = self.live_of(key) {
-            let stored = self.st.lock().unwrap().conns.get(&key.conn).and_then(|c| c.live.get(&key.profile).map(|l| l.stored.clone())).unwrap_or_default();
+            let stored = self.st.lock().unwrap().conns.get(&key.conn).and_then(|c| c.live.get(&key.slot()).map(|l| l.stored.clone())).unwrap_or_default();
             return Ok((gw, rt, stored));
         }
         let gw = self.gw(&key.conn).ok_or("Not connected.")?;
         let p = &key.profile;
+        // A thread is an existing stored session: resume it as is.
         // 1. canonical id from the roster, else look it up by title.
-        let mut stored = self.bot(key).and_then(|b| b.canonical.map(|c| c.id)).filter(|s| !s.is_empty());
+        let mut stored = match &key.thread {
+            Some(t) => Some(t.clone()),
+            None => self.bot(key).and_then(|b| b.canonical.map(|c| c.id)).filter(|s| !s.is_empty()),
+        };
         if stored.is_none() {
             if let Ok(r) = gw.call("session.list", json!({"profile": p, "title": BOT_CHAT_TITLE, "limit": 20, "include_hidden": true})).await {
                 let rows = r.get("sessions").or_else(|| r.get("rows")).or(Some(&r)).and_then(Value::as_array).cloned().unwrap_or_default();
@@ -614,8 +640,8 @@ impl Svc {
         {
             let mut st = self.st.lock().unwrap();
             if let Some(c) = st.conns.get_mut(&key.conn) {
-                c.by_runtime.insert(runtime.clone(), key.profile.clone());
-                c.live.insert(key.profile.clone(), Live { stored: stored.clone(), runtime: runtime.clone() });
+                c.by_runtime.insert(runtime.clone(), key.clone());
+                c.live.insert(key.slot(), Live { stored: stored.clone(), runtime: runtime.clone() });
             }
         }
         Ok((gw, runtime, stored))

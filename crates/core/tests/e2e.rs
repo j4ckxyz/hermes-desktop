@@ -198,3 +198,71 @@ fn approval_round_trip() {
     });
     assert!(t.contains("won't"));
 }
+
+fn rpc(svc: &Service, method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
+    let tag = format!("t-{method}-{}", uuid_like());
+    svc.send(Cmd::Rpc { conn: "m5".into(), method: method.into(), params, tag: tag.clone() });
+    wait(svc, 10, |e| match e {
+        Ev::Rpc { tag: t, result, .. } if *t == tag => Some(result.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn apps_page_uses_official_catalogs() {
+    use hermes_core::apps;
+    let (_rt, _mock, url) = mock_rt();
+    let svc = start(&url, "m5", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+
+    let cat = rpc(&svc, "connectors.catalog", apps::catalog_params("coder")).unwrap();
+    let list = rpc(&svc, "connectors.list", apps::connectors_list_params("coder")).unwrap();
+    let items = apps::connectors(&cat, Some(&list));
+    assert!(items.iter().any(|i| i.id == "github" && i.connected));
+    assert!(items.iter().any(|i| i.id == "gmail" && !i.connected && apps::is_recommended(i)));
+
+    let r = rpc(&svc, "connectors.connect", apps::connect_params("coder", "gmail")).unwrap();
+    assert_eq!(apps::connect_url(&r).as_deref(), Some("https://connect.example.invalid/gmail"));
+
+    let mcp = apps::mcp(&rpc(&svc, "mcp.catalog", apps::catalog_params("coder")).unwrap());
+    assert!(mcp.iter().any(|i| i.id == "brave_search" && i.requires == vec!["BRAVE_API_KEY"]));
+    rpc(&svc, "mcp.servers.add", apps::mcp_add_params("coder", "playwright")).unwrap();
+    let mcp = apps::mcp(&rpc(&svc, "mcp.catalog", apps::catalog_params("coder")).unwrap());
+    assert!(mcp.iter().any(|i| i.id == "playwright" && i.connected));
+
+    rpc(&svc, "tools.configure", apps::toolset_params("coder", "web", false)).unwrap();
+    let ts = apps::toolsets(&rpc(&svc, "toolsets.list", apps::catalog_params("coder")).unwrap());
+    assert!(ts.iter().any(|i| i.id == "web" && !i.connected));
+    assert!(!apps::skills(&rpc(&svc, "skills.manage", apps::skills_list_params("coder")).unwrap()).is_empty());
+
+    // Unknown methods come back as a readable error, never a hang.
+    let e = rpc(&svc, "nonexistent.method", serde_json::json!({})).unwrap_err();
+    assert!(e.contains("nonexistent.method"), "{e}");
+}
+
+#[test]
+fn threads_open_their_own_session() {
+    let (_rt, mock, url) = mock_rt();
+    let svc = start(&url, "m6", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let tag = "threads".to_owned();
+    svc.send(Cmd::Rpc { conn: "m6".into(), method: "session.list".into(), params: serde_json::json!({"profile": "coder", "limit": 30}), tag: tag.clone() });
+    let rows = wait(&svc, 10, |e| match e {
+        Ev::Rpc { tag: t, result: Ok(v), .. } if *t == tag => Some(v["sessions"].as_array().cloned().unwrap_or_default()),
+        _ => None,
+    });
+    let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).collect();
+    assert_eq!(ids, vec!["s-coder-old", "s-coder-tg"], "most recent first, Bot Chat excluded");
+
+    let key = BotKey::new("m6", "coder").with_thread(Some("s-coder-tg".into()));
+    svc.send(Cmd::OpenBot(key.clone()));
+    let msgs = wait(&svc, 10, |e| match e {
+        Ev::History { key: k, messages, cached: false } if *k == key => Some(messages.clone()),
+        _ => None,
+    });
+    assert!(msgs.iter().any(|m| m.text.contains("bump the version")));
+
+    svc.send(Cmd::Send { key: key.clone(), text: "and after that?".into(), files: vec![] });
+    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, .. } if *k == key).then_some(()));
+    assert!(mock.messages_of("coder").iter().all(|m| m["content"] != "and after that?"), "the Bot Chat was not touched");
+}
