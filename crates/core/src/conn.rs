@@ -248,24 +248,82 @@ impl Secrets {
         if let Some(m) = ephemeral() {
             return m.lock().unwrap().get(conn_id).cloned();
         }
-        Self::entry(conn_id).ok()?.get_password().ok()
+        chunked_get(&Keychain, conn_id)
     }
     pub fn set(conn_id: &str, secret: &str) -> Result<()> {
         if let Some(m) = ephemeral() {
             m.lock().unwrap().insert(conn_id.to_owned(), secret.to_owned());
             return Ok(());
         }
-        Self::entry(conn_id)?.set_password(secret).map_err(|e| anyhow!("keychain: {e}"))
+        chunked_set(&Keychain, conn_id, secret, CHUNK_CHARS)
     }
     pub fn delete(conn_id: &str) {
         if let Some(m) = ephemeral() {
             m.lock().unwrap().remove(conn_id);
             return;
         }
-        if let Ok(e) = Self::entry(conn_id) {
+        chunked_delete(&Keychain, conn_id);
+    }
+}
+
+/// Windows Credential Manager holds at most 2,560 bytes (1,280 UTF-16 units) per secret; OAuth
+/// credentials can be longer. There a long secret is split over `id#1..n` with `id` holding a
+/// marker. Elsewhere secrets are stored whole, exactly as before.
+const CHUNK_CHARS: usize = if cfg!(windows) { 1200 } else { usize::MAX };
+const CHUNK_MARK: &str = "hermes-desktop-chunks:";
+
+trait SecretStore {
+    fn get(&self, id: &str) -> Option<String>;
+    fn set(&self, id: &str, v: &str) -> Result<()>;
+    fn del(&self, id: &str);
+}
+
+struct Keychain;
+
+impl SecretStore for Keychain {
+    fn get(&self, id: &str) -> Option<String> {
+        Secrets::entry(id).ok()?.get_password().ok()
+    }
+    fn set(&self, id: &str, v: &str) -> Result<()> {
+        Secrets::entry(id)?.set_password(v).map_err(|e| anyhow!("keychain: {e}"))
+    }
+    fn del(&self, id: &str) {
+        if let Ok(e) = Secrets::entry(id) {
             let _ = e.delete_credential();
         }
     }
+}
+
+fn chunk_count(head: &str) -> Option<usize> {
+    head.strip_prefix(CHUNK_MARK)?.parse().ok()
+}
+
+fn chunked_get(s: &impl SecretStore, id: &str) -> Option<String> {
+    let head = s.get(id)?;
+    let Some(n) = chunk_count(&head) else { return Some(head) };
+    (1..=n).map(|i| s.get(&format!("{id}#{i}"))).collect()
+}
+
+fn chunked_set(s: &impl SecretStore, id: &str, secret: &str, max: usize) -> Result<()> {
+    chunked_delete(s, id);
+    if secret.chars().count() <= max {
+        return s.set(id, secret);
+    }
+    let chars: Vec<char> = secret.chars().collect();
+    let parts: Vec<String> = chars.chunks(max).map(|c| c.iter().collect()).collect();
+    for (i, p) in parts.iter().enumerate() {
+        s.set(&format!("{id}#{}", i + 1), p)?;
+    }
+    s.set(id, &format!("{CHUNK_MARK}{}", parts.len()))
+}
+
+fn chunked_delete(s: &impl SecretStore, id: &str) {
+    if let Some(n) = s.get(id).as_deref().and_then(chunk_count) {
+        for i in 1..=n {
+            s.del(&format!("{id}#{i}"));
+        }
+    }
+    s.del(id);
 }
 
 /// A resolved backend address plus credential.
@@ -320,6 +378,36 @@ impl Endpoint {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_secrets_are_split_and_rejoined() {
+        struct Mem(std::sync::Mutex<std::collections::HashMap<String, String>>);
+        impl SecretStore for Mem {
+            fn get(&self, id: &str) -> Option<String> {
+                self.0.lock().unwrap().get(id).cloned()
+            }
+            fn set(&self, id: &str, v: &str) -> Result<()> {
+                assert!(v.starts_with(CHUNK_MARK) || v.chars().count() <= 10, "an entry over the platform limit");
+                self.0.lock().unwrap().insert(id.into(), v.into());
+                Ok(())
+            }
+            fn del(&self, id: &str) {
+                self.0.lock().unwrap().remove(id);
+            }
+        }
+        let m = Mem(Default::default());
+        let long = "é".repeat(25) + "tail";
+        chunked_set(&m, "c1", &long, 10).unwrap();
+        assert_eq!(m.0.lock().unwrap().len(), 4, "3 parts plus the marker");
+        assert_eq!(chunked_get(&m, "c1").as_deref(), Some(long.as_str()));
+        // Replacing with a short secret leaves no stale parts behind.
+        chunked_set(&m, "c1", "short", 10).unwrap();
+        assert_eq!(chunked_get(&m, "c1").as_deref(), Some("short"));
+        assert_eq!(m.0.lock().unwrap().len(), 1);
+        chunked_set(&m, "c1", &long, 10).unwrap();
+        chunked_delete(&m, "c1");
+        assert!(m.0.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn config_writes_are_atomic_and_bad_files_are_kept() {
         let dir = std::env::temp_dir().join(format!("hd-cfg-{}", uuid::Uuid::new_v4().simple()));
