@@ -31,6 +31,7 @@ fn init_logging(config: &Config) {
     let _ = std::fs::create_dir_all(&dir);
     let mut b = env_logger::Builder::new();
     b.filter_level(log::LevelFilter::Warn).filter_module("hermes_core", log::LevelFilter::Trace).filter_module("hermes_desktop", log::LevelFilter::Trace).filter_module("hermes_net", log::LevelFilter::Trace);
+    hermes_core::housekeeping::rotate_log(&dir.join("hermes-desktop.log"), hermes_core::housekeeping::LOG_MAX);
     if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("hermes-desktop.log")) {
         b.target(env_logger::Target::Pipe(Box::new(f)));
     }
@@ -49,6 +50,10 @@ fn main() {
         log::warn!("cache unavailable ({e}); running without it");
         Store::memory().expect("in-memory store")
     }));
+    {
+        let (store, data, conns) = (store.clone(), data.clone(), config.connections.iter().map(|c| c.id.clone()).collect::<Vec<_>>());
+        std::thread::Builder::new().name("housekeeping".into()).spawn(move || hermes_core::housekeeping::run(&data, &data.join("cache"), &store, &conns)).ok();
+    }
     let service = Service::start(store, data.join("cache")).expect("start service");
 
     gpui_platform::application().with_assets(assets::Assets).run(move |cx: &mut App| {

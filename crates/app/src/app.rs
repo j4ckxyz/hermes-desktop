@@ -393,6 +393,8 @@ pub struct HermesApp {
     pub focus: FocusHandle,
     rpc_gen: u64,
     _subs: Vec<Subscription>,
+    palette_sub: Option<Subscription>,
+    apps_sub: Option<Subscription>,
 }
 
 /// Seed a connection from the environment (`HERMES_DESKTOP_URL` + `HERMES_DESKTOP_TOKEN`) for
@@ -563,6 +565,8 @@ impl HermesApp {
             focus: cx.focus_handle(),
             rpc_gen: 0,
             _subs: subs,
+            palette_sub: None,
+            apps_sub: None,
         };
         this.apply_prefs(window, cx);
         // Paint the cached roster immediately, then connect.
@@ -1809,7 +1813,8 @@ impl HermesApp {
                 cx.notify();
             }
         });
-        self._subs.push(sub);
+        // One live subscription per overlay: replacing it drops the previous one.
+        self.palette_sub = Some(sub);
         self.palette = Some(PaletteState { input, sel: 0 });
         if self.info.as_ref().is_none_or(|i| !self.selected.as_ref().is_some_and(|s| s.same_bot(&i.key))) {
             self.load_info(cx);
@@ -2008,7 +2013,7 @@ impl HermesApp {
                 cx.notify();
             }
         });
-        self._subs.push(sub);
+        self.apps_sub = Some(sub);
         self.rpc_gen += 1;
         self.apps = Some(AppsState { key, search, category: String::new(), gen: self.rpc_gen, raw: HashMap::new(), busy: HashSet::new(), expanded: None, tools: HashMap::new() });
         self.reload_apps(cx);

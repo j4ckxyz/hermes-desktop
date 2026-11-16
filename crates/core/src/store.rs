@@ -53,6 +53,17 @@ impl Store {
         rows.iter().filter_map(|j| serde_json::from_str::<Vec<Bot>>(j).ok()).flatten().collect()
     }
 
+    /// Drop cached rosters, chats and read marks of servers that are no longer configured.
+    pub fn forget_other_conns(&self, keep: &[String]) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        let list = keep.iter().map(|c| format!("'{}'", c.replace('\'', "''"))).collect::<Vec<_>>().join(",");
+        let cond = if list.is_empty() { String::new() } else { format!(" WHERE conn NOT IN ({list})") };
+        for t in ["roster", "chat", "seen"] {
+            db.execute(&format!("DELETE FROM {t}{cond}"), [])?;
+        }
+        Ok(())
+    }
+
     pub fn save_chat(&self, key: &BotKey, session: Option<&str>, msgs: &[ChatMessage]) -> Result<()> {
         let tail = &msgs[msgs.len().saturating_sub(CACHE_MESSAGES)..];
         let tail: Vec<ChatMessage> = tail.iter().filter(|m| !m.streaming).cloned().collect();
@@ -113,6 +124,21 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_servers_leave_no_cached_chats() {
+        let st = Store::memory().unwrap();
+        let msg = vec![crate::transcript::ChatMessage::new("1", crate::transcript::Role::User, "hi", Some(1.0))];
+        for c in ["keep", "gone", "it's"] {
+            st.save_chat(&BotKey::new(c, "default"), None, &msg).unwrap();
+        }
+        st.forget_other_conns(&["keep".into(), "it's".into()]).unwrap();
+        assert!(st.load_chat(&BotKey::new("keep", "default")).is_some());
+        assert!(st.load_chat(&BotKey::new("it's", "default")).is_some());
+        assert!(st.load_chat(&BotKey::new("gone", "default")).is_none());
+        st.forget_other_conns(&[]).unwrap();
+        assert!(st.load_chat(&BotKey::new("keep", "default")).is_none());
+    }
     use crate::transcript::Role;
 
     #[test]
