@@ -332,7 +332,7 @@ impl HermesApp {
                 .child(group("LIMITS", &pal).child(row("Uploads", "Images up to 25 MB, other files up to 256 MB (Hermes' limits). Big files are read off the UI thread.", &pal)))
             }
             Section::Shortcuts => body.child(group("KEYBOARD", &pal).children(SHORTCUTS.iter().map(|(k, d)| {
-                div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child(*d).child(kbd(keys(k), &pal))
+                div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child(*d).child(kbd(if k.ends_with("-1") { keys(k) + "–9" } else { keys(k) }, &pal))
             }))
             .child(div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child("Send / new line").child(div().flex().gap(px(4.)).child(kbd("↩", &pal)).child(kbd("⇧↩", &pal))))
             .child(div().h(px(40.)).flex().items_center().justify_between().border_t_1().border_color(pal.border).text_size(pal.t(13.)).child("Mention a bot").child(kbd("@", &pal)))),
@@ -371,11 +371,11 @@ impl HermesApp {
                     .gap(px(8.))
                     .child(letter_tile("H", pal.accent, 64., false))
                     .child(div().pt(px(8.)).text_size(pal.t(18.)).font_weight(FontWeight::SEMIBOLD).child("Hermes Desktop"))
-                    .child(div().text_size(pal.t(13.)).text_color(pal.muted).child(format!("Version {VERSION} · GPUI · {}", std::env::consts::OS))),
+                    .child(div().text_size(pal.t(13.)).text_color(pal.muted).child(format!("Version {VERSION} · GPUI · {}", match std::env::consts::OS { "macos" => "macOS", "windows" => "Windows", "linux" => "Linux", o => o }))),
             )
             .child(
                 group("UPDATES", &pal)
-                    .child(row("Updates", "There is no update server yet: pull and rebuild (git pull, then cargo build --release). Release notes are in CHANGELOG.md.", &pal).child(button("ab-repo", "Open repo", Kind::Secondary, &pal).on_click(|_, _, cx| cx.open_url("https://github.com/j4ckxyz/hermes-desktop"))))
+                    .child(row("Updates", "There is no update server yet. To update, pull the repo and rebuild in release mode. Release notes are in CHANGELOG.md.", &pal).child(button("ab-repo", "Open repo", Kind::Secondary, &pal).on_click(|_, _, cx| cx.open_url("https://github.com/j4ckxyz/hermes-desktop"))))
                     .child(row("Protocol", "Only official Hermes APIs: gateway WebSocket /api/ws, dashboard REST and the /v1 API server.", &pal)),
             ),
         }

@@ -3,6 +3,17 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.2.1] - 2026-11-16
+
+### Added
+- `size:WxH` demo-script step, used for the narrow-window screenshot.
+- Screenshots of every main screen in `docs/screenshots/`.
+
+### Fixed
+- The `type:` demo step leaves the cursor at the end, so the @mention popup opens.
+- Settings → Shortcuts shows ⌘1–9 for "Jump to bot"; About says macOS/Windows/Linux and no
+  longer breaks a command across lines.
+
 ## [0.2.0] - 2026-11-16
 
 ### Added

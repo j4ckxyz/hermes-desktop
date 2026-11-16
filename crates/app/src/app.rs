@@ -513,13 +513,20 @@ impl HermesApp {
             }
             "type" => {
                 let arg = arg.to_owned();
+                let end = arg.len();
                 self.composer.update(cx, |s, cx| {
                     s.set_value(arg, window, cx);
+                    s.set_selected_range(end..end, cx);
                     s.focus(window, cx);
                 });
                 self.update_mention(cx);
             }
             "send" => self.send(window, cx),
+            "size" => {
+                if let Some((w, h)) = arg.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))) {
+                    window.resize(size(px(w), px(h)));
+                }
+            }
             "attach" => self.add_paths(&[PathBuf::from(arg)], cx),
             "share" => self.share(cx),
             "hidden" => {
