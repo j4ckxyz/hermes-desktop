@@ -227,10 +227,16 @@ impl Secrets {
 }
 
 /// A resolved backend address plus credential.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Endpoint {
     pub base: Url,
     pub token: String,
+}
+
+impl std::fmt::Debug for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Endpoint({}, token={})", self.base, if self.token.is_empty() { "none" } else { "***" })
+    }
 }
 
 impl Endpoint {

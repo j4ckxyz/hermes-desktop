@@ -241,12 +241,15 @@ impl Svc {
                 });
             }
             Cmd::SignOut { conn_id } => {
+                // Revoke first so a refresh already in flight can't write tokens back.
                 if let Some(c) = s.st.lock().unwrap().conns.remove(&conn_id) {
+                    c.rest.auth.revoke();
                     c.gw.stop();
                 }
                 // Native tokens are held only here: dropping them signs this app out (docs: Desktop
                 // Native Sign-In → "Sign out"). `/auth/logout` revokes cookie sessions only.
-                crate::conn::Secrets::delete(&conn_id);
+                // Keychain calls can block (a macOS prompt), so keep them off the actor loop.
+                tokio::task::spawn_blocking(move || crate::conn::Secrets::delete(&conn_id));
             }
             Cmd::Disconnect(id) => {
                 if let Some(c) = s.st.lock().unwrap().conns.remove(&id) {
@@ -396,7 +399,9 @@ impl Svc {
             Err(e) => return self.emit(Ev::Error { key: None, message: e.to_string() }),
         };
         // The dev `env` connection's token comes from the environment and is never saved.
-        let auth = Auth::new(&conn.id, ep.base.clone(), Stored::load(&conn.id), conn.id != "env");
+        // The keychain can block (e.g. an access prompt); let the other worker keep running.
+        let stored = tokio::task::block_in_place(|| Stored::load(&conn.id));
+        let auth = Auth::new(&conn.id, ep.base.clone(), stored, conn.id != "env");
         let Ok(rest) = Rest::new(auth.clone()) else { return };
         let (in_tx, in_rx) = async_channel::unbounded();
         let a = auth.clone();

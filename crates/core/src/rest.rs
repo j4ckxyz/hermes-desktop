@@ -30,6 +30,10 @@ impl Rest {
     pub fn new(auth: Arc<Auth>) -> Result<Rest> {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
+            // A stalled server must not hang history or a download forever.
+            .read_timeout(std::time::Duration::from_secs(45))
+            // Never carry the session token to another origin.
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("hermes-desktop/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Rest { auth, http })
@@ -66,6 +70,12 @@ impl Rest {
     }
 
     async fn json(&self, m: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        // Whole-call limit on top of the read timeout (uploads get longer).
+        let limit = std::time::Duration::from_secs(if m == Method::GET { 60 } else { 300 });
+        tokio::time::timeout(limit, self.json_inner(m, path, body)).await.map_err(|_| anyhow!("Hermes took too long to answer."))?
+    }
+
+    async fn json_inner(&self, m: Method, path: &str, body: Option<&Value>) -> Result<Value> {
         let r = self.send(m, path, body).await?;
         let st = r.status();
         let body: Value = r.json().await.unwrap_or(Value::Null);

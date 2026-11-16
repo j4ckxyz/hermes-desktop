@@ -84,6 +84,8 @@ struct LoginState {
     /// Counters for tests.
     pub refreshed: u32,
     pub logins: u32,
+    pub password_posts: u32,
+    refresh_delay_ms: u64,
 }
 
 #[derive(Clone)]
@@ -190,6 +192,23 @@ impl Mock {
         if let Some(k) = &self.0.lock().unwrap().kill {
             let _ = k.send(());
         }
+    }
+
+    /// Change the `basic` account's password (sessions survive until `revoke_sessions`).
+    pub fn set_password(&self, pass: &str) {
+        if let Some(b) = &mut self.0.lock().unwrap().basic {
+            b.1 = pass.to_owned();
+        }
+    }
+
+    /// Slow down `/auth/native/refresh` (tests racing sign-out against a refresh).
+    pub fn set_refresh_delay(&self, ms: u64) {
+        self.0.lock().unwrap().login.refresh_delay_ms = ms;
+    }
+
+    /// Password sign-in attempts so far, successful or not.
+    pub fn password_posts(&self) -> u32 {
+        self.0.lock().unwrap().login.password_posts
     }
 
     /// (refreshes, password logins) so far.
@@ -331,6 +350,7 @@ async fn password_login(State(m): State<Mock>, h: HeaderMap, Json(b): Json<Value
     if b.get("provider").and_then(Value::as_str) != Some("basic") {
         return err(StatusCode::NOT_FOUND, "unknown provider");
     }
+    i.login.password_posts += 1;
     let t = now();
     i.login.attempts.retain(|a| t - a < 60.0);
     if i.login.attempts.len() >= 10 {
@@ -378,6 +398,10 @@ async fn native_token(State(m): State<Mock>, Json(b): Json<Value>) -> Response {
 }
 
 async fn native_refresh(State(m): State<Mock>, Json(b): Json<Value>) -> Response {
+    let delay = m.0.lock().unwrap().login.refresh_delay_ms;
+    if delay > 0 {
+        tokio::time::sleep(Duration::from_millis(delay)).await;
+    }
     let mut i = m.0.lock().unwrap();
     let rt = b.get("refresh_token").and_then(Value::as_str).unwrap_or_default();
     let Some(user) = i.login.refresh.remove(rt) else { return err(StatusCode::UNAUTHORIZED, "session_expired") };

@@ -10,7 +10,7 @@ use gpui_component::input::{InputEvent, InputState, TextareaState};
 use gpui_component::text::TextViewState;
 use gpui_component::{Theme, ThemeMode};
 use hermes_core::apps::{self, AppItem, AppKind, AppsSnapshot};
-use hermes_core::conn::{ConnKind, Config, Connection, Prefs, Secrets};
+use hermes_core::conn::{ConnKind, Config, Connection, Prefs};
 use hermes_core::gateway::LinkState;
 use hermes_core::roster::{self, Bot, BotKey};
 use hermes_core::service::{Cmd, Ev, LocalFile, MAX_FILE_BYTES};
@@ -1678,10 +1678,10 @@ impl HermesApp {
 
     pub fn remove_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         self.config.connections.retain(|c| c.id != id);
-        Secrets::delete(id);
+        // Stops the link, revokes the live session and deletes the keychain entry off the UI thread.
+        self.svc.send(Cmd::SignOut { conn_id: id.to_owned() });
         let _ = self.svc.store.set_kv(&format!("account:{id}"), "");
         let _ = self.svc.store.set_kv(&format!("signedout:{id}"), "");
-        self.svc.send(Cmd::Disconnect(id.to_owned()));
         self.bots.retain(|b| b.key.conn != id);
         if self.selected.as_ref().is_some_and(|k| k.conn == id) {
             self.selected = None;

@@ -71,6 +71,8 @@ pub struct Onboard {
     pub bot_title: Entity<InputState>,
     pub show_password: bool,
     pub remember: bool,
+    /// The user accepted sending credentials over plain HTTP to this address.
+    pub allow_http: bool,
     /// `None` while scanning this computer.
     pub local: Option<Vec<ServerInfo>>,
     pub probe: Probe,
@@ -96,12 +98,19 @@ fn server_name(info: &ServerInfo) -> String {
     c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_else(|| "Hermes".into())
 }
 
+/// The address as shown to the user: the host for HTTPS, with `http://` spelled out otherwise so
+/// an unencrypted connection is never hidden.
 fn host_label(info: &ServerInfo) -> String {
     let u = &info.base;
-    match (u.host_str(), u.port()) {
+    let host = match (u.host_str(), u.port()) {
         (Some(h), Some(p)) => format!("{h}:{p}"),
         (Some(h), None) => h.to_owned(),
-        _ => u.as_str().to_owned(),
+        _ => return u.as_str().to_owned(),
+    };
+    if u.scheme() == "https" {
+        host
+    } else {
+        format!("{}://{host}", u.scheme())
     }
 }
 
@@ -163,7 +172,9 @@ impl HermesApp {
             token,
             bot_title,
             show_password: false,
-            remember: true,
+            // Refresh tokens already renew for 30 days; keeping the password is opt-in.
+            remember: false,
+            allow_http: false,
             local: None,
             probe: Probe::Idle,
             probe_gen: 0,
@@ -243,6 +254,7 @@ impl HermesApp {
     pub fn schedule_probe(&mut self, cx: &mut Context<Self>) {
         let Some(o) = &mut self.onboard else { return };
         o.probe_gen += 1;
+        o.allow_http = false;
         o.server = None;
         let gen = o.probe_gen;
         let input = o.url.read(cx).value().trim().to_owned();
@@ -290,6 +302,7 @@ impl HermesApp {
         let Some(o) = &mut self.onboard else { return };
         let Some(info) = o.local.as_ref().and_then(|l| l.get(i)).cloned() else { return };
         o.probe_gen += 1;
+        o.allow_http = false;
         o.url.update(cx, |s, cx| s.set_value(info.base.as_str().trim_end_matches('/').to_owned(), window, cx));
         o.server = Some(info.clone());
         o.probe = Probe::Ok(info);
@@ -312,6 +325,11 @@ impl HermesApp {
                     cx.notify();
                     return;
                 };
+                if info.auth_required && info.insecure() && !o.allow_http {
+                    o.error = Some(format!("{} isn't encrypted, so your password could be read on the network. Use its HTTPS or Tailscale address, or confirm below.", host_label(&info)));
+                    cx.notify();
+                    return;
+                }
                 if !info.auth_required {
                     // A dashboard on loopback has no accounts: it hands its session token to
                     // whoever loads the page from this machine.
@@ -603,6 +621,8 @@ impl HermesApp {
         let local = o.local.clone();
         let typed_local = local.as_ref().is_some_and(|l| l.iter().any(|s| Some(&s.base) == chosen.as_ref()));
         let probe = o.probe.clone();
+        let insecure = o.server.as_ref().is_some_and(|s| s.auth_required && s.insecure());
+        let allow_http = o.allow_http;
         let title = if o.existing { "Switch server" } else { "Choose your Hermes" };
         let status: Option<AnyElement> = match (&probe, typed_local) {
             (_, true) | (Probe::Idle, _) => None,
@@ -664,7 +684,37 @@ impl HermesApp {
                     .gap(px(8.))
                     .child(section_label("REMOTE OR TAILSCALE", &pal))
                     .child(Input::new(&url).prefix(ico("globe", 14., pal.faint)))
-                    .child(div().w_full().min_h(px(18.)).text_size(pal.t(12.)).when_some(status, |d, s| d.child(s))),
+                    .child(div().w_full().min_h(px(18.)).text_size(pal.t(12.)).when_some(status, |d, s| d.child(s)))
+                    .when(insecure, |d| {
+                        d.child(
+                            div()
+                                .id("ob-allow-http")
+                                .p(px(10.))
+                                .rounded(px(10.))
+                                .bg(pal.danger_soft)
+                                .flex()
+                                .items_start()
+                                .gap(px(10.))
+                                .cursor_pointer()
+                                .child(checkbox(allow_http, &pal))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .child(div().text_size(pal.t(13.)).text_color(pal.danger).child("Not encrypted"))
+                                        .child(div().text_size(pal.t(12.)).text_color(pal.muted).child("This address uses plain HTTP, so anyone on the network could read your password. Prefer its HTTPS or Tailscale address. Tick to send it anyway.")),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(o) = &mut this.onboard {
+                                        o.allow_http = !o.allow_http;
+                                        o.error = None;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
     }
 
@@ -706,7 +756,7 @@ impl HermesApp {
                     .gap(px(10.))
                     .cursor_pointer()
                     .child(checkbox(remember, &pal))
-                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_size(pal.t(13.)).child("Stay signed in")).child(div().text_size(pal.t(12.)).text_color(pal.muted).child("Keeps your password in the system keychain so Hermes can sign you back in when a session ends.")))
+                    .child(div().flex_1().min_w_0().flex().flex_col().child(div().text_size(pal.t(13.)).child("Stay signed in")).child(div().text_size(pal.t(12.)).text_color(pal.muted).child("Sessions renew on their own for 30 days. Tick to also keep your password in the system keychain, so Hermes can sign you back in after that or after a password reset elsewhere.")))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(o) = &mut this.onboard {
                             o.remember = !o.remember;
@@ -840,5 +890,6 @@ mod tests {
         assert_eq!(server_name(&info("https://homelab.tail1234.ts.net")), "Homelab");
         assert_eq!(server_name(&info("http://100.64.0.7:9119")), "100.64.0.7");
         assert_eq!(host_label(&info("https://homelab.tail1234.ts.net")), "homelab.tail1234.ts.net");
+        assert_eq!(host_label(&info("http://192.168.1.5:9119")), "http://192.168.1.5:9119");
     }
 }

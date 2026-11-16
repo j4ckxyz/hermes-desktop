@@ -33,6 +33,23 @@ Fixes from a full code review (IDs from that review in brackets).
 - Opening a bot is single-flight, so concurrent opens can't create two Bot Chat sessions [M3].
 - A repeated `message.start` for the same `turn_id` no longer wipes the text streamed so far.
 
+### Sign-in hardening
+- Plain-HTTP addresses outside this computer and Tailscale are flagged "Not encrypted", and a
+  password or token is only sent there after you tick to confirm. The sign-in screens show
+  `http://` whenever it is used [H4].
+- HTTPS and WebSockets trust the OS certificate store as well as the bundled roots, so private
+  CAs and mkcert certificates work [M10].
+- Sign-out (and removing a server) revokes the in-memory session first, so a refresh already in
+  flight can't write tokens back to the keychain [M11].
+- A remembered password the server refuses is forgotten instead of being retried on every
+  reconnect. A dead refresh token is dropped too [M12].
+- "Stay signed in" (keeping the password) is now off by default: refresh tokens already renew
+  for 30 days [M21].
+- REST calls have read and overall timeouts and never follow redirects, so the session token
+  can't be carried to another origin [M9, L].
+- Tokens and passwords are redacted from Debug output, and keychain access no longer blocks the
+  UI thread or the network loop [L].
+
 ## [0.5.0] - 2026-11-16
 
 ### Added

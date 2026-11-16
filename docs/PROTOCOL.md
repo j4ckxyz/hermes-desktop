@@ -78,7 +78,10 @@ hermacos (`core/src/auth.rs`) uses the same headless password variant.
   in*, the app signs in again silently with the password kept in the keychain. Otherwise the link
   goes to *Sign in required* and Settings → Account offers **Sign in**.
 * Every WebSocket (re)connect mints a fresh ticket via `/api/auth/ws-ticket`.
-* **Sign out** deletes the keychain entry (what the native-flow docs prescribe; `/auth/logout` only
+* Plain HTTP to another machine (not loopback, not a Tailscale `*.ts.net` / 100.64.0.0/10 /
+  fd7a:115c:a1e0::/48 address) needs an explicit "send anyway" before credentials go out.
+* A remembered password the server refuses is deleted rather than retried.
+* **Sign out** revokes the live session in memory, then deletes the keychain entry (what the native-flow docs prescribe; `/auth/logout` only
   revokes cookie sessions, so it isn't called).
 * **Loopback dashboards** (no accounts): the page injects `window.__HERMES_SESSION_TOKEN__`
   (`web_server_dashboard.py:167/221`, docs ~L7722), rotated on every restart. The app reads it

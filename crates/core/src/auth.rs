@@ -41,7 +41,7 @@ const NATIVE_REDIRECT: &str = "http://127.0.0.1:53682/callback";
 const UA: &str = concat!("hermes-desktop/", env!("CARGO_PKG_VERSION"));
 
 /// What the keychain holds for a connection (one JSON entry per connection id).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Credential {
     /// Nothing yet (or signed out).
@@ -64,7 +64,25 @@ pub enum Credential {
     Loopback,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+// Debug is hand-written below so tokens and passwords never reach a log.
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Credential::None => write!(f, "None"),
+            Credential::Token { .. } => write!(f, "Token(***)"),
+            Credential::Native { provider, user_id, expires_at, refresh_token, .. } => write!(f, "Native({provider}, {user_id}, expires_at={expires_at}, refresh={}, ***)", refresh_token.is_some()),
+            Credential::Loopback => write!(f, "Loopback"),
+        }
+    }
+}
+
+impl std::fmt::Debug for Stored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stored({:?}, provider={:?}, username={:?}, password={})", self.cred, self.provider, self.username, if self.password.is_some() { "***" } else { "none" })
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Stored {
     pub cred: Credential,
     /// Password provider name, for silent re-authentication.
@@ -203,8 +221,26 @@ impl ServerInfo {
     pub fn password_provider(&self) -> Option<&Provider> {
         self.providers.iter().find(|p| p.supports_password)
     }
+    /// Plain HTTP to another machine outside a Tailscale tailnet (WireGuard already encrypts
+    /// those): a password or token sent here can be read on the network.
+    pub fn insecure(&self) -> bool {
+        self.base.scheme() == "http" && !self.is_loopback() && !is_tailscale(&self.base)
+    }
     pub fn is_loopback(&self) -> bool {
         is_loopback(&self.base)
+    }
+}
+
+/// MagicDNS names (`*.ts.net`) and Tailscale's CGNAT / ULA ranges.
+pub fn is_tailscale(u: &Url) -> bool {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.trim_end_matches('.').ends_with(".ts.net"),
+        Some(url::Host::Ipv4(ip)) => {
+            let o = ip.octets();
+            o[0] == 100 && (64..128).contains(&o[1])
+        }
+        Some(url::Host::Ipv6(ip)) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+        None => false,
     }
 }
 
@@ -476,11 +512,14 @@ pub struct Auth {
     loopback: Mutex<Option<String>>,
     gate: tokio::sync::Mutex<()>,
     persist: bool,
+    /// Signed out or removed: nothing may be used or written back any more, even by a refresh
+    /// that was already in flight.
+    revoked: std::sync::atomic::AtomicBool,
 }
 
 impl Auth {
     pub fn new(conn_id: &str, base: Url, stored: Stored, persist: bool) -> Arc<Auth> {
-        Arc::new(Auth { conn_id: conn_id.to_owned(), base, http: http(), stored: Mutex::new(stored), loopback: Mutex::new(None), gate: tokio::sync::Mutex::new(()), persist })
+        Arc::new(Auth { conn_id: conn_id.to_owned(), base, http: http(), stored: Mutex::new(stored), loopback: Mutex::new(None), gate: tokio::sync::Mutex::new(()), persist, revoked: Default::default() })
     }
 
     pub fn load(conn_id: &str, base: Url) -> Arc<Auth> {
@@ -491,7 +530,21 @@ impl Auth {
         self.stored.lock().unwrap().clone()
     }
 
+    /// Forget the credential in memory and refuse to persist anything from now on.
+    pub fn revoke(&self) {
+        self.revoked.store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.stored.lock().unwrap() = Stored::default();
+        *self.loopback.lock().unwrap() = None;
+    }
+
+    pub fn is_revoked(&self) -> bool {
+        self.revoked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn set(&self, s: Stored) {
+        if self.is_revoked() {
+            return;
+        }
         if self.persist {
             if let Err(e) = s.save(&self.conn_id) {
                 log::warn!("couldn't save renewed sign-in to the keychain: {e}");
@@ -502,6 +555,9 @@ impl Auth {
 
     /// Headers for one REST call, refreshing first when the access token is about to lapse.
     pub async fn headers(&self) -> Result<Vec<(&'static str, String)>, AuthError> {
+        if self.is_revoked() {
+            return Err(AuthError::SignInRequired);
+        }
         let cred = self.stored().cred;
         let cred = match &cred {
             Credential::Native { expires_at, refresh_token: Some(_), access_token, .. } if *expires_at > 0 && *expires_at - now() < REFRESH_MARGIN_SECS => {
@@ -569,17 +625,32 @@ impl Auth {
                     log::info!("renewed the session for {}", self.conn_id);
                     return Ok(());
                 }
-                400 | 401 => {} // session_expired: fall through to a fresh sign-in
+                400 | 401 => {
+                    // session_expired: the refresh token is dead; don't present it again.
+                    if let Credential::Native { access_token, provider, user_id, expires_at, .. } = st.cred.clone() {
+                        self.set(Stored { cred: Credential::Native { access_token, refresh_token: None, expires_at, provider, user_id }, ..st.clone() });
+                    }
+                }
                 s => return Err(AuthError::Server(s, detail(r).await)),
             }
         }
+        let st = self.stored();
         match (&st.provider, &st.username, &st.password) {
-            (Some(p), Some(u), Some(pw)) => {
-                let cred = login_password(&self.base, p, u, pw).await?;
-                self.set(Stored { cred, ..st.clone() });
-                log::info!("signed in again silently for {}", self.conn_id);
-                Ok(())
-            }
+            (Some(p), Some(u), Some(pw)) => match login_password(&self.base, p, u, pw).await {
+                Ok(cred) => {
+                    self.set(Stored { cred, ..st.clone() });
+                    log::info!("signed in again silently for {}", self.conn_id);
+                    Ok(())
+                }
+                Err(AuthError::InvalidCredentials) => {
+                    // The password changed on the server: forget it so reconnects stop posting
+                    // it (rate limiter, audit log) and ask the user instead.
+                    self.set(Stored { password: None, ..st.clone() });
+                    log::info!("remembered password for {} was refused; sign-in required", self.conn_id);
+                    Err(AuthError::SignInRequired)
+                }
+                Err(e) => Err(e),
+            },
             _ => Err(AuthError::SignInRequired),
         }
     }
@@ -643,6 +714,27 @@ impl Auth {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plain_http_is_flagged_off_loopback_and_tailscale() {
+        let info = |u: &str| ServerInfo { base: Url::parse(u).unwrap(), version: String::new(), auth_required: true, native: true, providers: vec![] };
+        assert!(info("http://192.168.1.20:9119").insecure());
+        assert!(info("http://hermes.example.com").insecure());
+        assert!(!info("https://hermes.example.com").insecure());
+        assert!(!info("http://127.0.0.1:9119").insecure());
+        assert!(!info("http://localhost:9119").insecure());
+        assert!(!info("http://homelab.tail1234.ts.net:9119").insecure());
+        assert!(!info("http://100.101.102.103:9119").insecure());
+        assert!(info("http://100.200.1.1:9119").insecure());
+        assert!(!info("http://[fd7a:115c:a1e0::1]:9119").insecure());
+    }
+
+    #[test]
+    fn debug_output_never_shows_secrets() {
+        let st = Stored { cred: Credential::Native { access_token: "AT-SECRET".into(), refresh_token: Some("RT-SECRET".into()), expires_at: 1, provider: "basic".into(), user_id: "jack".into() }, provider: Some("basic".into()), username: Some("jack".into()), password: Some("PW-SECRET".into()) };
+        let d = format!("{st:?} {:?} {:?}", st.cred, Credential::Token { token: "TOK-SECRET".into() });
+        assert!(!d.contains("SECRET"), "{d}");
+    }
 
     #[test]
     fn candidate_urls() {

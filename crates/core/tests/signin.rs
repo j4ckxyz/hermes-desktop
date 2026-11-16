@@ -201,3 +201,44 @@ fn probe_failures_are_explained() {
     assert!(e.to_string().contains("http://"), "{e}");
     assert!(!e.to_string().is_empty());
 }
+
+#[test]
+fn sign_out_during_a_refresh_leaves_nothing_behind() {
+    // A 60 s token is inside the refresh margin, so the next call refreshes (slowly here).
+    let (rt, m, url) = gated(60);
+    m.set_refresh_delay(400);
+    let base = url::Url::parse(&url).unwrap();
+    let cred = rt.block_on(auth::login_password(&base, "basic", "jack", "hunter2")).unwrap();
+    let st = Stored { cred, provider: Some("basic".into()), username: Some("jack".into()), password: None };
+    st.save("so1").unwrap();
+    let a = auth::Auth::new("so1", base, st, true);
+    let rest = Rest::new(a.clone()).unwrap();
+    let call = rt.spawn(async move { rest.me().await.map(|_| ()) });
+    std::thread::sleep(Duration::from_millis(100)); // the refresh is now in flight
+    a.revoke();
+    hermes_core::conn::Secrets::delete("so1");
+    let _ = rt.block_on(call).unwrap();
+    assert!(matches!(Stored::load("so1").cred, Credential::None), "the late refresh must not write tokens back");
+    assert!(a.is_revoked());
+}
+
+#[test]
+fn a_refused_saved_password_is_forgotten_not_retried() {
+    let (rt, m, url) = gated(3600);
+    let base = url::Url::parse(&url).unwrap();
+    let cred = rt.block_on(auth::login_password(&base, "basic", "jack", "hunter2")).unwrap();
+    let st = Stored { cred, provider: Some("basic".into()), username: Some("jack".into()), password: Some("hunter2".into()) };
+    let a = auth::Auth::new("pw1", base, st, false);
+    let rest = Rest::new(a.clone()).unwrap();
+    // Password changed elsewhere, and every session revoked.
+    m.set_password("new-password");
+    m.revoke_sessions();
+    let e = rt.block_on(rest.me()).unwrap_err();
+    assert!(e.to_string().contains("Sign in"), "{e}");
+    assert!(a.stored().password.is_none(), "the refused password is dropped");
+    let posts = m.password_posts();
+    for _ in 0..3 {
+        assert!(rt.block_on(rest.me()).is_err());
+    }
+    assert_eq!(m.password_posts(), posts, "no more password attempts after it was refused");
+}
