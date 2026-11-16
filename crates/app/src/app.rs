@@ -414,6 +414,40 @@ pub(crate) fn gap_due(msgs: &[MsgVm], loaded: bool, p: &Prefs, now: f64) -> Opti
     (gap > p.gap_hours as f64 * 3600.0).then_some((p.gap_action, gap))
 }
 
+/// Fold a fresh history into what's on screen instead of replacing it:
+/// * messages that didn't change keep their parsed markdown;
+/// * session-only rows (approvals, saved files, slash output, gap chips) stay;
+/// * older rows than the fetched window (an earlier page) stay.
+///
+/// Returns the merged list and whether its last message changed.
+pub(crate) fn merge_history(old: Vec<MsgVm>, fresh: Vec<ChatMessage>) -> (Vec<MsgVm>, bool) {
+    let old_last = old.last().map(|m| m.m.id.clone());
+    let first_ts = fresh.iter().find_map(|m| m.timestamp).unwrap_or(f64::INFINITY);
+    let ids: HashSet<&str> = fresh.iter().map(|m| m.id.as_str()).collect();
+    let mut keep = Vec::new();
+    let mut parsed: HashMap<String, MsgVm> = HashMap::new();
+    for vm in old {
+        if ids.contains(vm.m.id.as_str()) {
+            parsed.insert(vm.m.id.clone(), vm);
+        } else if matches!(vm.m.role, Role::Local(_)) || (!vm.m.id.starts_with("local-") && vm.m.timestamp.is_some_and(|t| t < first_ts)) {
+            keep.push(vm);
+        }
+    }
+    let mut out: Vec<MsgVm> = fresh
+        .into_iter()
+        .map(|m| match parsed.remove(&m.id) {
+            Some(vm) if vm.m.text == m.text => MsgVm { m, md: vm.md },
+            _ => MsgVm { m, md: None },
+        })
+        .collect();
+    if !keep.is_empty() {
+        out.extend(keep);
+        out.sort_by(|a, b| a.m.timestamp.unwrap_or(f64::INFINITY).total_cmp(&b.m.timestamp.unwrap_or(f64::INFINITY)));
+    }
+    let changed = out.last().map(|m| &m.m.id) != old_last.as_ref();
+    (out, changed)
+}
+
 /// Slash commands handled by the desktop, whatever the bot's catalog says.
 const LOCAL_SLASH: &[&str] = &["/usage", "/insights", "/stop", "/approve", "/deny"];
 
@@ -1027,11 +1061,14 @@ impl HermesApp {
                 if chat.streaming || chat.awaiting || (cached && chat.loaded) {
                     return;
                 }
-                chat.msgs = messages.into_iter().map(|m| MsgVm { m, md: None }).collect();
+                let old = std::mem::take(&mut chat.msgs);
+                let (msgs, tail_changed) = merge_history(old, messages);
+                chat.msgs = msgs;
                 chat.loaded = !cached;
                 chat.error = None;
                 chat.status = None;
-                if Some(&key) == self.selected.as_ref() {
+                // Only a new last message moves the view; a refetch of the same history doesn't.
+                if tail_changed && Some(&key) == self.selected.as_ref() {
                     self.list_count = usize::MAX;
                 }
             }

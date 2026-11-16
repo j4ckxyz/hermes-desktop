@@ -38,3 +38,20 @@ fn long_break_needs_fresh_history() {
     let off = Prefs { gap_action: GapAction::Off, ..p };
     assert_eq!(crate::app::gap_due(&old, true, &off, now), None);
 }
+
+#[test]
+fn history_refresh_merges_instead_of_replacing() {
+    use crate::app::{merge_history, MsgVm};
+    use hermes_core::transcript::{ChatMessage, LocalEvent, Role};
+    let vm = |id: &str, role: Role, ts: f64| MsgVm { m: ChatMessage::new(id, role, id, Some(ts)), md: None };
+    let chip = Role::Local(LocalEvent { icon: "file".into(), detail: None, code: None, path: None });
+    let old = vec![vm("earlier", Role::User, 1.0), vm("a", Role::User, 10.0), vm("saved", chip, 11.0), vm("b", Role::Assistant, 12.0)];
+    let fresh = vec![ChatMessage::new("a", Role::User, "a", Some(10.0)), ChatMessage::new("b", Role::Assistant, "b", Some(12.0))];
+    let (out, tail) = merge_history(old, fresh);
+    let ids: Vec<&str> = out.iter().map(|m| m.m.id.as_str()).collect();
+    assert_eq!(ids, ["earlier", "a", "saved", "b"], "chips and older pages survive a refetch");
+    assert!(!tail, "same last message: the view doesn't jump");
+    let (out, tail) = merge_history(out, vec![ChatMessage::new("b", Role::Assistant, "b", Some(12.0)), ChatMessage::new("c", Role::User, "c", Some(13.0))]);
+    assert_eq!(out.last().unwrap().m.id, "c");
+    assert!(tail);
+}

@@ -162,6 +162,9 @@ struct State {
     focused: Option<BotKey>,
 }
 
+/// `session.list` activity stamp and the messages fetched at that stamp.
+type OtherSession = (String, Vec<ChatMessage>);
+
 #[derive(Clone)]
 struct Svc {
     st: Arc<Mutex<State>>,
@@ -171,6 +174,9 @@ struct Svc {
     /// One `ensure_live` at a time per bot slot, so concurrent callers can't each create or
     /// resume a session.
     opening: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Other sessions' messages by (server, session id), with the `session.list` activity stamp
+    /// they were fetched at. Re-opening a bot refetches only the sessions that changed.
+    others: Arc<Mutex<HashMap<(String, String), OtherSession>>>,
 }
 
 /// Handle the UI keeps. Dropping it shuts the runtime down.
@@ -186,7 +192,7 @@ impl Service {
         let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).thread_name("hermes-io").enable_all().build()?;
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<Cmd>();
         let (ev_tx, ev_rx) = async_channel::unbounded::<Ev>();
-        let svc = Svc { st: Arc::new(Mutex::new(State { conns: HashMap::new(), focused: None })), store: store.clone(), ev: ev_tx, cache_dir, opening: Default::default() };
+        let svc = Svc { st: Arc::new(Mutex::new(State { conns: HashMap::new(), focused: None })), store: store.clone(), ev: ev_tx, cache_dir, opening: Default::default(), others: Default::default() };
         rt.spawn(svc.clone().run(cmd_rx));
         Ok(Service { cmd: cmd_tx, ev: ev_rx, store, _rt: rt })
     }
@@ -918,21 +924,39 @@ impl Svc {
         let (Some(gw), Some(rest)) = (self.gw(&key.conn), self.rest(&key.conn)) else { return msgs };
         let Ok(r) = gw.call("session.list", json!({"profile": key.profile, "limit": MAX_SESSIONS + 1, "include_hidden": true})).await else { return msgs };
         let rows = r.get("sessions").or_else(|| r.get("rows")).or(Some(&r)).and_then(Value::as_array).cloned().unwrap_or_default();
-        let wanted: Vec<(String, String, String)> = rows
+        let wanted: Vec<(String, String, String, String)> = rows
             .iter()
             .filter_map(|row| {
                 let id = row.get("resolved_id").or_else(|| row.get("session_id")).or_else(|| row.get("id")).and_then(Value::as_str)?;
                 let s = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
-                (id != canonical).then(|| (id.to_owned(), s("title"), s("source")))
+                (id != canonical).then(|| (id.to_owned(), s("title"), s("source"), activity_stamp(row)))
             })
             .take(MAX_SESSIONS)
             .collect();
-        // Fetch concurrently so opening a bot stays quick.
-        let fetched = futures_util::future::join_all(wanted.iter().map(|(id, _, _)| rest.messages(id, &key.profile, 60))).await;
+        // Unchanged sessions come from memory; the rest are fetched concurrently.
+        let cached = |id: &str, stamp: &str| -> Option<Vec<ChatMessage>> {
+            let o = self.others.lock().unwrap();
+            o.get(&(key.conn.clone(), id.to_owned())).filter(|(s, _)| !stamp.is_empty() && s == stamp).map(|(_, m)| m.clone())
+        };
+        let fetched = futures_util::future::join_all(wanted.iter().map(|(id, _, _, stamp)| {
+            let hit = cached(id, stamp);
+            let rest = rest.clone();
+            let profile = key.profile.clone();
+            let id = id.clone();
+            async move {
+                match hit {
+                    Some(m) => Ok((m, false)),
+                    None => rest.messages(&id, &profile, 60).await.map(|h| (transcript::from_history(&h), true)),
+                }
+            }
+        }))
+        .await;
         let mut extra = Vec::new();
-        for ((id, title, source), hist) in wanted.into_iter().zip(fetched) {
-            let Ok(hist) = hist else { continue };
-            let part = transcript::from_history(&hist);
+        for ((id, title, source, stamp), hist) in wanted.into_iter().zip(fetched) {
+            let Ok((part, fresh)) = hist else { continue };
+            if fresh && !stamp.is_empty() {
+                self.others.lock().unwrap().insert((key.conn.clone(), id.clone()), (stamp, part.clone()));
+            }
             let Some(first_ts) = part.iter().find_map(|m| m.timestamp) else { continue };
             // Earlier canonical chats need no marker: they are the same conversation.
             if title != BOT_CHAT_TITLE {
@@ -1123,6 +1147,17 @@ fn b64_of(data_url: &str) -> &str {
 
 pub fn now() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+}
+
+/// What changes in a `session.list` row when its messages do.
+fn activity_stamp(row: &Value) -> String {
+    let last = row.get("last_active_at").or_else(|| row.get("last_active")).or_else(|| row.get("updated_at")).map(Value::to_string).unwrap_or_default();
+    let count = row.get("message_count").map(Value::to_string).unwrap_or_default();
+    if last.is_empty() && count.is_empty() {
+        String::new()
+    } else {
+        format!("{last}/{count}")
+    }
 }
 
 fn hash(s: &str) -> u64 {
