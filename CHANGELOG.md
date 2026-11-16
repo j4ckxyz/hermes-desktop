@@ -32,6 +32,47 @@ Fixes from a full code review (IDs from that review in brackets).
   raises a notification and a "Waiting for your approval" badge in the sidebar [H5].
 - Opening a bot is single-flight, so concurrent opens can't create two Bot Chat sessions [M3].
 - A repeated `message.start` for the same `turn_id` no longer wipes the text streamed so far.
+- Messages that merely start with `/` (paths such as `/etc/hosts`) are sent as text; only known
+  commands go to `slash.exec` [M2].
+- Attachments are base64-encoded once, straight into the data URL, and a slow large upload no
+  longer trips the "connection went quiet" watchdog [M5].
+- Roster change detection no longer sees a change when only the unread set's order differs [M8].
+- Reconnect backoff only starts over after a link stayed up for 10 s, so a server that drops
+  every connection isn't hit every 400 ms [M13].
+- Bot metadata writes patch the raw `ui_meta` object, so keys another client wrote survive even
+  when this client can't parse them [M14].
+- The sidebar preview of each bot is computed once instead of on every animation frame [M15,
+  partial].
+- A refreshed history is merged into the chat instead of replacing it: markdown isn't re-parsed,
+  session-only rows (saved files, slash output, approvals) stay, and the view only moves when
+  the last message changed. Other sessions are refetched only when they changed [M16, partial].
+- The long-break refresh is only judged from history fetched from Hermes, and its chip appears
+  once Hermes confirms the compaction or new session [M17].
+- The config file is written atomically; a file that doesn't parse is kept as `config.json.bak`
+  before defaults are used [M18].
+- Accessibility: buttons, icon buttons and toggles are keyboard focusable (Enter/Space) with a
+  focus ring, an accessible role and name, and tooltips on icon buttons. Faint text meets 4.5:1
+  and text on orange, green, teal or light accents switches to near-black [M19, partial].
+- Connector logos load, fetched by the core over HTTPS with a size cap and cache [M20].
+- Windows: a native title bar and no console window in release builds. Linux: server-side
+  decorations, or a drawn title bar with resize edges on compositors that refuse them [H2].
+- Unread markers use the server's clock, so a skewed local clock can't hide or stick them.
+- Usage: the daily chart ends on the server's latest day, and totals across bots add each bot's
+  best cost figure instead of letting one provider-reported cost hide the others' estimates.
+- Connector ids containing `:` no longer leave an app card busy; typing `@` while an input
+  method composes can no longer crash the mention lookup.
+- Local data stays bounded: the log rolls over at 5 MB, pasted images expire after a day, the
+  media and logo caches are trimmed, and cached chats of removed servers are deleted. Opening
+  the palette or Apps page no longer adds a subscription each time.
+- Long credentials are split across Windows Credential Manager entries (2,560-byte limit).
+- "Remove server" asks for confirmation; Edit and Window menus; the window size is remembered;
+  the mic button that only showed a toast is gone; the token step no longer suggests an API key;
+  a cancelled file drag clears the drop highlight; the display name falls back to `USERNAME`.
+
+### Development
+- Demo script mode and the `HERMES_DESKTOP_*` / `HERMES_TOKEN_*` overrides only exist in debug
+  builds. Scripted windows open unfocused and never activate the app or raise themselves.
+- The unused `api_server.rs` client was removed.
 
 ### Sign-in hardening
 - Plain-HTTP addresses outside this computer and Tailscale are flagged "Not encrypted", and a

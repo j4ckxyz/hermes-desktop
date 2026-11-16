@@ -17,7 +17,9 @@ in `docs/PROTOCOL.md` instead of working around it. Cite the docs page, or the
 ## Layout
 
 ```
-crates/core   hermes-core: protocol clients (gateway.rs WS JSON-RPC, rest.rs, api_server.rs),
+crates/core   hermes-core: protocol clients (gateway.rs WS JSON-RPC, rest.rs),
+              files.rs (link/open safety rules, portable names, quarantine flag),
+              logos.rs (connector logos), housekeeping.rs (log rotation, cache caps),
               roster.rs (Bot Mode: bots = profiles, mentions, agent notices),
               transcript.rs (history rows, MEDIA tags), store.rs (SQLite cache),
               conn.rs (config + OS keychain), service.rs (actor: Cmd in, Ev out)
@@ -28,7 +30,10 @@ crates/core   hermes-core: protocol clients (gateway.rs WS JSON-RPC, rest.rs, ap
 crates/mock   hermes-mock: stand-in backend that follows the documented wire (tests + demos)
 crates/app    hermes-desktop: GPUI binary. app.rs = state, actions, shortcuts, RPC routing;
               view.rs = sidebar, chat, composer, info pane; overlays.rs = palette, settings,
-              apps, new bot; onboard.rs = first-run / add-server / sign-in flow; ui.rs = shared controls; theme.rs = palette + prefs
+              apps, new bot; onboard.rs = first-run / add-server / sign-in flow; ui.rs = shared controls
+              (focusable, labelled); theme.rs = palette + prefs + contrast; notify.rs = OS notifications
+              (notify-rust, never a shell); guard.rs = link clicks and "Open" through files.rs;
+              chrome.rs = per-platform window chrome (Linux client-side decorations); tests.rs
 docs/         PROTOCOL.md (wire notes and API gaps), ci/ (drafted CI), screenshots/
 ```
 
