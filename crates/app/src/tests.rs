@@ -63,3 +63,22 @@ fn every_icon_button_has_a_name() {
         assert_ne!(crate::ui::icon_label(name), "Button", "{name}");
     }
 }
+
+#[test]
+fn rpc_tags_survive_colons_in_ids() {
+    let tag = crate::app::rpc_tag(&["apps-act", "mcp:github:prod", "connect"]);
+    let mut p = tag.splitn(3, '\u{1f}');
+    assert_eq!((p.next(), p.next(), p.next()), (Some("apps-act"), Some("mcp:github:prod"), Some("connect")));
+}
+
+#[test]
+fn mention_lookup_never_slices_mid_character() {
+    use crate::app::mention_query;
+    assert_eq!(mention_query("hi @res", 7), Some((3, 7, "res")));
+    let t = "ask @研究"; // each CJK char is 3 bytes
+    for c in 0..=t.len() + 2 {
+        let _ = mention_query(t, c); // no panic at any byte offset
+    }
+    assert_eq!(mention_query(t, 9), Some((4, 8, "研")));
+    assert_eq!(mention_query("mail a@b", 8), None, "not at a word start");
+}

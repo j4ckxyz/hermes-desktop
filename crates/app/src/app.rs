@@ -450,6 +450,27 @@ pub(crate) fn merge_history(old: Vec<MsgVm>, fresh: Vec<ChatMessage>) -> (Vec<Ms
     (out, changed)
 }
 
+/// The `@query` being typed at `cursor`: (position of `@`, cursor snapped to a char boundary,
+/// query). The cursor can sit inside a multi-byte character while an input method composes,
+/// so it is moved back to the previous boundary instead of slicing mid-character.
+pub(crate) fn mention_query(text: &str, cursor: usize) -> Option<(usize, usize, &str)> {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    let before = &text[..cursor];
+    let at = before.rfind('@')?;
+    let q = &before[at + 1..];
+    let ok_start = at == 0 || before[..at].ends_with(char::is_whitespace);
+    (ok_start && !q.contains(char::is_whitespace) && q.chars().count() <= 40).then_some((at, cursor, q))
+}
+
+/// An RPC tag from fields that may themselves contain `:` (connector ids such as `mcp:github`,
+/// server names). The unit separator never appears in ids or names.
+pub(crate) fn rpc_tag(parts: &[&str]) -> String {
+    parts.join("\u{1f}")
+}
+
 /// Slash commands handled by the desktop, whatever the bot's catalog says.
 const LOCAL_SLASH: &[&str] = &["/usage", "/insights", "/stop", "/approve", "/deny"];
 
@@ -1570,7 +1591,7 @@ impl HermesApp {
         u.data.clear();
         let (gen, days) = (u.gen, u.days);
         for k in bots {
-            self.svc.send(Cmd::Usage { conn: k.conn.clone(), profile: Some(k.profile.clone()), days, tag: format!("usage:{gen}:{}:{}", k.conn, k.profile) });
+            self.svc.send(Cmd::Usage { conn: k.conn.clone(), profile: Some(k.profile.clone()), days, tag: rpc_tag(&["usage", &gen.to_string(), &k.conn, &k.profile]) });
         }
         cx.notify();
     }
@@ -1609,17 +1630,12 @@ impl HermesApp {
     pub fn update_mention(&mut self, cx: &mut Context<Self>) {
         let st = self.composer.read(cx);
         let text = st.value().to_string();
-        let cursor = st.cursor().min(text.len());
+        let cursor = st.cursor();
         self.mention = None;
-        let before = &text[..cursor];
-        if let Some(at) = before.rfind('@') {
-            let q = &before[at + 1..];
-            let ok_start = at == 0 || before[..at].ends_with(char::is_whitespace);
-            if ok_start && !q.contains(char::is_whitespace) && q.len() <= 40 {
-                let items: Vec<BotKey> = roster::complete_mention(q, &self.bots).into_iter().take(6).map(|b| b.key.clone()).collect();
-                if !items.is_empty() {
-                    self.mention = Some(MentionPopup { at, cursor, items, sel: 0 });
-                }
+        if let Some((at, cursor, q)) = mention_query(&text, cursor) {
+            let items: Vec<BotKey> = roster::complete_mention(q, &self.bots).into_iter().take(6).map(|b| b.key.clone()).collect();
+            if !items.is_empty() {
+                self.mention = Some(MentionPopup { at, cursor, items, sel: 0 });
             }
         }
         cx.notify();
@@ -1948,8 +1964,8 @@ impl HermesApp {
         if !keep {
             self.info = Some(InfoState { key: key.clone(), describe: None, threads: None, edit: None });
         }
-        self.rpc(&key.conn, "profiles.describe", json!({"name": key.profile, "profile": key.profile}), format!("describe:{}:{}", key.conn, key.profile));
-        self.rpc(&key.conn, "session.list", json!({"profile": key.profile, "limit": 30}), format!("threads:{}:{}", key.conn, key.profile));
+        self.rpc(&key.conn, "profiles.describe", json!({"name": key.profile, "profile": key.profile}), rpc_tag(&["describe", &key.conn, &key.profile]));
+        self.rpc(&key.conn, "session.list", json!({"profile": key.profile, "limit": 30}), rpc_tag(&["threads", &key.conn, &key.profile]));
         cx.notify();
     }
 
@@ -1992,7 +2008,7 @@ impl HermesApp {
             self.svc.send(Cmd::SetMeta { key: key.clone(), patch: Value::Object(patch) });
         }
         if old.as_ref().and_then(|b| b.description.clone()).unwrap_or_default() != description {
-            self.rpc(&key.conn, "profiles.configure", json!({"name": key.profile, "description": description}), format!("edit:{}:{}", key.conn, key.profile));
+            self.rpc(&key.conn, "profiles.configure", json!({"name": key.profile, "description": description}), rpc_tag(&["edit", &key.conn, &key.profile]));
         }
         self.show_toast("Bot updated", false, cx);
         cx.notify();
@@ -2029,7 +2045,7 @@ impl HermesApp {
                 "skills" => apps::skills_list_params(p),
                 _ => apps::catalog_params(p),
             };
-            self.rpc(&key.conn, method, params, format!("apps:{gen}:{slot}"));
+            self.rpc(&key.conn, method, params, rpc_tag(&["apps", &gen.to_string(), slot]));
         }
         cx.notify();
     }
@@ -2045,7 +2061,7 @@ impl HermesApp {
             AppKind::Toolset => ("tools.configure", apps::toolset_params(&key.profile, &it.id, !it.connected), "toggle"),
             AppKind::Skill => return,
         };
-        self.rpc(&key.conn, method, params, format!("apps-act:{}:{what}", it.id));
+        self.rpc(&key.conn, method, params, rpc_tag(&["apps-act", &it.id, what]));
         cx.notify();
     }
 
@@ -2057,7 +2073,7 @@ impl HermesApp {
             a.expanded = Some(it.id.clone());
             if it.kind == AppKind::Connector && !a.tools.contains_key(&it.id) {
                 let key = a.key.clone();
-                self.rpc(&key.conn, "connectors.tools", json!({"profile": key.profile, "slug": it.id}), format!("tools:{}", it.id));
+                self.rpc(&key.conn, "connectors.tools", json!({"profile": key.profile, "slug": it.id}), rpc_tag(&["tools", &it.id]));
             }
         }
         cx.notify();
@@ -2071,8 +2087,8 @@ impl HermesApp {
             }
             return;
         }
-        if let Some(rest) = tag.strip_prefix("usage:") {
-            let mut it = rest.splitn(3, ':');
+        if let Some(rest) = tag.strip_prefix("usage\u{1f}") {
+            let mut it = rest.splitn(3, '\u{1f}');
             let (gen, conn, profile) = (it.next().and_then(|g| g.parse::<u64>().ok()).unwrap_or(0), it.next().unwrap_or_default(), it.next().unwrap_or_default());
             if let Some(u) = &mut self.usage {
                 if u.gen == gen {
@@ -2082,7 +2098,7 @@ impl HermesApp {
             }
             return;
         }
-        let mut parts = tag.splitn(3, ':');
+        let mut parts = tag.splitn(3, '\u{1f}');
         let (kind, a1, a2) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
         match kind {
             "apps" => {
