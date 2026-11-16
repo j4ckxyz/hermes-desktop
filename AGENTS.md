@@ -34,7 +34,11 @@ crates/app    hermes-desktop: GPUI binary. app.rs = state, actions, shortcuts, R
               (focusable, labelled); theme.rs = palette + prefs + contrast; notify.rs = OS notifications
               (notify-rust, never a shell); guard.rs = link clicks and "Open" through files.rs;
               chrome.rs = per-platform window chrome (Linux client-side decorations); tests.rs
-docs/         PROTOCOL.md (wire notes and API gaps), ci/ (drafted CI), screenshots/
+docs/         PROTOCOL.md (wire notes and API gaps), screenshots/ (README images)
+packaging/    icon, macOS Info.plist, Linux .desktop entry (used by the Release workflow)
+install.sh, install.ps1   one-line installers (download latest release, verify SHA256SUMS)
+.github/workflows/  ci.yml (clippy + tests on macOS/Linux/Windows), release.yml (v* tags:
+              build, package, publish with SHA256SUMS, then install-test.yml), install-test.yml
 ```
 
 Threading: the UI thread only renders. All I/O runs on a 2-worker tokio runtime inside
@@ -86,10 +90,17 @@ Dev-only environment variables (read through `conn::dev_env`; release builds ign
 * **UI**: build on `ui.rs` controls. Sizes sit on the 4/8 px grid (controls 24/28/32/36 px,
   icons 16 px in 32 px boxes); scale text with `Palette::t` and spacing with `Palette::g`. Check
   both themes and a narrow window with window-only screenshots before committing UI changes.
+  Screenshots are public: they must show only mock data (`scripts/screenshots.sh` sets a neutral
+  `USER`), never a real account name, host or path.
 * **Gateway methods** that the shared gateway may refuse (`connectors.*`, `mcp.*`, ...) go through
   `Cmd::Rpc`; a -32601 becomes a friendly notice, never a fallback of our own.
-* **CI** is drafted in `docs/ci/`. The pushing token lacks the `workflow` scope, so do not add
-  `.github/workflows/` until it has it.
+* **CI** runs on every push to `main` and every PR (`.github/workflows/ci.yml`); keep it green on
+  all three platforms. Pushing workflow changes needs a token with the `workflow` scope.
+* **Releases**: bump the version (below), commit, then push a `vX.Y.Z` tag matching `VERSION`.
+  The Release workflow refuses a tag that doesn't match. Only free GitHub-hosted runners, no
+  secrets: macOS builds are ad-hoc signed, not notarised.
+* `hermes-desktop --version` / `--help` must keep answering before any window, config or keychain
+  access: installers and CI rely on it.
 
 ## Versioning (semver)
 

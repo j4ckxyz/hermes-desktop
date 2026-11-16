@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hermes
+GenericName=Hermes Agent client
+Comment=A fast native desktop client for Hermes Agent
+Exec=hermes-desktop
+Icon=hermes-desktop
+Terminal=false
+Categories=Network;Chat;Utility;
+StartupWMClass=hermes-desktop

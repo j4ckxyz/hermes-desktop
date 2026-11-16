@@ -3,6 +3,23 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.7.0] - 2026-11-16
+
+### Added
+- Releases for macOS (universal `.app` in a `.dmg` and `.zip`, ad-hoc signed), Linux (x86_64
+  and arm64 tarballs with a menu entry and icon) and Windows (x86_64 zip), built by GitHub
+  Actions on every `v*` tag and published with `SHA256SUMS`.
+- One-line installers: `install.sh` (macOS, Linux) and `install.ps1` (Windows). Both verify the
+  download's SHA256 before installing, need no administrator rights and launch nothing.
+- `hermes-desktop --version` and `--help`, answered before any window opens.
+- CI on macOS, Linux and Windows (clippy with warnings as errors, tests), and an install test
+  that runs both installers on fresh runners against each published release.
+- An app icon, a public README and the MIT licence file.
+
+### Changed
+- README screenshots are a small curated set showing only mock data; the screenshot script uses
+  a neutral display name.
+
 ## [0.6.0] - 2026-11-16
 
 Fixes from a full code review (IDs from that review in brackets).

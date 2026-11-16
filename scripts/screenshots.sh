@@ -10,8 +10,8 @@ mkdir -p "$OUT"
 "$ROOT/target/release/hermes-mock" --port 9139 --token demo --pace 30 & MOCK=$!
 trap 'kill $MOCK ${APP:-} 2>/dev/null; rm -rf "$HOME_DIR"' EXIT
 sleep 0.5
-shot() { # $1 = name, $2 = env script
-  HERMES_DESKTOP_HOME=$HOME_DIR HERMES_DESKTOP_URL=http://127.0.0.1:9139 HERMES_DESKTOP_TOKEN=demo \
+shot() { # $1 = name, $2 = env script. USER is neutral: the sidebar shows it as the display name.
+  USER=you HERMES_DESKTOP_HOME=$HOME_DIR HERMES_DESKTOP_URL=http://127.0.0.1:9139 HERMES_DESKTOP_TOKEN=demo \
   HERMES_DESKTOP_SCRIPT="$2" "$ROOT/target/debug/hermes-desktop" & APP=$!
   sleep "${3:-4}"
   ID=$("$WINID" $APP | awk '$NF=="Hermes"{print $1; exit}')
