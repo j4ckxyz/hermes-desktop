@@ -108,6 +108,10 @@ pub struct Bot {
     pub last_session: Option<SessionSummary>,
     /// Name of the connection, used to qualify handles that collide across machines.
     pub conn_name: String,
+    /// `preview()` computed once (markdown stripping and notice parsing are not free, and the
+    /// sidebar asks for it on every frame while something animates).
+    #[serde(skip)]
+    preview_cache: std::sync::OnceLock<String>,
 }
 
 fn summary(v: Option<&Value>) -> Option<SessionSummary> {
@@ -157,6 +161,7 @@ impl Bot {
             canonical: summary(row.get("canonical_session")),
             last_session: summary(row.get("last_session")),
             conn_name: conn_name.to_owned(),
+            preview_cache: Default::default(),
             name,
         })
     }
@@ -228,6 +233,10 @@ impl Bot {
     /// One-line preview of the latest message, with an agent-notice prefix replaced by the
     /// sender's name.
     pub fn preview(&self) -> String {
+        self.preview_cache.get_or_init(|| self.compute_preview()).clone()
+    }
+
+    fn compute_preview(&self) -> String {
         let has = |s: &&SessionSummary| s.preview.as_ref().is_some_and(|p| !p.trim().is_empty());
         let c = self.canonical.as_ref().filter(has);
         let l = self.last_session.as_ref().filter(has);
