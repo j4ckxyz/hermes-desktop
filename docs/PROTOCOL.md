@@ -44,6 +44,16 @@ The full reasoning is in [PLAN.md](../PLAN.md).
 * Agent output arrives as `MEDIA:/abs/path` tags. These are previewed (images inline) and can be
   opened or saved. Downloads stream to a `.part` file, which is renamed when complete.
 
+## Event chips
+* Routines are cron jobs managed by the agent's `cronjob` tool (`tools/cronjob_tools.py`:
+  `action` = create | list | update | pause | resume | remove | run | cancel, `name`, `job_id`).
+  The chip title comes from `tool.start.args` live (`ToolStartPayload.args` in
+  `tui_gateway/contracts/events.py`) and from `tool_calls[].function.arguments` in history.
+* Bot-to-bot messages are `Message from 🤖 …` user rows (Bot Mode). Consecutive rows from one sender
+  are grouped on the client.
+* Approvals answered and files saved are local, session-only events: there is no official
+  history row for them.
+
 ## Apps & Connectors
 Research result: Hermes has official directories, and the app uses only those.
 * **Hosted connectors**: `connectors.catalog {profile}` → `{connectors:[{slug,name,description,

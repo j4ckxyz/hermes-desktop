@@ -51,7 +51,8 @@ Dev-only environment variables:
 * `HERMES_DESKTOP_SCRIPT` holds `;`-separated steps (`wait:ms`, `select:profile`, `type:text`,
   `send`, `attach:path`, `share`, `hidden`, `newbot`, `setup`, `palette`, `query:text`,
   `settings:<section>`, `apps`, `category:<chip>`, `expand:<app id>`, `info`, `edit`,
-  `thread:<session id>`, `theme:system|light|dark`, `size:WxH`, `close`) for reproducible demos.
+  `thread:<session id>`, `theme:system|light|dark`, `size:WxH`, `unfold` (expand every event chip), `approve:<choice>`,
+  `saveas:<remote path>` (download into the demo home without a dialog), `close`) for reproducible demos.
 
 ## Rules
 

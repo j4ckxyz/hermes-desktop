@@ -15,7 +15,8 @@ static ICONS: &[(&str, &[u8])] = icons![
     "download", "bot", "check", "x", "loader-circle", "wrench", "external-link", "square", "users", "sparkles",
     "server", "palette", "bell", "message-circle", "folder", "keyboard", "shield", "sliders-horizontal", "info",
     "chevron-left", "chevron-right", "pencil", "plug", "arrow-left", "messages-square", "panel-right", "command",
-    "sun", "moon", "trash-2", "refresh-cw", "circle-alert", "layout-grid",
+    "sun", "moon", "trash-2", "refresh-cw", "circle-alert", "layout-grid", "clock", "globe", "terminal", "send",
+    "image", "brain", "chevron-down", "shield-check", "shield-x", "history",
 ];
 
 pub struct Assets;

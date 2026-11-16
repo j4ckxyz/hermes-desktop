@@ -3,7 +3,30 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
-## [0.2.1] - 2026-11-16
+## [0.3.0] - 2026-11-16
+
+### Changed
+- **System events are now small, muted, centred one-line chips** instead of bubbles and cards,
+  so the conversation stays the focus. Each chip has an icon or avatar and a short label, shows
+  its time on hover, and expands in place when clicked:
+  - bot-to-bot messages: "Message from (avatar) Research Buddy", and consecutive messages from one
+    sender fold into "2 messages with (avatar) Research Buddy". Expanding shows every message in
+    full, with an "Open Research Buddy" button. This replaces the large purple notice bubble.
+  - tool calls and subagents: one chip per call, or one summary chip per turn ("Used 2 tools and
+    2 subagents"), with a spinner while running. Expanding lists each step with its detail,
+    duration and result.
+  - routines (Hermes cron jobs): `cronjob` calls are titled from their arguments, e.g.
+    "Updated routine · News watch", from both live `tool.start.args` and stored
+    `tool_calls[].function.arguments`.
+  - timeline rows (model switch, compaction, process complete).
+
+### Added
+- Session-only chips for answered approvals ("Approved · rm -rf build/") and saved files ("Saved
+  report.pdf to Downloads", with Show in folder). Hermes history does not record these, so they
+  are not kept after a reload. The save toast is gone.
+- Demo-script steps `unfold`, `approve:<choice>` and `saveas:<remote path>`.
+
+ - 2026-11-16
 
 ### Added
 - `size:WxH` demo-script step, used for the narrow-window screenshot.

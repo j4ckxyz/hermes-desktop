@@ -87,7 +87,12 @@ impl Mock {
                 messages: vec![
                     row(1, "user", "Morning! What's on today?", t - 7200.0),
                     row(2, "assistant", "Good morning. You have **two** things queued:\n\n1. Review the *Q3 notes*\n2. Reply to Sam about the offsite\n\nWant me to draft the reply?", t - 7190.0),
+                    row(5, "user", "Keep an eye on agent news for me every weekday morning", t - 5400.0),
+                    json!({"id": 6, "role": "assistant", "content": "", "timestamp": t - 5395.0,
+                        "tool_calls": [{"id": "cj1", "type": "function", "function": {"name": "cronjob", "arguments": "{\"action\":\"update\",\"job_id\":\"j-news\",\"name\":\"News watch\",\"schedule\":\"0 8 * * 1-5\"}"}}]}),
+                    row(7, "assistant", "Done. **News watch** now runs at 08:00 on weekdays and posts a short digest here.", t - 5390.0),
                     row(3, "user", "Message from 🤖 Research Buddy (@research-buddy): I found 3 papers on retrieval-augmented agents, summary in your inbox.", t - 3600.0),
+                    row(8, "user", "Message from 🤖 Research Buddy (@research-buddy): Also flagged a 2024 follow-up on memory compaction. It is the second link in the doc.", t - 3598.0),
                     row(4, "assistant", "Research Buddy sent over three papers. Here's the gist:\n\n```rust\nfn rank(papers: &[Paper]) -> Vec<&Paper> {\n    let mut v: Vec<_> = papers.iter().collect();\n    v.sort_by_key(|p| std::cmp::Reverse(p.citations));\n    v\n}\n```\n\nSee [the survey](https://example.com/survey) for details.", t - 3590.0),
                 ],
                 last_active: t - 3590.0,
@@ -515,6 +520,13 @@ async fn run_turn(m: Mock, rt: String, stored: String, text: String, pace: u64) 
         tokio::time::sleep(Duration::from_millis(pace * 8)).await;
         let _ = tx.send(event("tool.complete", &rt, json!({"tool_id": "t1", "name": "web_search", "duration_s": 1.2, "summary": "5 results"})));
         tool_calls.push(json!({"id": "t1", "function": {"name": "web_search"}}));
+    }
+    if lower.contains("routine") || lower.contains("remind") {
+        let args = json!({"action": "create", "name": "News watch", "schedule": "0 8 * * 1-5", "prompt": "Summarise agent news"});
+        let _ = tx.send(event("tool.start", &rt, json!({"tool_id": "cj2", "name": "cronjob", "args": args, "context": "create News watch"})));
+        tokio::time::sleep(Duration::from_millis(pace * 6)).await;
+        let _ = tx.send(event("tool.complete", &rt, json!({"tool_id": "cj2", "name": "cronjob", "duration_s": 0.3, "summary": "job j-news scheduled"})));
+        tool_calls.push(json!({"id": "cj2", "function": {"name": "cronjob", "arguments": args.to_string()}}));
     }
     if lower.contains("delegate") || lower.contains("in parallel") {
         for (n, goal) in ["Survey crates.io for GPUI widgets", "Benchmark idle RAM"].iter().enumerate() {

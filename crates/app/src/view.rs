@@ -4,15 +4,33 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use gpui_component::input::{Input, Textarea};
+use gpui_component::ActiveTheme as _;
 use gpui_component::Sizable as _;
 use gpui_component::text::{TextView, TextViewState};
 use hermes_core::gateway::LinkState;
 use hermes_core::roster::{Bot, BotKey};
-use hermes_core::transcript::{Activity, Attachment, AttachmentKind, Role, ToolState};
+use hermes_core::transcript::{Activity, Attachment, AttachmentKind, ChatMessage, Role, ToolState};
 
 use crate::app::*;
 use crate::theme::ACCENTS;
 use crate::ui::*;
+
+/// What sits in front of an event chip's label or object name.
+pub enum Lead {
+    None,
+    Icon(&'static str),
+    Avatar(Option<Box<Bot>>, String),
+}
+
+/// A centred event: the chip, then (when expanded) its detail panel underneath.
+fn event_row(outer: Div, chip: AnyElement, panel: Option<Div>) -> AnyElement {
+    outer.flex().flex_col().items_center().gap(px(6.)).child(chip).when_some(panel, |d, p| d.child(p)).into_any_element()
+}
+
+/// The muted card an expanded chip opens.
+fn event_panel(pal: &crate::theme::Palette) -> Div {
+    div().w_full().max_w(px(560.)).p(px(12.)).flex().flex_col().gap(px(8.)).rounded(px(12.)).bg(pal.panel).border_1().border_color(pal.border)
+}
 
 pub const SIDEBAR_W: f32 = 280.;
 pub const INFO_W: f32 = 320.;
@@ -380,117 +398,314 @@ impl HermesApp {
                 })
                 .when(!time.is_empty(), |d| d.child(div().pr(px(4.)).text_size(pal.t(11.)).text_color(pal.faint).child(time)))
                 .into_any_element(),
-            Role::Assistant => outer
-                .flex()
-                .gap(px(12.))
-                .child(div().w(px(28.)).flex_none().when(!same, |d| d.child(avatar_for(bot.as_ref(), &key.profile, 28.))))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .items_start()
-                        .gap(px(4.))
-                        .when(!m.activity.is_empty() && prefs.show_tool_activity, |d| d.child(self.render_activity(&m.activity)))
-                        .when(!m.text.is_empty(), |d| {
-                            d.child(div().max_w(relative(0.9)).min_w_0().px(bpx).py(bpy).rounded(px(18.)).rounded_tl(px(6.)).bg(pal.bot_bubble).text_size(pal.t(14.)).child(body))
-                        })
-                        .when(m.streaming && m.text.is_empty() && (m.activity.is_empty() || !prefs.show_tool_activity), |d| d.child(typing_dots(&pal)))
-                        .when(!m.attachments.is_empty(), |d| d.child(atts))
-                        .when(!m.streaming && !time.is_empty(), |d| d.child(div().pl(px(4.)).text_size(pal.t(11.)).text_color(pal.faint).child(time))),
-                )
-                .into_any_element(),
-            Role::Agent(n) => {
-                let sender = self.bots.iter().find(|b| b.tags().contains(&n.handle.split('@').next().unwrap_or("").to_lowercase())).cloned();
+            Role::Assistant => {
+                let chips = (!m.activity.is_empty() && prefs.show_tool_activity).then(|| self.render_activity(&m, ix, cx));
+                let has_bubble = !m.text.is_empty() || !m.attachments.is_empty() || (m.streaming && chips.is_none());
                 outer
                     .flex()
-                    .gap(px(12.))
-                    .child(div().w(px(28.)).flex_none().child(avatar_for(sender.as_ref(), &n.name, 28.)))
-                    .child(
-                        div()
-                            .max_w(relative(0.9))
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap(px(4.))
-                            .px(px(14.))
-                            .py(px(12.))
-                            .rounded(px(14.))
-                            .bg(pal.notice_bg)
-                            .border_1()
-                            .border_color(pal.notice_border)
-                            .child(
-                                div()
-                                    .h(px(20.))
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.))
-                                    .text_size(pal.t(12.))
-                                    .child(ico("bot", 14., pal.text))
-                                    .child(div().font_weight(FontWeight::SEMIBOLD).child(format!("Message from {}", n.name)))
-                                    .child(div().text_color(pal.muted).child(format!("@{}", n.handle)))
-                                    .when(!time.is_empty(), |d| d.child(div().text_color(pal.faint).child(format!("· {time}")))),
-                            )
-                            .child(div().text_size(pal.t(14.)).child(TextView::markdown(SharedString::from(format!("notice-{}", m.id)), n.body.clone()).selectable(true)))
-                            .when(!m.attachments.is_empty(), |d| d.child(atts)),
-                    )
+                    .flex_col()
+                    .gap(px(8.))
+                    .when_some(chips, |d, c| d.child(c))
+                    .when(has_bubble, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .gap(px(12.))
+                                .child(div().w(px(28.)).flex_none().when(!same || !m.activity.is_empty(), |d| d.child(avatar_for(bot.as_ref(), &key.profile, 28.))))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_col()
+                                        .items_start()
+                                        .gap(px(4.))
+                                        .when(!m.text.is_empty(), |d| {
+                                            d.child(div().max_w(relative(0.9)).min_w_0().px(bpx).py(bpy).rounded(px(18.)).rounded_tl(px(6.)).bg(pal.bot_bubble).text_size(pal.t(14.)).child(body))
+                                        })
+                                        .when(m.streaming && m.text.is_empty(), |d| d.child(typing_dots(&pal)))
+                                        .when(!m.attachments.is_empty(), |d| d.child(atts))
+                                        .when(!m.streaming && !time.is_empty() && !m.text.is_empty(), |d| d.child(div().pl(px(4.)).text_size(pal.t(11.)).text_color(pal.faint).child(time))),
+                                ),
+                        )
+                    })
                     .into_any_element()
             }
-            Role::System => outer
-                .flex()
-                .justify_center()
-                .child(div().h(px(24.)).px(px(12.)).flex().items_center().rounded_full().bg(pal.hover).text_size(pal.t(12.)).text_color(pal.muted).child(m.text.clone()))
-                .into_any_element(),
+            Role::Agent(n) => {
+                let (head, len) = self.agent_run(key, ix);
+                if head != ix {
+                    // Folded into the chip at the head of the run.
+                    return div().into_any_element();
+                }
+                let sender = self.notice_sender(n);
+                let name = sender.as_ref().map(|b| b.title()).unwrap_or_else(|| n.name.clone());
+                let lead_text = if len == 1 { "Message from".to_owned() } else { format!("{len} messages with") };
+                let expanded = self.expanded_events.contains(&m.id);
+                let run: Vec<ChatMessage> = (head..head + len).map(|i| self.chats[key].msgs[i].m.clone()).collect();
+                let last_ts = run.last().and_then(|r| r.timestamp);
+                let chip = self.event_chip(&m.id, ix, Lead::None, lead_text, Some((Lead::Avatar(sender.clone().map(Box::new), name.clone()), name.clone())), last_ts, None, true, expanded, cx);
+                let panel = expanded.then(|| {
+                    let mut p = event_panel(&pal);
+                    for (i, r) in run.iter().enumerate() {
+                        let Role::Agent(rn) = &r.role else { continue };
+                        p = p.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.))
+                                .when(i > 0, |d| d.pt(px(8.)).border_t_1().border_color(pal.border))
+                                .child(
+                                    div()
+                                        .h(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .text_size(pal.t(12.))
+                                        .child(avatar_for(sender.as_ref(), &rn.name, 16.))
+                                        .child(div().font_weight(FontWeight::MEDIUM).text_color(pal.text).child(name.clone()))
+                                        .child(div().text_color(pal.faint).child(format!("@{}", rn.handle)))
+                                        .child(div().flex_1())
+                                        .child(div().text_color(pal.faint).child(fmt_clock(r.timestamp))),
+                                )
+                                .child(div().text_size(pal.t(13.)).text_color(pal.text).child(TextView::markdown(SharedString::from(format!("notice-{}", r.id)), rn.body.clone()).selectable(true))),
+                        );
+                        if !r.attachments.is_empty() {
+                            p = p.child(self.render_attachments(key, &r.attachments, false, cx));
+                        }
+                    }
+                    if let Some(b) = sender.clone() {
+                        let k = b.key.clone();
+                        p = p.child(
+                            div().flex().justify_end().child(
+                                button(SharedString::from(format!("open-sender-{}", m.id)), format!("Open {}", b.title()), Kind::Secondary, &pal)
+                                    .h(px(28.))
+                                    .on_click(cx.listener(move |this, _, window, cx| this.select(k.clone(), window, cx))),
+                            ),
+                        );
+                    }
+                    p
+                });
+                event_row(outer, chip, panel)
+            }
+            Role::System => {
+                let lower = m.text.to_lowercase();
+                let icon = if lower.contains("compact") {
+                    "history"
+                } else if lower.contains("model") {
+                    "sparkles"
+                } else if lower.contains("fail") || lower.contains("error") {
+                    "circle-alert"
+                } else {
+                    "info"
+                };
+                let long = m.text.chars().count() > 64;
+                let expanded = long && self.expanded_events.contains(&m.id);
+                let short = if long { hermes_core::roster::one_line(&m.text, 64) } else { m.text.clone() };
+                let chip = self.event_chip(&m.id, ix, Lead::Icon(icon), short, None, m.timestamp, None, long, expanded, cx);
+                let panel = expanded.then(|| event_panel(&pal).child(div().text_size(pal.t(13.)).text_color(pal.text).child(m.text.clone())));
+                event_row(outer, chip, panel)
+            }
+            Role::Local(ev) => {
+                let expandable = ev.detail.is_some() || ev.code.is_some();
+                let expanded = expandable && self.expanded_events.contains(&m.id);
+                let icon: &'static str = match ev.icon.as_str() {
+                    "download" => "download",
+                    "shield-check" => "shield-check",
+                    "shield-x" => "shield-x",
+                    _ => "info",
+                };
+                let (text, object) = match m.text.split_once(" · ") {
+                    Some((verb, obj)) => (format!("{verb} ·"), Some((Lead::None, obj.to_owned()))),
+                    None => (m.text.clone(), None),
+                };
+                let chip = self.event_chip(&m.id, ix, Lead::Icon(icon), text, object, m.timestamp, None, expandable, expanded, cx);
+                let mono = cx.theme().mono_font_family.clone();
+                let panel = expanded.then(|| {
+                    let path = ev.path.clone();
+                    event_panel(&pal)
+                        .when_some(ev.detail.clone(), |d, t| d.child(div().text_size(pal.t(13.)).text_color(pal.muted).child(t)))
+                        .when_some(ev.code.clone(), |d, t| {
+                            d.child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(pal.raised).font_family(mono).text_size(pal.t(12.)).text_color(pal.text).child(t))
+                        })
+                        .when_some(path, |d, p| {
+                            d.child(div().flex().justify_end().child(
+                                button(SharedString::from(format!("reveal-{}", m.id)), "Show in folder", Kind::Secondary, &pal).h(px(28.)).on_click(move |_, _, cx| cx.reveal_path(std::path::Path::new(&p))),
+                            ))
+                        })
+                });
+                event_row(outer, chip, panel)
+            }
         }
     }
 
-    fn render_activity(&self, acts: &[Activity]) -> impl IntoElement {
+    /// The head and length of the run of consecutive agent messages from one sender around `ix`.
+    fn agent_run(&self, key: &BotKey, ix: usize) -> (usize, usize) {
+        let msgs = &self.chats[key].msgs;
+        let handle = |i: usize| match &msgs[i].m.role {
+            Role::Agent(n) => Some(n.handle.to_lowercase()),
+            _ => None,
+        };
+        let Some(h) = handle(ix) else { return (ix, 1) };
+        let mut head = ix;
+        while head > 0 && handle(head - 1).as_ref() == Some(&h) {
+            head -= 1;
+        }
+        let mut end = ix + 1;
+        while end < msgs.len() && handle(end).as_ref() == Some(&h) {
+            end += 1;
+        }
+        (head, end - head)
+    }
+
+    fn notice_sender(&self, n: &hermes_core::roster::AgentNotice) -> Option<Bot> {
+        let tag = n.handle.split('@').next().unwrap_or("").to_lowercase();
+        self.bots.iter().find(|b| b.tags().contains(&tag)).cloned()
+    }
+
+    /// A small, muted, centred one-line chip for something that happened around the conversation.
+    /// The timestamp fades in on hover; clicking toggles the expanded panel.
+    #[allow(clippy::too_many_arguments)]
+    fn event_chip(
+        &self,
+        id: &str,
+        ix: usize,
+        lead: Lead,
+        text: String,
+        object: Option<(Lead, String)>,
+        ts: Option<f64>,
+        state: Option<ToolState>,
+        expandable: bool,
+        expanded: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let pal = self.pal;
-        div().flex().flex_col().gap(px(4.)).max_w(relative(0.9)).min_w(px(280.)).children(acts.iter().map(|a| {
-            let (state_icon, state_color) = match a.state {
-                ToolState::Running => ("loader-circle", pal.muted),
-                ToolState::Done => ("check", pal.ok),
-                ToolState::Failed => ("x", pal.danger),
+        let group = SharedString::from(format!("evg-{id}"));
+        let time = fmt_clock(ts);
+        let id_owned = id.to_owned();
+        let glyph = |l: Lead| -> Option<AnyElement> {
+            match l {
+                Lead::None => None,
+                Lead::Icon(name) => Some(ico(name, 14., pal.muted).into_any_element()),
+                Lead::Avatar(b, fallback) => Some(avatar_for(b.as_deref(), &fallback, 16.).into_any_element()),
+            }
+        };
+        let (hover, pressed) = (pal.hover, pal.pressed);
+        let chip = div()
+            .id(SharedString::from(format!("ev-{id}")))
+            .h(px(28.))
+            .max_w(px(560.))
+            .min_w_0()
+            .px(px(10.))
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(6.))
+            .rounded_full()
+            .border_1()
+            .border_color(pal.border)
+            .when(expanded, |d| d.bg(pal.hover))
+            .text_size(pal.t(12.))
+            .text_color(pal.muted)
+            .when_some(glyph(lead), |d, g| d.child(g))
+            .child(div().flex_none().child(text))
+            .when_some(object, |d, (l, name)| {
+                d.when_some(glyph(l), |d, g| d.child(g)).child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).text_color(pal.text).child(name))
+            })
+            .when_some(state, |d, st| match st {
+                ToolState::Running => d.child(
+                    ico("loader-circle", 12., pal.muted)
+                        .with_animation(SharedString::from(format!("evspin-{id}")), Animation::new(std::time::Duration::from_millis(900)).repeat(), |s, t| s.with_transformation(Transformation::rotate(percentage(t)))),
+                ),
+                ToolState::Failed => d.child(ico("x", 12., pal.danger)),
+                ToolState::Done => d,
+            })
+            .when(expandable, |d| {
+                d.cursor_pointer()
+                    .hover(move |s| s.bg(hover))
+                    .active(move |s| s.bg(pressed))
+                    .child(ico("chevron-down", 12., pal.faint).when(expanded, |s| s.with_transformation(Transformation::rotate(percentage(0.5)))))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_event(&id_owned, ix, cx)))
+            });
+        // The time hangs off the chip's right edge so the chip itself stays centred.
+        div()
+            .group(group.clone())
+            .relative()
+            .flex()
+            .items_center()
+            .child(chip)
+            .when(!time.is_empty() && self.config.prefs.show_timestamps, |d| {
+                d.child(div().absolute().left_full().pl(px(8.)).text_size(pal.t(11.)).text_color(pal.faint).whitespace_nowrap().opacity(0.).group_hover(group, |s| s.opacity(1.)).child(time))
+            })
+            .into_any_element()
+    }
+
+    /// Tool calls and subagents for one turn: one chip per call, or a single summary chip
+    /// when there are several, expanding to the full list.
+    fn render_activity(&self, m: &ChatMessage, ix: usize, cx: &mut Context<Self>) -> AnyElement {
+        let pal = self.pal;
+        let acts = &m.activity;
+        let id = format!("act-{}", m.id);
+        let expanded = self.expanded_events.contains(&id);
+        let label = |a: &Activity| if a.is_subagent { format!("Subagent · {}", a.title) } else { a.title.clone() };
+        let running = acts.iter().find(|a| a.state == ToolState::Running);
+        let failed = acts.iter().any(|a| a.state == ToolState::Failed);
+        let state = if running.is_some() {
+            Some(ToolState::Running)
+        } else if failed {
+            Some(ToolState::Failed)
+        } else {
+            Some(ToolState::Done)
+        };
+        let (icon, text, expandable) = if acts.len() == 1 {
+            let a = &acts[0];
+            (hermes_core::transcript::tool_icon(&a.name, a.is_subagent), label(a), a.detail.is_some() || a.summary.is_some() || a.duration_s.is_some())
+        } else if let Some(r) = running {
+            let done = acts.iter().filter(|a| a.state != ToolState::Running).count();
+            (hermes_core::transcript::tool_icon(&r.name, r.is_subagent), format!("{} · {done}/{}", label(r), acts.len()), true)
+        } else {
+            let subs = acts.iter().filter(|a| a.is_subagent).count();
+            let tools = acts.len() - subs;
+            let plural = |n: usize, w: &str| if n == 1 { format!("1 {w}") } else { format!("{n} {w}s") };
+            let text = match (tools, subs) {
+                (t, 0) => format!("Used {}", plural(t, "tool")),
+                (0, s) => format!("Ran {}", plural(s, "subagent")),
+                (t, s) => format!("Used {} and {}", plural(t, "tool"), plural(s, "subagent")),
             };
-            let running = a.state == ToolState::Running;
-            let id = SharedString::from(format!("act-{}-{}", a.id, a.is_subagent));
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .px(px(12.))
-                .py(px(8.))
-                .rounded(px(10.))
-                .border_1()
-                .border_color(if a.is_subagent { pal.notice_border } else { pal.border })
-                .bg(if a.is_subagent { pal.notice_bg } else { pal.panel })
-                .child(div().size(px(24.)).flex_none().rounded(px(6.)).bg(pal.hover).flex().items_center().justify_center().child(ico(if a.is_subagent { "users" } else { "wrench" }, 12., pal.muted)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.))
-                                .text_size(pal.t(13.))
-                                .child(div().min_w_0().truncate().font_weight(FontWeight::MEDIUM).child(if a.is_subagent { format!("Subagent · {}", a.title) } else { a.title.clone() }))
-                                .when_some(a.duration_s, |d, s| d.child(div().flex_none().text_color(pal.faint).child(format!("{s:.1}s")))),
-                        )
-                        .when_some(a.detail.clone().or(a.summary.clone()), |d, t| d.child(div().text_size(pal.t(12.)).text_color(pal.muted).truncate().child(t))),
-                )
-                .child(if running {
-                    ico(state_icon, 14., state_color)
-                        .with_animation(id, Animation::new(std::time::Duration::from_millis(900)).repeat(), |s, t| s.with_transformation(Transformation::rotate(percentage(t))))
-                        .into_any_element()
-                } else {
-                    ico(state_icon, 14., state_color).into_any_element()
-                })
-        }))
+            (if tools == 0 { "users" } else { "wrench" }, text, true)
+        };
+        // "Updated routine · News watch": the object after the separator is emphasised.
+        let (text, object) = match text.split_once(" · ") {
+            Some((verb, obj)) if acts.len() == 1 => (format!("{verb} ·"), Some((Lead::None, obj.to_owned()))),
+            _ => (text, None),
+        };
+        let chip = self.event_chip(&id, ix, Lead::Icon(icon), text, object, m.timestamp, state, expandable, expanded, cx);
+        let panel = expanded.then(|| {
+            event_panel(&pal).children(acts.iter().map(|a| {
+                let (si, sc) = match a.state {
+                    ToolState::Running => ("loader-circle", pal.muted),
+                    ToolState::Done => ("check", pal.ok),
+                    ToolState::Failed => ("x", pal.danger),
+                };
+                div()
+                    .min_h(px(32.))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(div().size(px(24.)).flex_none().rounded(px(6.)).bg(pal.hover).flex().items_center().justify_center().child(ico(hermes_core::transcript::tool_icon(&a.name, a.is_subagent), 12., pal.muted)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(div().text_size(pal.t(13.)).text_color(pal.text).truncate().child(label(a)))
+                            .when_some(a.detail.clone().or(a.summary.clone()), |d, t| d.child(div().text_size(pal.t(12.)).text_color(pal.muted).truncate().child(t))),
+                    )
+                    .when_some(a.duration_s, |d, s| d.child(div().flex_none().text_size(pal.t(11.)).text_color(pal.faint).child(format!("{s:.1}s"))))
+                    .child(ico(si, 14., sc))
+            }))
+        });
+        div().w_full().flex().flex_col().items_center().gap(px(6.)).child(chip).when_some(panel, |d, p| d.child(p)).into_any_element()
     }
 
     fn render_attachments(&mut self, key: &BotKey, atts: &[Attachment], mine: bool, cx: &mut Context<Self>) -> Div {
@@ -621,7 +836,7 @@ impl HermesApp {
                     .gap(px(8.))
                     .child(div().flex().items_center().gap(px(8.)).child(ico("shield", 16., pal.accent)).child(div().text_size(pal.t(14.)).font_weight(FontWeight::SEMIBOLD).child("Hermes wants to run a command")))
                     .when(!description.is_empty(), |d| d.child(div().text_size(pal.t(13.)).text_color(pal.muted).child(description)))
-                    .child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(pal.raised).font_family("Menlo").text_size(pal.t(13.)).child(command))
+                    .child(div().px(px(12.)).py(px(8.)).rounded(px(8.)).bg(pal.raised).font_family(cx.theme().mono_font_family.clone()).text_size(pal.t(13.)).child(command))
                     .child(div().pt(px(4.)).flex().flex_wrap().gap(px(8.)).children(choices.into_iter().map(|c| {
                         let (id2, c2) = (id.clone(), c.clone());
                         let label = match c.as_str() {

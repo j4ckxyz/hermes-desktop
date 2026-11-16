@@ -307,6 +307,8 @@ pub struct HermesApp {
     pub info_open: bool,
     pub info: Option<InfoState>,
     pub thread_titles: HashMap<String, String>,
+    /// Event chips (agent messages, tool runs, local events) the user has expanded, by message id.
+    pub expanded_events: HashSet<String>,
     pub window_active: bool,
     pub list: ListState,
     list_count: usize,
@@ -409,6 +411,7 @@ impl HermesApp {
             window_active: true,
             list,
             list_count: 0,
+            expanded_events: HashSet::new(),
             dragging: false,
             focus: cx.focus_handle(),
             rpc_gen: 0,
@@ -522,6 +525,33 @@ impl HermesApp {
                 self.update_mention(cx);
             }
             "send" => self.send(window, cx),
+            "unfold" => {
+                if let Some(chat) = self.selected.as_ref().and_then(|k| self.chats.get(k)) {
+                    for vm in &chat.msgs {
+                        match vm.m.role {
+                            Role::Assistant if !vm.m.activity.is_empty() => {
+                                self.expanded_events.insert(format!("act-{}", vm.m.id));
+                            }
+                            Role::Agent(_) | Role::System | Role::Local(_) => {
+                                self.expanded_events.insert(vm.m.id.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                    self.list_count = usize::MAX;
+                }
+            }
+            "approve" => {
+                if let Some(id) = self.approvals.first().map(|a| a.request_id.clone()) {
+                    self.approve(&id, arg, cx);
+                }
+            }
+            "saveas" => {
+                if let Some(key) = self.selected.clone() {
+                    let dest = Some(hermes_core::conn::data_dir().join("demo-downloads"));
+                    self.svc.send(Cmd::Download { key, remote: arg.to_owned(), dest, open: false });
+                }
+            }
             "size" => {
                 if let Some((w, h)) = arg.split_once('x').and_then(|(w, h)| Some((w.parse::<f32>().ok()?, h.parse::<f32>().ok()?))) {
                     window.resize(size(px(w), px(h)));
@@ -831,12 +861,18 @@ impl HermesApp {
             Ev::MediaReady { remote, local } => {
                 self.media.insert(remote, local);
             }
-            Ev::Downloaded { path, open } => {
+            Ev::Downloaded { key, path, open } => {
                 if open {
                     cx.open_with_system(&path);
                 } else {
-                    self.show_toast(format!("Saved {}", path.display()), false, cx);
-                    cx.reveal_path(&path);
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let dir = path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let full = path.display().to_string();
+                    // Show `~/…` rather than the full home path.
+                    let shown = directories::UserDirs::new()
+                        .and_then(|u| path.strip_prefix(u.home_dir()).ok().map(|r| format!("~/{}", r.display())))
+                        .unwrap_or_else(|| full.clone());
+                    self.push_local(&key, format!("Saved {name} to {dir}"), "download", None, Some(shown), Some(full));
                 }
             }
             Ev::Notify { key, title, body } => {
@@ -1014,9 +1050,43 @@ impl HermesApp {
         self.show_toast(if hidden { "Bot unhidden" } else { "Bot hidden (still reachable by @mention)" }, false, cx);
     }
 
+    /// Add a session-only event chip (Hermes history does not record approvals or local saves).
+    pub fn push_local(&mut self, key: &BotKey, text: String, icon: &str, detail: Option<String>, code: Option<String>, path: Option<String>) {
+        let ev = transcript::LocalEvent { icon: icon.to_owned(), detail, code, path };
+        let m = ChatMessage::new(format!("local-{}", uuid::Uuid::new_v4()), Role::Local(ev), text, Some(hermes_core::service::now()));
+        let chat = self.chat_mut(key);
+        // Keep a live reply last so streaming keeps appending to it.
+        let at = if chat.msgs.last().is_some_and(|m| m.m.streaming) { chat.msgs.len() - 1 } else { chat.msgs.len() };
+        chat.msgs.insert(at, MsgVm { m, md: None });
+        if self.selected.as_ref() == Some(key) {
+            self.list_count = usize::MAX;
+        }
+    }
+
+    /// Expand or collapse an event chip; `ix` is its list row, which must be re-measured.
+    pub fn toggle_event(&mut self, id: &str, ix: usize, cx: &mut Context<Self>) {
+        if !self.expanded_events.remove(id) {
+            self.expanded_events.insert(id.to_owned());
+        }
+        if ix < self.list_count && self.list_count != usize::MAX {
+            self.list.splice(ix..ix + 1, 1);
+        }
+        cx.notify();
+    }
+
     pub fn approve(&mut self, request_id: &str, choice: &str, cx: &mut Context<Self>) {
         if let Some(i) = self.approvals.iter().position(|a| a.request_id == request_id) {
             let a = self.approvals.remove(i);
+            if let Some(key) = a.key.clone() {
+                let (verb, icon) = if choice == "deny" { ("Denied", "shield-x") } else { ("Approved", "shield-check") };
+                let scope = match choice {
+                    "session" => " for this session",
+                    "always" => " always",
+                    _ => "",
+                };
+                let detail = (!a.description.is_empty()).then(|| a.description.clone());
+                self.push_local(&key, format!("{verb}{scope} · {}", roster::one_line(&a.command, 60)), icon, detail, Some(a.command.clone()), None);
+            }
             self.svc.send(Cmd::Approve { conn: a.conn, request_id: a.request_id, choice: choice.to_owned() });
         }
         cx.notify();

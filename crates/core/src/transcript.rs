@@ -21,6 +21,22 @@ pub enum Role {
     Agent(AgentNotice),
     /// Timeline markers (model switch, compaction, process completion…).
     System,
+    /// Something this desktop did that Hermes history does not record (an approval answered, a
+    /// file saved). Shown for the current session only; never sent anywhere.
+    Local(LocalEvent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalEvent {
+    /// Lucide icon name for the chip.
+    pub icon: String,
+    /// Prose shown when the chip is expanded (what an approval was for…).
+    pub detail: Option<String>,
+    /// Shown as code when expanded (the approved command, a saved path).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// A local file the expanded chip can reveal.
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,10 +205,15 @@ pub fn from_history(rows: &[Value]) -> Vec<ChatMessage> {
                     .iter()
                     .map(|c| {
                         let name = c.pointer("/function/name").or_else(|| c.get("name")).and_then(Value::as_str).unwrap_or("tool").to_owned();
+                        // OpenAI-style rows carry `arguments` as a JSON string.
+                        let args = c.pointer("/function/arguments").and_then(|a| match a {
+                            Value::String(s) => serde_json::from_str::<Value>(s).ok(),
+                            v => Some(v.clone()),
+                        });
                         Activity {
                             id: c.get("id").and_then(Value::as_str).unwrap_or_default().to_owned(),
                             is_subagent: name == "delegate_task",
-                            title: humanize(&name),
+                            title: tool_title(&name, args.as_ref()).unwrap_or_else(|| humanize(&name)),
                             name,
                             detail: None,
                             summary: None,
@@ -237,6 +258,49 @@ pub fn from_history(rows: &[Value]) -> Vec<ChatMessage> {
     out
 }
 
+/// A readable title for tools whose arguments name something the user cares about. Routines
+/// are Hermes cron jobs, managed by the `cronjob` tool (`tools/cronjob_tools.py`:
+/// `action` = create | list | update | pause | resume | remove | run | cancel, plus `name`/`job_id`).
+pub fn tool_title(name: &str, args: Option<&Value>) -> Option<String> {
+    match name {
+        "cronjob" => {
+            let a = args?;
+            let verb = match a.get("action")?.as_str()? {
+                "create" => "Created routine",
+                "update" => "Updated routine",
+                "pause" => "Paused routine",
+                "resume" => "Resumed routine",
+                "remove" => "Removed routine",
+                "run" => "Ran routine",
+                "cancel" => "Cancelled routine",
+                "list" => return Some("Checked routines".into()),
+                _ => return None,
+            };
+            let what = a.get("name").and_then(Value::as_str).filter(|s| !s.trim().is_empty()).or_else(|| a.get("job_id").and_then(Value::as_str));
+            Some(match what {
+                Some(w) => format!("{verb} · {w}"),
+                None => verb.to_owned(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Lucide icon for a tool chip.
+pub fn tool_icon(name: &str, is_subagent: bool) -> &'static str {
+    match name {
+        _ if is_subagent => "users",
+        "cronjob" => "clock",
+        "web_search" | "web_extract" | "browser_navigate" => "globe",
+        "terminal" | "process" => "terminal",
+        "read_file" | "write_file" | "patch" | "search_files" => "file-text",
+        "send_message" => "send",
+        "image_generate" => "image",
+        "memory" => "brain",
+        _ => "wrench",
+    }
+}
+
 pub fn humanize(name: &str) -> String {
     let s = name.replace(['_', '.'], " ");
     let mut c = s.chars();
@@ -251,7 +315,7 @@ pub fn to_markdown(title: &str, msgs: &[ChatMessage]) -> String {
             Role::User => "**You**".to_owned(),
             Role::Assistant => format!("**{title}**"),
             Role::Agent(n) => format!("**🤖 {} (@{})**", n.name, n.handle),
-            Role::System => "_system_".to_owned(),
+            Role::System | Role::Local(_) => "_system_".to_owned(),
         };
         s.push_str(&format!("{who}\n\n{}\n\n", m.text));
         for a in &m.attachments {
@@ -295,6 +359,23 @@ mod tests {
         assert!(matches!(&m[2].role, Role::Agent(n) if n.handle == "scribe"));
         assert_eq!(m[3].role, Role::System);
         assert_eq!(m[3].text, "Model → m2");
+    }
+
+    #[test]
+    fn routine_tool_titles() {
+        let a = json!({"action": "update", "name": "News watch", "job_id": "j1"});
+        assert_eq!(tool_title("cronjob", Some(&a)).as_deref(), Some("Updated routine · News watch"));
+        assert_eq!(tool_title("cronjob", Some(&json!({"action": "run", "job_id": "j1"}))).as_deref(), Some("Ran routine · j1"));
+        assert_eq!(tool_title("web_search", Some(&a)), None);
+        let rows = vec![
+            json!({"id": 1, "role": "user", "content": "every morning please", "timestamp": 1.0}),
+            json!({"id": 2, "role": "assistant", "content": "", "timestamp": 2.0,
+                "tool_calls": [{"id": "c1", "function": {"name": "cronjob", "arguments": "{\"action\":\"create\",\"name\":\"News watch\"}"}}]}),
+            json!({"id": 3, "role": "assistant", "content": "Done.", "timestamp": 3.0}),
+        ];
+        let m = from_history(&rows);
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[1].activity[0].title, "Created routine · News watch");
     }
 
     #[test]

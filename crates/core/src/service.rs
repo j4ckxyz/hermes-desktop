@@ -80,7 +80,7 @@ pub enum Ev {
     Approval { conn: String, key: Option<BotKey>, request_id: String, command: String, description: String, choices: Vec<String> },
     ApprovalGone { request_id: String },
     MediaReady { remote: String, local: PathBuf },
-    Downloaded { path: PathBuf, open: bool },
+    Downloaded { key: BotKey, path: PathBuf, open: bool },
     /// Something to surface as an OS notification (a bot replied while not focused).
     Notify { key: BotKey, title: String, body: String },
     Error { key: Option<BotKey>, message: String },
@@ -206,7 +206,7 @@ impl Svc {
                     let Some(rest) = s.rest(&key.conn) else { return };
                     let dir = dest.unwrap_or_else(|| directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| s.cache_dir.join("downloads")));
                     match rest.download(&remote, &key.profile, &dir, |_, _| {}).await {
-                        Ok(path) => s.emit(Ev::Downloaded { path, open }),
+                        Ok(path) => s.emit(Ev::Downloaded { key: key.clone(), path, open }),
                         Err(e) => s.emit(Ev::Error { key: Some(key), message: e.to_string() }),
                     }
                 });
@@ -438,7 +438,7 @@ impl Svc {
                     activity: Activity {
                         id: s("tool_id"),
                         is_subagent: false,
-                        title: label.unwrap_or_else(|| transcript::humanize(&name)),
+                        title: transcript::tool_title(&name, p.get("args")).or(label).unwrap_or_else(|| transcript::humanize(&name)),
                         name,
                         detail,
                         summary: p.get("summary").and_then(Value::as_str).map(|t| roster::one_line(t, 160)),

@@ -74,8 +74,11 @@ fn roster_chat_stream_mentions_files_compact() {
         Ev::History { key: k, messages, cached: false } if *k == key => Some(messages.clone()),
         _ => None,
     });
-    assert_eq!(msgs.len(), 4);
-    assert!(matches!(&msgs[2].role, Role::Agent(n) if n.name == "Research Buddy"));
+    assert_eq!(msgs.len(), 7);
+    // A routine update (cronjob tool call) is titled from its arguments.
+    assert_eq!(msgs[3].activity[0].title, "Updated routine · News watch");
+    assert!(matches!(&msgs[4].role, Role::Agent(n) if n.name == "Research Buddy"));
+    assert!(matches!(&msgs[5].role, Role::Agent(n) if n.name == "Research Buddy"));
 
     // Stream a reply with tool activity.
     svc.send(Cmd::Send { key: key.clone(), text: "please search for gpui".into(), files: vec![] });
