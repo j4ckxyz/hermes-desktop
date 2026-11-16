@@ -324,7 +324,7 @@ impl HermesApp {
                     group("NOTIFICATIONS", &pal)
                         .child(pref_toggle!("n-on", "Desktop notifications", "When a bot replies in a chat you're not looking at.", notifications))
                         .child(pref_toggle!("n-focus", "Only when Hermes is in the background", "Skip notifications while the window is active.", notify_only_unfocused))
-                        .child(row("Test", "Send a sample notification.", &pal).child(button("n-test", "Send test", Kind::Secondary, &pal).on_click(|_, _, _| crate::view::notify_os("Hermes", "Notifications are working.")))),
+                        .child(row("Test", "Send a sample notification.", &pal).child(button("n-test", "Send test", Kind::Secondary, &pal).on_click(|_, _, _| crate::notify::post("Hermes", "Notifications are working.", false)))),
                 )
                 .child(group("SOUNDS", &pal).child(pref_toggle!("n-sound", "Play a sound", "A short chime for new replies.", sounds))),
             Section::Chat => body.child(

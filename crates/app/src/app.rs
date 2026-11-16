@@ -680,7 +680,7 @@ impl HermesApp {
             "saveas" => {
                 if let Some(key) = self.selected.clone() {
                     let dest = Some(hermes_core::conn::data_dir().join("demo-downloads"));
-                    self.svc.send(Cmd::Download { key, remote: arg.to_owned(), dest, open: false });
+                    self.svc.send(Cmd::Download { key, remote: arg.to_owned(), dest, save_as: None, open: false });
                 }
             }
             "size" => {
@@ -1051,7 +1051,9 @@ impl HermesApp {
             }
             Ev::Downloaded { key, path, open } => {
                 if open {
-                    cx.open_with_system(&path);
+                    if let Some(msg) = crate::guard::open_file(&path, cx) {
+                        self.show_toast(msg, false, cx);
+                    }
                 } else {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     let dir = path.parent().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1064,15 +1066,15 @@ impl HermesApp {
                 }
             }
             Ev::Notify { key, title, body } => {
-                if Some(&key) != self.selected.as_ref() {
+                let p = &self.config.prefs;
+                let alert = crate::notify::decide(Some(&key) == self.selected.as_ref(), self.window_active, p.notifications, p.notify_only_unfocused, p.sounds);
+                if alert.mark_unread {
                     self.unread.insert(key.base());
-                    let p = &self.config.prefs;
-                    if p.notifications && (!p.notify_only_unfocused || !self.window_active || key.thread.is_none()) {
-                        crate::view::notify_os(&title, if p.hide_previews { "New message" } else { &body });
-                    }
-                    if p.sounds {
-                        crate::view::play_sound();
-                    }
+                }
+                if alert.notify {
+                    crate::notify::post(&title, if p.hide_previews { "New message" } else { &body }, alert.sound);
+                } else if alert.sound {
+                    crate::notify::play_sound();
                 }
             }
             Ev::Error { key, message } => match key.and_then(|k| self.chats.get_mut(&k)) {
@@ -1238,20 +1240,22 @@ impl HermesApp {
         let svc = self.svc.clone();
         cx.spawn(async move |_, _| {
             if let Ok(Ok(Some(path))) = rx.await {
+                // The dialog already asked about replacing, so save exactly there.
                 let dest = path.parent().map(|p| p.to_path_buf());
-                svc.send(Cmd::Download { key, remote, dest, open: false });
+                svc.send(Cmd::Download { key, remote, dest, save_as: Some(path), open: false });
             }
         })
         .detach();
     }
 
     pub fn open_attachment(&mut self, key: BotKey, a: &Attachment, cx: &mut Context<Self>) {
-        if let Some(l) = &a.local_path {
-            cx.open_with_system(std::path::Path::new(l));
-        } else if let Some(local) = a.remote_path.as_ref().and_then(|r| self.media.get(r)) {
-            cx.open_with_system(local);
+        let local = a.local_path.as_ref().map(PathBuf::from).or_else(|| a.remote_path.as_ref().and_then(|r| self.media.get(r)).cloned());
+        if let Some(l) = local {
+            if let Some(msg) = crate::guard::open_file(&l, cx) {
+                self.show_toast(msg, false, cx);
+            }
         } else if let Some(remote) = a.remote_path.clone() {
-            self.svc.send(Cmd::Download { key, remote, dest: Some(hermes_core::conn::data_dir().join("cache").join("downloads")), open: true });
+            self.svc.send(Cmd::Download { key, remote, dest: Some(hermes_core::conn::data_dir().join("cache").join("downloads")), save_as: None, open: true });
         }
     }
 
@@ -1975,11 +1979,11 @@ impl HermesApp {
                     Ok(v) => {
                         if a2 == "connect" {
                             match apps::connect_url(&v) {
-                                Some(url) => {
+                                Some(url) if matches!(hermes_core::files::link_action(&url), hermes_core::files::LinkAction::Open(_)) => {
                                     cx.open_url(&url);
                                     self.show_toast("Finish connecting in your browser. Hermes picks it up automatically.", false, cx);
                                 }
-                                None => self.show_toast("Connection started. Hermes will finish it.", false, cx),
+                                _ => self.show_toast("Connection started. Hermes will finish it.", false, cx),
                             }
                         }
                         self.reload_apps(cx);

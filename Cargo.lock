@@ -2913,6 +2913,7 @@ dependencies = [
  "futures-util",
  "hermes-mock",
  "keyring",
+ "libc",
  "log",
  "mime_guess",
  "regex",
@@ -2940,6 +2941,7 @@ dependencies = [
  "gpui-pre-platform",
  "hermes-core",
  "log",
+ "notify-rust",
  "serde_json",
  "uuid",
 ]

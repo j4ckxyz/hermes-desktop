@@ -2,6 +2,8 @@
 
 mod app;
 mod assets;
+mod guard;
+mod notify;
 mod onboard;
 mod overlays;
 mod theme;

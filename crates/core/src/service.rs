@@ -55,7 +55,8 @@ pub enum Cmd {
     Stop(BotKey),
     MarkRead(BotKey),
     /// Download an agent-produced file; `open` opens it with the OS when done.
-    Download { key: BotKey, remote: String, dest: Option<PathBuf>, open: bool },
+    /// `save_as`: the exact path picked in a save dialog (wins over `dest`).
+    Download { key: BotKey, remote: String, dest: Option<PathBuf>, save_as: Option<PathBuf>, open: bool },
     /// Fetch an image for inline display (cached on disk).
     FetchMedia { key: BotKey, remote: String },
     Approve { conn: String, request_id: String, choice: String },
@@ -265,11 +266,11 @@ impl Svc {
                 let _ = s.store.set_seen(&key, la.max(now()));
                 s.st.lock().unwrap().focused = Some(key);
             }
-            Cmd::Download { key, remote, dest, open } => {
+            Cmd::Download { key, remote, dest, save_as, open } => {
                 tokio::spawn(async move {
                     let Some(rest) = s.rest(&key.conn) else { return };
                     let dir = dest.unwrap_or_else(|| directories::UserDirs::new().and_then(|u| u.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| s.cache_dir.join("downloads")));
-                    match rest.download(&remote, &key.profile, &dir, |_, _| {}).await {
+                    match rest.download(&remote, &key.profile, &dir, save_as.as_deref(), |_, _| {}).await {
                         Ok(path) => s.emit(Ev::Downloaded { key: key.clone(), path, open }),
                         Err(e) => s.emit(Ev::Error { key: Some(key), message: e.to_string() }),
                     }
@@ -278,13 +279,27 @@ impl Svc {
             Cmd::FetchMedia { key, remote } => {
                 tokio::spawn(async move {
                     let Some(rest) = s.rest(&key.conn) else { return };
-                    let dir = s.cache_dir.join("media").join(format!("{:016x}", hash(&remote)));
-                    if let Some(existing) = std::fs::read_dir(&dir).ok().and_then(|mut d| d.next()).and_then(|e| e.ok()).map(|e| e.path()).filter(|p| p.extension().is_none_or(|x| x != "part")) {
-                        s.emit(Ev::MediaReady { remote, local: existing });
+                    // Keyed by server, profile and path; re-fetched after an hour so an image the
+                    // agent rewrote in place shows up. `/api/media` caps images at 25 MB.
+                    let file = media_cache_path(&s.cache_dir, &key.conn, &key.profile, &remote);
+                    if std::fs::metadata(&file).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age < MEDIA_TTL) {
+                        s.emit(Ev::MediaReady { remote, local: file });
                         return;
                     }
-                    match rest.download(&remote, &key.profile, &dir, |_, _| {}).await {
-                        Ok(local) => s.emit(Ev::MediaReady { remote, local }),
+                    let fetched = async {
+                        let url = rest.media_data_url(&remote, &key.profile).await?;
+                        let b64 = url.split_once(',').map(|(_, b)| b).ok_or_else(|| anyhow::anyhow!("bad data url"))?;
+                        let bytes = base64::engine::general_purpose::STANDARD.decode(b64.trim())?;
+                        if let Some(dir) = file.parent() {
+                            tokio::fs::create_dir_all(dir).await?;
+                        }
+                        let part = crate::files::part_path(&file);
+                        tokio::fs::write(&part, &bytes).await?;
+                        tokio::fs::rename(&part, &file).await?;
+                        anyhow::Ok(())
+                    };
+                    match fetched.await {
+                        Ok(()) => s.emit(Ev::MediaReady { remote, local: file }),
                         Err(e) => log::warn!("media {remote}: {e}"),
                     }
                 });
@@ -572,7 +587,8 @@ impl Svc {
                 let status = s("status");
                 let error = p.get("error").and_then(Value::as_str).map(str::to_owned).filter(|e| !e.is_empty()).or_else(|| (status == "error").then(|| "The turn failed.".to_owned()));
                 let focused = self.st.lock().unwrap().focused.clone();
-                if focused.as_ref() != Some(&key) && !transcript::is_silent(&text) && !text.is_empty() {
+                // The app decides whether to alert (it knows if the window has focus).
+                if !transcript::is_silent(&text) && !text.is_empty() {
                     let title = self.bot(&key).map(|b| b.title()).unwrap_or_else(|| key.profile.clone());
                     self.emit(Ev::Notify { key: key.clone(), title, body: roster::one_line(&text, 140) });
                 }
@@ -1017,4 +1033,13 @@ async fn sign_in(conn_id: &str, base: &str, method: SignInMethod) -> Result<Stri
         stored.save(conn_id).map_err(|e| format!("Couldn't save to the system keychain: {e}"))?;
     }
     Ok(probe.identity())
+}
+
+const MEDIA_TTL: Duration = Duration::from_secs(3600);
+
+/// Cache file for an inline image: one per (server, profile, remote path), keeping the extension
+/// so the image decoder can sniff it.
+pub fn media_cache_path(cache_dir: &std::path::Path, conn: &str, profile: &str, remote: &str) -> PathBuf {
+    let ext = std::path::Path::new(remote).extension().and_then(|e| e.to_str()).filter(|e| e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("img").to_ascii_lowercase();
+    cache_dir.join("media").join(format!("{:016x}.{ext}", hash(&format!("{conn}\0{profile}\0{remote}"))))
 }

@@ -24,6 +24,9 @@ async-channel.workspace = true
 log.workspace = true
 mime_guess.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 hermes-mock = { path = "../mock" }
 axum.workspace = true

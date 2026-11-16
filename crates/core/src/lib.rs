@@ -7,6 +7,7 @@ pub mod api_server;
 pub mod apps;
 pub mod auth;
 pub mod conn;
+pub mod files;
 pub mod gateway;
 pub mod rest;
 pub mod roster;

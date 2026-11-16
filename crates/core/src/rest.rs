@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use reqwest::Method;
 
+use crate::files;
 use crate::auth::Auth;
 
 #[derive(Clone)]
@@ -119,9 +120,12 @@ impl Rest {
         self.json(Method::POST, &path, Some(&json!({"data_url": data_url, "filename": filename}))).await
     }
 
-    /// Stream a file from the Hermes host to `dest_dir` without buffering it in memory.
-    /// `GET /api/files/download?path=`.
-    pub async fn download(&self, remote: &str, profile: &str, dest_dir: &Path, progress: impl Fn(u64, Option<u64>)) -> Result<PathBuf> {
+    /// Stream a file from the Hermes host without buffering it in memory
+    /// (`GET /api/files/download?path=`). It lands at `save_as` when the user picked a path in a
+    /// save dialog (replacing what they agreed to replace), else under `dest_dir` with a portable,
+    /// non-clobbering name. Downloads are written to a private `.part` file first, removed on
+    /// failure, and flagged as coming from the network.
+    pub async fn download(&self, remote: &str, profile: &str, dest_dir: &Path, save_as: Option<&Path>, progress: impl Fn(u64, Option<u64>)) -> Result<PathBuf> {
         let path = format!("/api/files/download?path={}&profile={}", enc(remote), enc(profile));
         let r = self.send(Method::GET, &path, None).await?;
         let st = r.status();
@@ -133,22 +137,39 @@ impl Rest {
             });
         }
         let total = r.content_length();
-        tokio::fs::create_dir_all(dest_dir).await?;
-        let name = remote.rsplit(['/', '\\']).next().filter(|n| !n.is_empty()).unwrap_or("file");
-        let target = unique(dest_dir, name);
-        let part = target.with_extension("part");
-        let mut f = tokio::fs::File::create(&part).await?;
-        let mut got = 0u64;
-        let mut s = r.bytes_stream();
-        while let Some(chunk) = s.next().await {
-            let chunk = chunk?;
-            got += chunk.len() as u64;
-            f.write_all(&chunk).await?;
-            progress(got, total);
+        let target = match save_as {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tokio::fs::create_dir_all(dest_dir).await?;
+                files::unique(dest_dir, &files::safe_file_name(remote))
+            }
+        };
+        let part = files::part_path(&target);
+        let result: Result<()> = async {
+            let mut f = tokio::fs::File::create(&part).await?;
+            let mut got = 0u64;
+            let mut s = r.bytes_stream();
+            while let Some(chunk) = s.next().await {
+                let chunk = chunk?;
+                got += chunk.len() as u64;
+                f.write_all(&chunk).await?;
+                progress(got, total);
+            }
+            f.flush().await?;
+            drop(f);
+            if save_as.is_some() && tokio::fs::metadata(&target).await.is_ok() {
+                // Windows can't rename over an existing file.
+                let _ = tokio::fs::remove_file(&target).await;
+            }
+            tokio::fs::rename(&part, &target).await?;
+            Ok(())
         }
-        f.flush().await?;
-        drop(f);
-        tokio::fs::rename(&part, &target).await?;
+        .await;
+        if let Err(e) = result {
+            let _ = tokio::fs::remove_file(&part).await;
+            return Err(e);
+        }
+        files::mark_downloaded(&target);
         Ok(target)
     }
 
@@ -160,15 +181,4 @@ impl Rest {
     }
 }
 
-/// `name`, or `name (2)` etc. when it exists.
-pub fn unique(dir: &Path, name: &str) -> PathBuf {
-    let p = dir.join(name);
-    if !p.exists() {
-        return p;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) => (s.to_owned(), format!(".{e}")),
-        None => (name.to_owned(), String::new()),
-    };
-    (2..).map(|n| dir.join(format!("{stem} ({n}){ext}"))).find(|p| !p.exists()).unwrap()
-}
+pub use crate::files::unique;

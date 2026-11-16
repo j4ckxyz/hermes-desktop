@@ -40,45 +40,6 @@ pub const INFO_W: f32 = 320.;
 pub const CONTENT_MAX_W: f32 = 760.;
 const TOP_INSET: f32 = if cfg!(target_os = "macos") { 36. } else { 8. };
 
-/// Post an OS notification without extra dependencies. macOS uses `osascript`, Linux uses
-/// `notify-send` (freedesktop), and Windows uses a PowerShell toast.
-pub fn notify_os(title: &str, body: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-        let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = std::process::Command::new("notify-send").arg("--app-name=Hermes").arg(title).arg(body).spawn();
-    }
-    #[cfg(windows)]
-    {
-        // Untested: WinRT toast through PowerShell, no extra crates.
-        let esc = |s: &str| s.replace('\'', "''");
-        let ps = format!(
-            "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null; \
-             $t = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
-             $x = $t.GetElementsByTagName('text'); $x.Item(0).AppendChild($t.CreateTextNode('{}')) > $null; $x.Item(1).AppendChild($t.CreateTextNode('{}')) > $null; \
-             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Hermes').Show([Windows.UI.Notifications.ToastNotification]::new($t))",
-            esc(title),
-            esc(body)
-        );
-        let _ = std::process::Command::new("powershell").args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &ps]).spawn();
-    }
-}
-
-/// A short system sound for new replies (Settings → Notifications → Sounds).
-pub fn play_sound() {
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("afplay").arg("/System/Library/Sounds/Tink.aiff").spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let _ = std::process::Command::new("canberra-gtk-play").args(["-i", "message-new-instant"]).spawn();
-    #[cfg(windows)]
-    let _ = std::process::Command::new("powershell").args(["-NoProfile", "-Command", "[System.Media.SystemSounds]::Asterisk.Play()"]).spawn();
-}
-
 impl HermesApp {
     fn render_sidebar(&mut self, peek: bool, cx: &mut Context<Self>) -> Div {
         let pal = self.pal;
@@ -414,7 +375,7 @@ impl HermesApp {
         }
         let bot = self.bot(key).cloned();
         let body: AnyElement = match (&md, prefs.render_markdown) {
-            (Some(s), true) => TextView::new(s).selectable(true).into_any_element(),
+            (Some(s), true) => TextView::new(s).selectable(true).on_link_click(crate::guard::on_link).into_any_element(),
             _ => div().child(m.text.clone()).into_any_element(),
         };
         let time = if prefs.show_timestamps { fmt_clock(m.timestamp) } else { String::new() };
@@ -502,7 +463,7 @@ impl HermesApp {
                                         .child(div().flex_1())
                                         .child(div().text_color(pal.faint).child(fmt_clock(r.timestamp))),
                                 )
-                                .child(div().text_size(pal.t(13.)).text_color(pal.text).child(TextView::markdown(SharedString::from(format!("notice-{}", r.id)), rn.body.clone()).selectable(true))),
+                                .child(div().text_size(pal.t(13.)).text_color(pal.text).child(TextView::markdown(SharedString::from(format!("notice-{}", r.id)), rn.body.clone()).selectable(true).on_link_click(crate::guard::on_link))),
                         );
                         if !r.attachments.is_empty() {
                             p = p.child(self.render_attachments(key, &r.attachments, false, cx));
@@ -1515,6 +1476,9 @@ fn typing_dots(pal: &Palette) -> impl IntoElement {
 
 impl Render for HermesApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for msg in crate::guard::take_pending() {
+            self.show_toast(msg, true, cx);
+        }
         let started = self.frame_stats.is_some().then(std::time::Instant::now);
         let el = self.render_root(window, cx);
         if let (Some(t), Some(v)) = (started, self.frame_stats.as_mut()) {

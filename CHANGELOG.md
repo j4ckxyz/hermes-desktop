@@ -3,6 +3,28 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.6.0] - 2026-11-16
+
+Fixes from a full code review (IDs from that review in brackets).
+
+### Security
+- Notifications use `notify-rust` (macOS notification centre, D-Bus on Linux, WinRT on Windows)
+  instead of `osascript`/`notify-send`/PowerShell. Reply text can no longer break out of a
+  PowerShell string on Windows, and no helper processes are left unreaped [C1, M4].
+- Links in chats only open when they are `http`, `https` or `mailto`. Anything else (`file:`,
+  `smb:`, `shortcuts:`, app schemes) is copied to the clipboard with a note instead [H1].
+- "Open" on an agent file only opens inert document types (images, PDF, text, audio, video).
+  Apps, scripts, installers, shortcuts and HTML are shown in their folder instead. Downloads get
+  the macOS quarantine flag / Windows mark-of-the-web [H6].
+
+### Fixed
+- Notifications fire when the open bot replies while Hermes is in the background, and "only when
+  in the background" now applies to Bot Chats too [M1].
+- Downloads: portable file names (Windows reserved names and characters), a private `.part` file
+  per download, cleanup on failure, and the exact path chosen in the save dialog is used [M6].
+- Inline images come from `/api/media` (25 MB cap), cached per server, profile and path and
+  refreshed after an hour [M7].
+
 ## [0.5.0] - 2026-11-16
 
 ### Added
