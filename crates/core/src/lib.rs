@@ -5,6 +5,7 @@
 
 pub mod api_server;
 pub mod apps;
+pub mod auth;
 pub mod conn;
 pub mod gateway;
 pub mod rest;
@@ -18,3 +19,4 @@ pub mod transcript;
 pub use roster::{Bot, BotKey};
 pub use service::{Cmd, Ev, LocalFile, Service};
 pub use transcript::{ChatMessage, Role};
+pub use url::Url;

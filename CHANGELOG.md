@@ -3,6 +3,37 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.5.0] - 2026-11-16
+
+### Added
+- **Sign in with your Hermes username and password**, the same account as the web dashboard.
+  The app uses Hermes' official native sign-in (RFC 8252: `/auth/native/authorize` →
+  `/auth/password-login` → `/auth/native/token`), gets bearer tokens and refreshes them before they
+  expire. Each WebSocket connect uses a fresh single-use `/api/auth/ws-ticket`. Research and
+  citations are in docs/PROTOCOL.md → Sign-in.
+- **New first-run flow**: a welcome screen, then choosing a server (Hermes found on this computer
+  on ports 9119/9120, or a typed remote or Tailscale address with a live "Checking…" health
+  probe), then sign in (show password, Enter to submit, *Stay signed in*), then picking or
+  creating your first bot. Clear errors cover a wrong password, too many attempts, an unreachable
+  server, a name that doesn't resolve, a non-Hermes server, and TLS problems (untrusted, wrong
+  name, expired, or HTTPS against an HTTP port).
+- **Silent re-authentication**: when a session ends, the app refreshes it, or signs in again with
+  the password kept in the keychain if you chose *Stay signed in*. Otherwise the server shows
+  *Sign in required*.
+- **Settings → Account**: each saved server shows who you're signed in as, with **Sign out**,
+  **Sign in**, **Switch server** and remove. **Add server** opens the same flow. Any number of
+  servers can be saved.
+- Dashboards on this computer that have no accounts connect with no typing: the app reads the
+  page's per-run session token, which is how the official dashboard page authenticates.
+- Mock: `--basic-auth USER:PASS` and `--access-ttl SECS` gate it like a public dashboard (native
+  sign-in endpoints, tickets, 429 rate limit). New `tests/signin.rs`.
+
+### Changed
+- The session-token field is now *Advanced: use a session token* in the sign-in flow.
+- Keychain entries hold JSON (tokens, provider, username, optional password). Older plain-token
+  entries still work.
+- "Token refused" is now "Sign in required".
+
 ## [0.4.0] - 2026-11-16
 
 ### Added

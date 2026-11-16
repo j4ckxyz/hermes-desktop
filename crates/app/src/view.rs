@@ -93,11 +93,12 @@ impl HermesApp {
         } else if link_ok {
             self.config.connections.iter().map(|c| c.name.clone()).collect::<Vec<_>>().join(", ")
         } else if self.links.values().any(|l| *l == LinkState::Unauthorized) {
-            "Token refused".to_owned()
+            "Sign in required".to_owned()
         } else {
             "Connecting…".to_owned()
         };
-        let loading = self.bots.is_empty() && !self.config.connections.is_empty();
+        let signed_out = !self.config.connections.is_empty() && self.config.connections.iter().all(|c| self.links.get(&c.id) == Some(&LinkState::Unauthorized));
+        let loading = self.bots.is_empty() && !self.config.connections.is_empty() && !signed_out;
         let searching = self.searching;
         let cmd_held = self.cmd_held && !self.any_overlay();
 
@@ -174,6 +175,16 @@ impl HermesApp {
                     .when(loading, |d| d.children((0..5).map(|i| roster_skeleton(i, &pal))))
                     .when(self.config.connections.is_empty(), |d| {
                         d.child(div().p(px(12.)).text_size(pal.t(13.)).text_color(pal.faint).child("Connect to your Hermes to see your bots."))
+                    })
+                    .when(signed_out && self.bots.is_empty(), |d| {
+                        d.child(
+                            div().p(px(12.)).flex().flex_col().gap(px(10.)).child(div().text_size(pal.t(13.)).text_color(pal.faint).child("Sign in to see your bots.")).child(
+                                button("sidebar-signin", "Sign in", Kind::Primary, &pal).on_click(cx.listener(|this, _, window, cx| {
+                                    let id = this.config.connections.first().map(|c| c.id.clone());
+                                    this.open_onboarding(crate::onboard::Step::SignIn, id, window, cx);
+                                })),
+                            ),
+                        )
                     })
                     .when(!loading && searching && self.visible_bots(cx).is_empty() && !self.bots.is_empty(), |d| {
                         d.child(div().p(px(12.)).text_size(pal.t(13.)).text_color(pal.faint).child("No bots match."))

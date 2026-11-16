@@ -61,8 +61,12 @@ pub enum Inbound {
 
 type Pending = oneshot::Sender<std::result::Result<Value, RpcError>>;
 
+/// Produces the `/api/ws` URL for each connect attempt: tickets are single use, and a loopback
+/// dashboard's token rotates on restart (see [`crate::auth::Auth::ws_url`]).
+pub type UrlSource = Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, std::result::Result<String, crate::auth::AuthError>> + Send + Sync>;
+
 struct Shared {
-    ws_url: String,
+    ws_url: UrlSource,
     pending: Mutex<HashMap<u64, Pending>>,
     next_id: AtomicU64,
     out: Mutex<Option<mpsc::UnboundedSender<String>>>,
@@ -77,8 +81,8 @@ pub struct Gateway {
 }
 
 impl Gateway {
-    /// `ws_url` already carries the credential (`?token=`), see [`crate::conn::Endpoint`].
-    pub fn spawn(ws_url: String, inbound: async_channel::Sender<Inbound>) -> Gateway {
+    /// `ws_url` is asked for a fresh, credentialed URL before every connect attempt.
+    pub fn spawn(ws_url: UrlSource, inbound: async_channel::Sender<Inbound>) -> Gateway {
         let s = Arc::new(Shared {
             ws_url,
             pending: Mutex::new(HashMap::new()),
@@ -107,7 +111,7 @@ impl Gateway {
             loop {
                 match &*rx.borrow_and_update() {
                     LinkState::Connected => return Ok(()),
-                    LinkState::Unauthorized => return Err(anyhow!("Hermes refused the session token.")),
+                    LinkState::Unauthorized => return Err(anyhow!("Sign in to this Hermes again.")),
                     LinkState::Stopped => return Err(anyhow!("Connection stopped.")),
                     _ => {}
                 }
@@ -175,7 +179,16 @@ async fn run(s: Arc<Shared>) {
         if is_stopped(&stop) {
             break;
         }
-        let reason = match connect(&s.ws_url).await {
+        let url = match (s.ws_url)().await {
+            Ok(u) => Ok(u),
+            Err(crate::auth::AuthError::SignInRequired | crate::auth::AuthError::InvalidCredentials) => Err(ConnectErr::Unauthorized),
+            Err(e) => Err(ConnectErr::Other(e.to_string())),
+        };
+        let attempt_result = match url {
+            Ok(u) => connect(&u).await,
+            Err(e) => Err(e),
+        };
+        let reason = match attempt_result {
             Ok(ws) => {
                 attempt = 0;
                 let r = pump(&s, ws).await;

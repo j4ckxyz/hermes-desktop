@@ -41,10 +41,13 @@ your name) for tokens, cost, requests and sessions per bot.
 
 ## Connect
 
-Run `hermes dashboard` (or `hermes serve`) on the machine that hosts your agent. Open
-**Settings** (the gear icon, bottom left) and enter the dashboard URL and its session token.
-The token is kept in the OS keychain (macOS Keychain, Windows Credential Manager, or Secret
-Service on Linux). The client only speaks Hermes' official protocols: the gateway WebSocket
+Run `hermes dashboard` (or `hermes serve`) on the machine that hosts your agent. On first launch
+Hermes Desktop finds a dashboard on this computer, or you type a remote or Tailscale address. Then
+sign in with the same username and password as the web dashboard; a dashboard on this computer
+without accounts needs no sign-in. Sessions renew on their own. Add more servers, sign out or
+switch servers under **Settings → Account**. A dashboard session token still works under
+*Advanced*. Credentials are kept only in the OS keychain (macOS Keychain, Windows Credential
+Manager, or Secret Service on Linux). The client only speaks Hermes' official protocols: the gateway WebSocket
 `/api/ws`, the dashboard REST API and the `/v1` API server. See [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Build
@@ -63,5 +66,8 @@ Linux needs `libxkbcommon`, `wayland`, `vulkan`, `fontconfig` and `dbus` develop
 cargo run --release -p hermes-mock -- --port 9119 --token dev-token &
 HERMES_DESKTOP_URL=http://127.0.0.1:9119 HERMES_DESKTOP_TOKEN=dev-token ./target/release/hermes-desktop
 ```
+
+To try the sign-in flow, run a gated mock and start the app without `HERMES_DESKTOP_URL`:
+`cargo run --release -p hermes-mock -- --port 9120 --basic-auth demo:demo-password`.
 
 See [PLAN.md](PLAN.md) for the design and milestones, and [AGENTS.md](AGENTS.md) for contributing.

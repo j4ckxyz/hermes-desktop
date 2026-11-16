@@ -152,14 +152,6 @@ pub struct MentionPopup {
     pub sel: usize,
 }
 
-pub struct SetupForm {
-    pub name: Entity<InputState>,
-    pub url: Entity<InputState>,
-    pub token: Entity<InputState>,
-    pub editing: Option<String>,
-    pub error: Option<String>,
-}
-
 pub struct NewBotForm {
     pub name: Entity<InputState>,
     pub title: Entity<InputState>,
@@ -364,7 +356,9 @@ pub struct HermesApp {
     pub media: HashMap<String, PathBuf>,
     media_requested: HashSet<String>,
     pub approvals: Vec<Approval>,
-    pub setup: Option<SetupForm>,
+    pub onboard: Option<crate::onboard::Onboard>,
+    /// Select this bot when it first shows up in the roster (just created).
+    pub want_select: Option<BotKey>,
     pub new_bot: Option<NewBotForm>,
     pub settings: Option<SettingsState>,
     pub palette: Option<PaletteState>,
@@ -479,7 +473,8 @@ impl HermesApp {
             media: HashMap::new(),
             media_requested: HashSet::new(),
             approvals: vec![],
-            setup: None,
+            onboard: None,
+            want_select: None,
             new_bot: None,
             settings: None,
             palette: None,
@@ -502,7 +497,7 @@ impl HermesApp {
             this.selected = Some(last.base());
         }
         if this.config.connections.is_empty() {
-            this.open_setup(None, window, cx);
+            this.open_onboarding(crate::onboard::Step::Welcome, None, window, cx);
         }
         for c in this.config.connections.clone() {
             this.svc.send(Cmd::Connect(c));
@@ -700,7 +695,53 @@ impl HermesApp {
                 cx.notify();
             }
             "newbot" => self.open_new_bot(window, cx),
-            "setup" => self.open_setup(self.config.connections.first().map(|c| c.id.clone()), window, cx),
+            "setup" => self.open_onboarding(crate::onboard::Step::Server, None, window, cx),
+            "onboard" => {
+                if self.onboard.is_none() {
+                    self.open_onboarding(crate::onboard::Step::parse(arg), None, window, cx);
+                } else {
+                    self.set_onboard_step(crate::onboard::Step::parse(arg), window, cx);
+                }
+            }
+            "resignin" => {
+                let id = self.config.connections.iter().find(|c| c.name == arg || c.id == arg).or(self.config.connections.first()).map(|c| c.id.clone());
+                self.open_onboarding(crate::onboard::Step::SignIn, id, window, cx);
+            }
+            "addr" => {
+                if let Some(o) = &self.onboard {
+                    let v = arg.to_owned();
+                    o.url.update(cx, |s, cx| s.set_value(v, window, cx));
+                }
+                self.schedule_probe(cx);
+            }
+            "pick" => self.pick_local(arg.parse().unwrap_or(0), window, cx),
+            "creds" => {
+                if let Some(o) = &self.onboard {
+                    let (u, p) = arg.split_once('|').unwrap_or((arg, ""));
+                    let (u, p) = (u.to_owned(), p.to_owned());
+                    o.username.update(cx, |s, cx| s.set_value(u, window, cx));
+                    o.password.update(cx, |s, cx| s.set_value(p, window, cx));
+                }
+            }
+            "tokenfield" => {
+                if let Some(o) = &self.onboard {
+                    let v = arg.to_owned();
+                    o.token.update(cx, |s, cx| s.set_value(v, window, cx));
+                }
+            }
+            "bottitle" => {
+                if let Some(o) = &self.onboard {
+                    let v = arg.to_owned();
+                    o.bot_title.update(cx, |s, cx| s.set_value(v, window, cx));
+                }
+            }
+            "showpw" => self.toggle_show_password(window, cx),
+            "next" => self.onboard_next(window, cx),
+            "signout" => {
+                if let Some(id) = self.config.connections.iter().find(|c| c.name == arg || c.id == arg).or(self.config.connections.first()).map(|c| c.id.clone()) {
+                    self.sign_out(&id, cx);
+                }
+            }
             "palette" => self.open_palette(window, cx),
             "query" => {
                 let arg = arg.to_owned();
@@ -894,8 +935,10 @@ impl HermesApp {
     fn on_event(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
             Ev::Link { conn, state } => {
-                if state == LinkState::Unauthorized {
-                    self.show_toast(format!("{} refused the session token. Check it in Settings.", self.conn_name(&conn)), true, cx);
+                // Signed out in Settings: the gateway stops, but what the user needs is "Sign in".
+                let state = if state == LinkState::Stopped && self.svc.store.get_kv(&format!("signedout:{conn}")).as_deref() == Some("1") { LinkState::Unauthorized } else { state };
+                if state == LinkState::Unauthorized && self.links.get(&conn) != Some(&LinkState::Unauthorized) && self.svc.store.get_kv(&format!("signedout:{conn}")).as_deref() != Some("1") {
+                    self.show_toast(format!("Sign in to {} again in Settings → Account.", self.conn_name(&conn)), true, cx);
                 }
                 // The info pane may have been open at launch, before this server answered.
                 let reload = state == LinkState::Connected && self.info_open && self.selected.as_ref().is_some_and(|k| k.conn == conn);
@@ -911,6 +954,12 @@ impl HermesApp {
                 self.unread.retain(|k| k.conn != conn);
                 let sel = self.selected.clone();
                 self.unread.extend(unread.into_iter().filter(|k| !sel.as_ref().is_some_and(|s| s.same_bot(k))));
+                if let Some(want) = self.want_select.clone().filter(|w| self.bots.iter().any(|b| b.key.same_bot(w))) {
+                    self.want_select = None;
+                    self.selected = Some(want.clone());
+                    self.list_count = usize::MAX;
+                    self.svc.send(Cmd::OpenBot(want));
+                }
                 if self.selected.as_ref().is_none_or(|k| !self.bots.iter().any(|b| b.key.same_bot(k))) {
                     if let Some(first) = self.bots.iter().find(|b| !b.hidden()).map(|b| b.key.clone()) {
                         self.selected = Some(first.clone());
@@ -1034,6 +1083,9 @@ impl HermesApp {
                 _ => self.show_toast(message, true, cx),
             },
             Ev::Info { message } => self.show_toast(message, false, cx),
+            Ev::Probed { tag, result } => self.on_probed(&tag, result, cx),
+            Ev::LocalServers { servers } => self.on_local_servers(servers, cx),
+            Ev::SignedIn { tag, conn_id, result } => self.on_signed_in(&tag, conn_id, result, cx),
             Ev::Slash { key, command, output, error } => {
                 self.chat_mut(&key).awaiting = false;
                 let icon = if error { "circle-alert" } else { "slash" };
@@ -1494,13 +1546,13 @@ impl HermesApp {
     // ---- overlays -------------------------------------------------------------------------
 
     pub fn any_overlay(&self) -> bool {
-        self.palette.is_some() || self.settings.is_some() || self.apps.is_some() || self.setup.is_some() || self.new_bot.is_some()
+        self.palette.is_some() || self.settings.is_some() || self.apps.is_some() || self.onboard.is_some() || self.new_bot.is_some()
     }
 
     /// Close the top-most overlay (Escape). Returns whether anything closed.
     pub fn close_top(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let closed = if self.setup.is_some() && !self.config.connections.is_empty() {
-            self.setup = None;
+        let closed = if self.onboard.as_ref().is_some_and(|o| !o.first_run && !o.busy) {
+            self.onboard = None;
             true
         } else if self.new_bot.is_some() {
             self.new_bot = None;
@@ -1551,8 +1603,8 @@ impl HermesApp {
         self.settings = None;
         self.usage = None;
         self.new_bot = None;
-        if !self.config.connections.is_empty() {
-            self.setup = None;
+        if self.onboard.as_ref().is_some_and(|o| !o.first_run && !o.busy) {
+            self.onboard = None;
         }
         cx.notify();
     }
@@ -1576,6 +1628,8 @@ impl HermesApp {
     pub fn remove_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         self.config.connections.retain(|c| c.id != id);
         Secrets::delete(id);
+        let _ = self.svc.store.set_kv(&format!("account:{id}"), "");
+        let _ = self.svc.store.set_kv(&format!("signedout:{id}"), "");
         self.svc.send(Cmd::Disconnect(id.to_owned()));
         self.bots.retain(|b| b.key.conn != id);
         if self.selected.as_ref().is_some_and(|k| k.conn == id) {
@@ -1736,7 +1790,7 @@ impl HermesApp {
                     self.svc.send(Cmd::Send { key: k.base(), text: "/compact".into(), files: vec![], refresh: None });
                 }
             }
-            Act::AddServer => self.open_setup(None, window, cx),
+            Act::AddServer => self.open_onboarding(crate::onboard::Step::Server, None, window, cx),
             Act::BotChat => {
                 if let Some(k) = self.selected.clone() {
                     self.select(k.base(), window, cx);
@@ -1997,52 +2051,7 @@ impl HermesApp {
         cx.notify();
     }
 
-    // ---- connection setup and bot creation --------------------------------------------------
-
-    pub fn open_setup(&mut self, editing: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
-        let existing = editing.as_ref().and_then(|id| self.config.connections.iter().find(|c| c.id == *id).cloned());
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Device name, e.g. Homelab").default_value(existing.as_ref().map(|c| c.name.clone()).unwrap_or_else(|| "Hermes".into())));
-        let url = cx.new(|cx| InputState::new(window, cx).placeholder("http://my-hermes.tailnet.ts.net:9119").default_value(existing.as_ref().map(|c| c.base_url.clone()).unwrap_or_default()));
-        let token = cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(if existing.is_some() { "Leave blank to keep the saved token" } else { "Dashboard session token" }));
-        url.update(cx, |s, cx| s.focus(window, cx));
-        self.setup = Some(SetupForm { name, url, token, editing, error: None });
-        cx.notify();
-    }
-
-    pub fn save_setup(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(f) = &self.setup else { return };
-        let name = f.name.read(cx).value().trim().to_owned();
-        let url = f.url.read(cx).value().trim().to_owned();
-        let token = f.token.read(cx).value().trim().to_owned();
-        let editing = f.editing.clone();
-        if url.is_empty() || hermes_core::conn::Endpoint::new(&url, "").is_err() {
-            if let Some(f) = &mut self.setup {
-                f.error = Some("Enter the address you open the Hermes dashboard at.".into());
-            }
-            cx.notify();
-            return;
-        }
-        let id = editing.clone().unwrap_or_else(|| format!("c{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
-        if !token.is_empty() {
-            if let Err(e) = Secrets::set(&id, &token) {
-                if let Some(f) = &mut self.setup {
-                    f.error = Some(format!("Couldn't save the token in the keychain: {e}"));
-                }
-                cx.notify();
-                return;
-            }
-        }
-        let conn = Connection { id: id.clone(), name: if name.is_empty() { "Hermes".into() } else { name }, base_url: url, kind: ConnKind::Gateway };
-        if let Some(i) = self.config.connections.iter().position(|c| c.id == id) {
-            self.config.connections[i] = conn.clone();
-        } else {
-            self.config.connections.push(conn.clone());
-        }
-        self.save_config(cx);
-        self.svc.send(Cmd::Connect(conn));
-        self.setup = None;
-        cx.notify();
-    }
+    // ---- bot creation --------------------------------------------------
 
     pub fn open_new_bot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette = None;

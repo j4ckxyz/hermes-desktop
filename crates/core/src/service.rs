@@ -10,7 +10,8 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::conn::{ConnKind, Connection, Endpoint, GapAction, Secrets};
+use crate::auth::{self, Auth, Credential, ServerInfo, Stored};
+use crate::conn::{ConnKind, Connection, Endpoint, GapAction};
 use crate::gateway::{Gateway, Inbound, LinkState, RpcError, METHOD_NOT_FOUND};
 use crate::rest::Rest;
 use crate::roster::{self, Bot, BotKey, BOT_CHAT_TITLE, UI_META_KEY};
@@ -66,6 +67,34 @@ pub enum Cmd {
     RefreshRoster,
     /// `GET /api/analytics/usage` for one profile (or the default store), answered with `Ev::Rpc`.
     Usage { conn: String, profile: Option<String>, days: u32, tag: String },
+    /// Health/auth probe of what the user typed (`/api/status` + providers) → `Ev::Probed`.
+    Probe { input: String, tag: String },
+    /// Look for Hermes dashboards on this machine's default ports → `Ev::LocalServers`.
+    DetectLocal,
+    /// Sign in and save the credential to the keychain under `conn_id` → `Ev::SignedIn`.
+    SignIn { conn_id: String, base: String, method: SignInMethod, tag: String },
+    /// Forget the credential (keychain) and close the connection.
+    SignOut { conn_id: String },
+}
+
+/// How to sign in (see `auth.rs`).
+#[derive(Clone)]
+pub enum SignInMethod {
+    Password { provider: String, username: String, password: String, remember: bool },
+    Token { token: String },
+    /// A loopback dashboard without accounts.
+    Loopback,
+}
+
+impl std::fmt::Debug for SignInMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print secrets.
+        match self {
+            SignInMethod::Password { provider, username, .. } => write!(f, "Password({provider}, {username}, ***)"),
+            SignInMethod::Token { .. } => write!(f, "Token(***)"),
+            SignInMethod::Loopback => write!(f, "Loopback"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +120,10 @@ pub enum Ev {
     /// Output of a slash command run through `slash.exec` (or why it could not run).
     Slash { key: BotKey, command: String, output: String, error: bool },
     Rpc { tag: String, conn: String, result: Result<Value, String> },
+    Probed { tag: String, result: Result<ServerInfo, String> },
+    LocalServers { servers: Vec<ServerInfo> },
+    /// `Ok(identity)` ("admin", "This computer"…).
+    SignedIn { tag: String, conn_id: String, result: Result<String, String> },
 }
 
 struct Live {
@@ -178,6 +211,32 @@ impl Svc {
         let s = self.clone();
         match c {
             Cmd::Connect(conn) => s.connect(conn),
+            Cmd::Probe { input, tag } => {
+                tokio::spawn(async move {
+                    let result = auth::probe(&input).await.map_err(|e| e.to_string());
+                    s.emit(Ev::Probed { tag, result });
+                });
+            }
+            Cmd::DetectLocal => {
+                tokio::spawn(async move {
+                    let servers = auth::detect_local().await;
+                    s.emit(Ev::LocalServers { servers });
+                });
+            }
+            Cmd::SignIn { conn_id, base, method, tag } => {
+                tokio::spawn(async move {
+                    let result = sign_in(&conn_id, &base, method).await;
+                    s.emit(Ev::SignedIn { tag, conn_id, result });
+                });
+            }
+            Cmd::SignOut { conn_id } => {
+                if let Some(c) = s.st.lock().unwrap().conns.remove(&conn_id) {
+                    c.gw.stop();
+                }
+                // Native tokens are held only here: dropping them signs this app out (docs: Desktop
+                // Native Sign-In → "Sign out"). `/auth/logout` revokes cookie sessions only.
+                crate::conn::Secrets::delete(&conn_id);
+            }
             Cmd::Disconnect(id) => {
                 if let Some(c) = s.st.lock().unwrap().conns.remove(&id) {
                     c.gw.stop();
@@ -307,14 +366,20 @@ impl Svc {
             self.emit(Ev::Error { key: None, message: "API-server-only connections are not supported yet in this build.".into() });
             return;
         }
-        let token = Secrets::get(&conn.id).unwrap_or_default();
-        let ep = match Endpoint::new(&conn.base_url, &token) {
+        let ep = match Endpoint::new(&conn.base_url, "") {
             Ok(e) => e,
             Err(e) => return self.emit(Ev::Error { key: None, message: e.to_string() }),
         };
-        let Ok(rest) = Rest::new(ep.clone()) else { return };
+        // The dev `env` connection's token comes from the environment and is never saved.
+        let auth = Auth::new(&conn.id, ep.base.clone(), Stored::load(&conn.id), conn.id != "env");
+        let Ok(rest) = Rest::new(auth.clone()) else { return };
         let (in_tx, in_rx) = async_channel::unbounded();
-        let gw = Gateway::spawn(ep.ws_url(), in_tx);
+        let a = auth.clone();
+        let source: crate::gateway::UrlSource = Arc::new(move || {
+            let a = a.clone();
+            Box::pin(async move { a.ws_url().await })
+        });
+        let gw = Gateway::spawn(source, in_tx);
         // Seed from cache so the roster paints instantly.
         let cached: Vec<Bot> = self.store.load_rosters().into_iter().filter(|b| b.key.conn == conn.id).collect();
         if !cached.is_empty() {
@@ -927,4 +992,29 @@ pub fn now() -> f64 {
 
 fn hash(s: &str) -> u64 {
     s.bytes().fold(1469598103934665603u64, |h, b| (h ^ b as u64).wrapping_mul(1099511628211))
+}
+
+/// Verify a sign-in method against the server and keep the result in the keychain.
+async fn sign_in(conn_id: &str, base: &str, method: SignInMethod) -> Result<String, String> {
+    let base = Endpoint::new(base, "").map_err(|e| e.to_string())?.base;
+    let stored = match method {
+        SignInMethod::Password { provider, username, password, remember } => {
+            let cred = auth::login_password(&base, &provider, &username, &password).await.map_err(|e| e.to_string())?;
+            Stored { cred, provider: Some(provider), username: Some(username), password: remember.then_some(password) }
+        }
+        SignInMethod::Token { token } => Stored { cred: Credential::Token { token }, ..Default::default() },
+        SignInMethod::Loopback => Stored { cred: Credential::Loopback, ..Default::default() },
+    };
+    // Prove the credential works before saving it: `GET /api/auth/me` needs a valid one.
+    let probe = Auth::new(conn_id, base, stored.clone(), false);
+    let rest = Rest::new(probe.clone()).map_err(|e| e.to_string())?;
+    match rest.me().await {
+        Ok(_) => {}
+        Err(e) if matches!(stored.cred, Credential::Token { .. }) => return Err(format!("Hermes didn't accept that token. {e}")),
+        Err(e) => return Err(e.to_string()),
+    }
+    if conn_id != "env" {
+        stored.save(conn_id).map_err(|e| format!("Couldn't save to the system keychain: {e}"))?;
+    }
+    Ok(probe.identity())
 }

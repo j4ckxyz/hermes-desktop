@@ -1,4 +1,4 @@
-//! Overlays: command palette, Settings, Apps, connection setup and the new-bot form.
+//! Overlays: command palette, Settings, Apps and the new-bot form (onboarding lives in `onboard.rs`).
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -32,8 +32,8 @@ impl HermesApp {
         if let Some(e) = self.render_new_bot(cx) {
             v.push(e.into_any_element());
         }
-        if let Some(e) = self.render_setup(cx) {
-            v.push(e.into_any_element());
+        if let Some(e) = self.render_onboarding(cx) {
+            v.push(e);
         }
         v
     }
@@ -238,19 +238,28 @@ impl HermesApp {
                 ))
                 .child(
                     group("HERMES SERVERS", &pal)
-                        .child(div().pb(px(8.)).text_size(pal.t(12.)).text_color(pal.muted).child("Each server is a Hermes dashboard (hermes dashboard or hermes serve): your laptop, a homelab or a VPS over Tailscale. Their bots appear together in the sidebar. Tokens are kept in the system keychain."))
+                        .child(div().pb(px(8.)).text_size(pal.t(12.)).text_color(pal.muted).child("Each server is a Hermes dashboard (hermes dashboard or hermes serve): your laptop, a homelab or a VPS over Tailscale. Their bots appear together in the sidebar. Sign-ins are kept in the system keychain and renewed automatically."))
                         .children(conns.into_iter().map(|c| {
                             let state = self.links.get(&c.id).cloned();
                             let (dot, label) = match state {
                                 Some(LinkState::Connected) => (pal.ok, "Connected"),
-                                Some(LinkState::Unauthorized) => (pal.danger, "Token refused"),
+                                Some(LinkState::Unauthorized) => (pal.danger, "Sign in required"),
                                 Some(LinkState::Reconnecting { .. }) => (pal.warn, "Reconnecting"),
                                 Some(LinkState::Connecting) | None => (pal.faint, "Connecting"),
                                 Some(LinkState::Stopped) => (pal.faint, "Stopped"),
                             };
                             let bots = self.bots.iter().filter(|b| b.key.conn == c.id).count();
-                            let (id1, id2) = (c.id.clone(), c.id.clone());
+                            let (id1, id2, id3, id4) = (c.id.clone(), c.id.clone(), c.id.clone(), c.id.clone());
                             let dev = c.id == "env";
+                            let needs_sign_in = state == Some(LinkState::Unauthorized);
+                            let account = self.svc.store.get_kv(&format!("account:{}", c.id)).filter(|a| !a.is_empty());
+                            let who = match account.as_deref() {
+                                _ if needs_sign_in => None,
+                                Some("This computer") => Some("No sign-in needed (this computer)".to_owned()),
+                                Some("Session token") => Some("Using a session token".to_owned()),
+                                Some(a) => Some(format!("Signed in as {a}")),
+                                None => None,
+                            };
                             div()
                                 .min_h(px(64.))
                                 .py(px(12.))
@@ -267,14 +276,21 @@ impl HermesApp {
                                         .flex()
                                         .flex_col()
                                         .child(div().flex().items_center().gap(px(8.)).child(div().text_size(pal.t(14.)).font_weight(FontWeight::MEDIUM).truncate().child(c.name.clone())).child(div().size(px(6.)).rounded_full().bg(dot)).child(div().text_size(pal.t(12.)).text_color(pal.muted).child(format!("{label} · {bots} bots"))))
-                                        .child(div().text_size(pal.t(12.)).text_color(pal.faint).truncate().child(if dev { format!("{} (from the environment, not saved)", c.base_url) } else { c.base_url.clone() })),
+                                        .child(div().text_size(pal.t(12.)).text_color(pal.faint).truncate().child(if dev { format!("{} (from the environment, not saved)", c.base_url) } else { c.base_url.clone() }))
+                                        .when_some(who, |d, w| d.child(div().flex().items_center().gap(px(4.)).text_size(pal.t(12.)).text_color(pal.muted).child(ico("user", 11., pal.faint)).child(w))),
                                 )
                                 .when(!dev, |d| {
-                                    d.child(button(SharedString::from(format!("edit-{}", c.id)), "Edit", Kind::Secondary, &pal).on_click(cx.listener(move |this, _, window, cx| this.open_setup(Some(id1.clone()), window, cx))))
-                                        .child(icon_btn(SharedString::from(format!("rm-{}", c.id)), "trash-2", &pal).on_click(cx.listener(move |this, _, _, cx| this.remove_connection(&id2, cx))))
+                                    d.when(needs_sign_in, |d| {
+                                        d.child(button(SharedString::from(format!("signin-{}", c.id)), "Sign in", Kind::Primary, &pal).on_click(cx.listener(move |this, _, window, cx| this.open_onboarding(crate::onboard::Step::SignIn, Some(id1.clone()), window, cx))))
+                                    })
+                                    .when(!needs_sign_in, |d| {
+                                        d.child(button(SharedString::from(format!("signout-{}", c.id)), "Sign out", Kind::Secondary, &pal).child(ico("log-out", 13., pal.muted)).flex_row_reverse().on_click(cx.listener(move |this, _, _, cx| this.sign_out(&id4, cx))))
+                                    })
+                                    .child(button(SharedString::from(format!("switch-{}", c.id)), "Switch server", Kind::Secondary, &pal).on_click(cx.listener(move |this, _, window, cx| this.open_onboarding(crate::onboard::Step::Server, Some(id3.clone()), window, cx))))
+                                    .child(icon_btn(SharedString::from(format!("rm-{}", c.id)), "trash-2", &pal).on_click(cx.listener(move |this, _, _, cx| this.remove_connection(&id2, cx))))
                                 })
                         }))
-                        .child(div().pt(px(12.)).flex().child(button("add-server", "Add server", Kind::Primary, &pal).child(ico("plus", 14., pal.on_accent)).flex_row_reverse().on_click(cx.listener(|this, _, window, cx| this.open_setup(None, window, cx))))),
+                        .child(div().pt(px(12.)).flex().child(button("add-server", "Add server", Kind::Primary, &pal).child(ico("plus", 14., pal.on_accent)).flex_row_reverse().on_click(cx.listener(|this, _, window, cx| this.open_onboarding(crate::onboard::Step::Server, None, window, cx))))),
                 )
             }
             Section::Appearance => {
@@ -934,42 +950,6 @@ impl HermesApp {
     }
 
     // ---- forms -------------------------------------------------------------------------------------
-
-    fn render_setup(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let pal = self.pal;
-        let f = self.setup.as_ref()?;
-        let can_cancel = !self.config.connections.is_empty();
-        let editing = f.editing.is_some();
-        Some(
-            self.dismiss_scrim("setup-scrim", cx).child(
-                sheet(460., &pal)
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .p(px(24.))
-                    .gap(px(16.))
-                    .child(div().flex().flex_col().gap(px(4.)).child(div().text_size(pal.t(18.)).font_weight(FontWeight::SEMIBOLD).child(if editing { "Edit server" } else { "Connect to Hermes" })).child(
-                        div().text_size(pal.t(13.)).text_color(pal.muted).child("The address of a Hermes dashboard (run hermes dashboard), local, homelab or over Tailscale, and its session token. The token is stored in your system keychain."),
-                    ))
-                    .child(field("Name", &f.name, &pal))
-                    .child(field("Address", &f.url, &pal))
-                    .child(field("Session token", &f.token, &pal))
-                    .when_some(f.error.clone(), |d, e| d.child(div().text_size(pal.t(13.)).text_color(pal.danger).child(e)))
-                    .child(
-                        div()
-                            .pt(px(8.))
-                            .flex()
-                            .justify_end()
-                            .gap(px(8.))
-                            .when(can_cancel, |d| {
-                                d.child(button("cancel-setup", "Cancel", Kind::Secondary, &pal).on_click(cx.listener(|this, _, _, cx| {
-                                    this.setup = None;
-                                    cx.notify();
-                                })))
-                            })
-                            .child(button("save-setup", if editing { "Save" } else { "Connect" }, Kind::Primary, &pal).on_click(cx.listener(|this, _, window, cx| this.save_setup(window, cx)))),
-                    ),
-            ),
-        )
-    }
 
     fn render_new_bot(&mut self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let pal = self.pal;

@@ -21,13 +21,14 @@ crates/core   hermes-core: protocol clients (gateway.rs WS JSON-RPC, rest.rs, ap
               roster.rs (Bot Mode: bots = profiles, mentions, agent notices),
               transcript.rs (history rows, MEDIA tags), store.rs (SQLite cache),
               conn.rs (config + OS keychain), service.rs (actor: Cmd in, Ev out)
+              auth.rs (sign-in: probe, native PKCE password login, refresh, ws tickets)
               apps.rs (Apps page: param builders + parsers for connectors/mcp/toolsets/skills)
               slash.rs + slash_registry.json (slash commands; regenerate with
               scripts/gen_slash_registry.py <hermes-agent checkout>), usage.rs (Usage page)
 crates/mock   hermes-mock: stand-in backend that follows the documented wire (tests + demos)
 crates/app    hermes-desktop: GPUI binary. app.rs = state, actions, shortcuts, RPC routing;
               view.rs = sidebar, chat, composer, info pane; overlays.rs = palette, settings,
-              apps, new bot, setup; ui.rs = shared controls; theme.rs = palette + prefs
+              apps, new bot; onboard.rs = first-run / add-server / sign-in flow; ui.rs = shared controls; theme.rs = palette + prefs
 docs/         PROTOCOL.md (wire notes and API gaps), ci/ (drafted CI), screenshots/
 ```
 
@@ -41,7 +42,8 @@ cargo build                                  # debug (debug info off to save dis
 cargo build --release -p hermes-desktop      # optimized app
 cargo test -p hermes-core                    # unit + end-to-end tests against the mock
 cargo clippy --workspace --all-targets
-cargo run -p hermes-mock -- --port 9119 --token dev-token   # fake Hermes
+cargo run -p hermes-mock -- --port 9119 --token dev-token   # fake Hermes (loopback, no accounts)
+cargo run -p hermes-mock -- --port 9120 --basic-auth jack:hunter2   # fake gated Hermes (sign-in)
 HERMES_DESKTOP_URL=http://127.0.0.1:9119 HERMES_DESKTOP_TOKEN=dev-token cargo run -p hermes-desktop
 scripts/screenshots.sh                       # macOS: scripted demo + window-only screenshots
 ```
@@ -50,6 +52,8 @@ Dev-only environment variables:
 * `HERMES_DESKTOP_URL` / `HERMES_DESKTOP_TOKEN` / `HERMES_DESKTOP_NAME` seed a connection. The
   token stays in memory and is never written to disk.
 * `HERMES_DESKTOP_HOME` puts config and cache in a different directory.
+* `HERMES_DESKTOP_EPHEMERAL_SECRETS=1` keeps credentials in process memory instead of the OS
+  keychain (tests and demos; never on disk).
 * `HERMES_DESKTOP_SCRIPT` holds `;`-separated steps (`wait:ms`, `select:profile`, `type:text`,
   `send`, `attach:path`, `share`, `hidden`, `newbot`, `setup`, `palette`, `query:text`,
   `settings:<section>`, `apps`, `category:<chip>`, `expand:<app id>`, `info`, `edit`,
@@ -57,7 +61,10 @@ Dev-only environment variables:
   `saveas:<remote path>` (download into the demo home without a dialog), `key:<binding>` (dispatch a
   keystroke, e.g. `key:secondary-2`), `cmdheld[:off]` (show the ⌘ number badges), `usage`,
   `usagebot:<profile>`, `pin:<profile>`, `sidebar`, `gap:<hours>` (age the chat to trigger the
-  long-break policy), `resizebench:<n>` (resize every frame and log render timings), `close`) for
+  long-break policy), `resizebench:<n>` (resize every frame and log render timings), `onboard:welcome|server|signin|token|bot`,
+  `addr:<url>` (type an address and probe it), `pick:<n>` (choose a local server), `creds:user|pass`,
+  `showpw`, `tokenfield:<token>`, `bottitle:<name>`, `next` (the flow's primary button),
+  `signout[:<server>]`, `resignin[:<server>]`, `close`) for
   reproducible demos.
 
 ## Rules

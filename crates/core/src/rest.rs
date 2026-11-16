@@ -1,5 +1,6 @@
-//! Dashboard REST (`hermes serve`). Auth: `X-Hermes-Session-Token` (docs: *Hermes Desktop*,
-//! *Web Dashboard → Deployment session-token provider*). Profile selection: `?profile=`.
+//! Dashboard REST (`hermes serve`). Auth comes from [`crate::auth::Auth`]: `Authorization: Bearer`
+//! after a sign-in, `X-Hermes-Session-Token` for a token or a loopback dashboard. A 401 renews the
+//! credential once and retries. Profile selection: `?profile=`.
 
 use std::path::{Path, PathBuf};
 
@@ -8,11 +9,15 @@ use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 
-use crate::conn::Endpoint;
+use std::sync::Arc;
+
+use reqwest::Method;
+
+use crate::auth::Auth;
 
 #[derive(Clone)]
 pub struct Rest {
-    pub ep: Endpoint,
+    pub auth: Arc<Auth>,
     http: reqwest::Client,
 }
 
@@ -21,25 +26,53 @@ fn enc(s: &str) -> String {
 }
 
 impl Rest {
-    pub fn new(ep: Endpoint) -> Result<Rest> {
+    pub fn new(auth: Arc<Auth>) -> Result<Rest> {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
             .user_agent(concat!("hermes-desktop/", env!("CARGO_PKG_VERSION")))
             .build()?;
-        Ok(Rest { ep, http })
+        Ok(Rest { auth, http })
     }
 
-    fn req(&self, m: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let b = self.http.request(m, self.ep.http(path));
-        if self.ep.token.is_empty() { b } else { b.header("X-Hermes-Session-Token", &self.ep.token) }
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{}", self.auth.base.as_str().trim_end_matches('/'), path)
     }
 
-    async fn json(&self, b: reqwest::RequestBuilder) -> Result<Value> {
-        let r = b.send().await.map_err(|e| anyhow!("Couldn't reach Hermes: {e}"))?;
+    /// Send with the current credential; on 401 renew it once (refresh, or a silent sign-in) and
+    /// retry.
+    async fn send(&self, m: Method, path: &str, body: Option<&Value>) -> Result<reqwest::Response> {
+        let mut renewed = false;
+        loop {
+            let h = self.auth.headers().await.map_err(|e| anyhow!("{e}"))?;
+            let mut b = self.http.request(m.clone(), self.url(path));
+            for (k, v) in &h {
+                b = b.header(*k, v);
+            }
+            if let Some(j) = body {
+                b = b.json(j);
+            }
+            let r = b.send().await.map_err(|e| anyhow!("Couldn't reach Hermes: {e}"))?;
+            if r.status().as_u16() == 401 && !renewed {
+                if let Some((_, v)) = h.first() {
+                    renewed = true;
+                    if self.auth.rejected(v).await.is_ok() {
+                        continue;
+                    }
+                }
+            }
+            return Ok(r);
+        }
+    }
+
+    async fn json(&self, m: Method, path: &str, body: Option<&Value>) -> Result<Value> {
+        let r = self.send(m, path, body).await?;
         let st = r.status();
         let body: Value = r.json().await.unwrap_or(Value::Null);
-        if st.as_u16() == 401 || st.as_u16() == 403 {
-            bail!("Hermes refused the session token ({st}).");
+        if st.as_u16() == 401 {
+            bail!("Sign in to this Hermes again.");
+        }
+        if st.as_u16() == 403 {
+            bail!("Hermes refused that ({st}).");
         }
         if !st.is_success() {
             let d = body.get("detail").map(|d| d.to_string()).unwrap_or_default();
@@ -50,7 +83,12 @@ impl Rest {
 
     /// `GET /api/status`: reachability and auth providers.
     pub async fn status(&self) -> Result<Value> {
-        self.json(self.req(reqwest::Method::GET, "/api/status")).await
+        self.json(Method::GET, "/api/status", None).await
+    }
+
+    /// `GET /api/auth/me`: the verified identity (any valid credential; source `dashboard_auth/routes.py`).
+    pub async fn me(&self) -> Result<Value> {
+        self.json(Method::GET, "/api/auth/me", None).await
     }
 
     /// `GET /api/analytics/usage?days=&profile=`: daily and per-model tokens, cost, sessions and
@@ -60,7 +98,7 @@ impl Rest {
         if let Some(p) = profile {
             path.push_str(&format!("&profile={}", enc(p)));
         }
-        self.json(self.req(reqwest::Method::GET, &path)).await
+        self.json(Method::GET, &path, None).await
     }
 
     /// Stored history of a session, newest page (source `hermes_cli/web_routers/sessions.py`).
@@ -70,7 +108,7 @@ impl Rest {
             enc(session_id),
             enc(profile)
         );
-        let v = self.json(self.req(reqwest::Method::GET, &path)).await?;
+        let v = self.json(Method::GET, &path, None).await?;
         Ok(v.get("messages").and_then(Value::as_array).cloned().unwrap_or_default())
     }
 
@@ -78,14 +116,14 @@ impl Rest {
     /// (source `hermes_cli/web_routers/files.py`).
     pub async fn upload_image(&self, profile: &str, filename: &str, data_url: String) -> Result<Value> {
         let path = format!("/api/chat/image-upload?profile={}", enc(profile));
-        self.json(self.req(reqwest::Method::POST, &path).json(&json!({"data_url": data_url, "filename": filename}))).await
+        self.json(Method::POST, &path, Some(&json!({"data_url": data_url, "filename": filename}))).await
     }
 
     /// Stream a file from the Hermes host to `dest_dir` without buffering it in memory.
     /// `GET /api/files/download?path=`.
     pub async fn download(&self, remote: &str, profile: &str, dest_dir: &Path, progress: impl Fn(u64, Option<u64>)) -> Result<PathBuf> {
         let path = format!("/api/files/download?path={}&profile={}", enc(remote), enc(profile));
-        let r = self.req(reqwest::Method::GET, &path).send().await?;
+        let r = self.send(Method::GET, &path, None).await?;
         let st = r.status();
         if !st.is_success() {
             bail!(match st.as_u16() {
@@ -117,7 +155,7 @@ impl Rest {
     /// Inline image bytes: `GET /api/media?path=` → `{data_url}` (≤ 25 MB).
     pub async fn media_data_url(&self, remote: &str, profile: &str) -> Result<String> {
         let path = format!("/api/media?path={}&profile={}", enc(remote), enc(profile));
-        let v = self.json(self.req(reqwest::Method::GET, &path)).await?;
+        let v = self.json(Method::GET, &path, None).await?;
         v.get("data_url").and_then(Value::as_str).map(str::to_owned).ok_or_else(|| anyhow!("no image data"))
     }
 }

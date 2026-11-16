@@ -5,8 +5,9 @@ Hermes docs and the `NousResearch/hermes-agent` source (`tui_gateway/`, `hermes_
 The full reasoning is in [PLAN.md](../PLAN.md).
 
 ## Transport
-* **Gateway JSON-RPC 2.0** at `ws(s)://<dashboard>/api/ws?token=<session token>`. This is the
-  same channel the official Desktop uses for Bot Mode.
+* **Gateway JSON-RPC 2.0** at `ws(s)://<dashboard>/api/ws?ticket=<ws ticket>` (signed in) or
+  `?token=<session token>` (loopback / Advanced). This is the same channel the official Desktop
+  uses for Bot Mode. See **Sign-in** below for where each comes from.
   * Events arrive as `{"method":"event","params":{"type","session_id","payload"}}`.
   * On `gateway.ready`, the client sends `client.capabilities {server_requests:true}`. If
     `payload.heartbeat` is set, it sends `gateway.ping` every 15 s and drops the socket after 45 s
@@ -14,7 +15,8 @@ The full reasoning is in [PLAN.md](../PLAN.md).
   * Server→client requests (`approval`, `clarify`, `sudo`, `secret`) have string ids. Any the
     client doesn't handle get `-32601`.
   * Each frame selects a profile through `params.profile`. There is no `/p/<profile>/api/ws`.
-* **Dashboard REST** uses the header `X-Hermes-Session-Token`:
+* **Dashboard REST** uses `Authorization: Bearer <access token>` when signed in, otherwise the
+  header `X-Hermes-Session-Token`:
   * `/api/status`
   * `/api/sessions/{id}/messages?profile=&limit=&order=latest&include_compacted=true`
   * `POST /api/chat/image-upload`
@@ -22,6 +24,76 @@ The full reasoning is in [PLAN.md](../PLAN.md).
   * `/api/media?path=`
 * **API server** `/v1` (and `/p/<profile>/v1` with `gateway.multiplex_profiles`) provides
   `capabilities` and `runs`, with events streamed over SSE.
+
+## Sign-in
+
+Researched on 2026-11-16 against the official docs (`llms-full.txt`, fetched that day from
+hermes-agent.nousresearch.com) and `NousResearch/hermes-agent` at `dff103e0`. Code: `crates/core/src/auth.rs`.
+
+**When a server asks for a password.** The dashboard's auth gate turns on for any non-loopback
+bind or a non-loopback `public_url`; loopback binds have no accounts (docs: *Web Dashboard →
+Authentication (gated mode)*, llms-full.txt ~L96931). Providers are `basic` (username + password,
+`plugins/dashboard_auth/basic`), `nous` (OAuth), `self-hosted` (OIDC) and `session-token`.
+
+**Discovery.** `GET /api/status` → `version`, `auth_required`, `auth_providers`, `auth_flows`
+(`native_pkce` when the native flow below is available; docs *Desktop Native Sign-In (RFC 8252)*,
+~L81961–82061). `GET /api/auth/providers` → `{providers:[{name, display_name, supports_password}]}`,
+503 when none is registered (`hermes_cli/dashboard_auth/routes.py:214`). The app probes what you
+type (and ports 9119/9120 on this machine) with these two calls and nothing else.
+
+**How the web dashboard signs in.** Its `/login` page POSTs `/auth/password-login
+{provider, username, password, next}` (`routes.py:466`). Success is `{ok, next}` plus two cookies:
+`hermes_session_at` (HttpOnly, SameSite=Lax) and `hermes_session_rt` (refresh). Failures: 401
+"Invalid credentials" (deliberately generic), 429 after 10 attempts per minute per IP, 503 when the
+provider is down, 404 for an unknown provider. The middleware refreshes the session from the rt
+cookie transparently (`dashboard_auth/middleware.py`); `POST /auth/logout` clears and revokes it
+(`routes.py:515`); `GET /api/auth/me` returns the identity (`routes.py:551`). The browser reaches
+the WebSocket with `POST /api/auth/ws-ticket` → `{ticket, ttl_seconds: 30}`, single use, presented
+as `/api/ws?ticket=` or the `hermes-gateway-ticket.` subprotocol (`routes.py:583`,
+`web_server_chat.py:377 _consume_ws_ticket`). Lifetimes for `basic`: access 12 h
+(`session_ttl_seconds`), refresh 30 days, stateless; changing the username, password or secret
+invalidates every session. (Nous OAuth access tokens live 15 min.)
+
+**What a native app does (what we use).** Cookies are for browsers; the official native clients use
+the RFC 8252 flow, which yields bearer tokens (docs ~L81961, `routes.py:307/605/626`):
+
+1. `GET /auth/native/authorize?provider&code_challenge(S256)&code_challenge_method=S256&redirect_uri=http://127.0.0.1:<port>/callback&state`
+   sets the `hermes_session_pkce` cookie and 302s to `/login` for password providers.
+2. `POST /auth/password-login` with that cookie returns `next = <redirect_uri>?code&state` and sets
+   no session cookies.
+3. `POST /auth/native/token {code, code_verifier}` → `{access_token, refresh_token,
+   token_type: "Bearer", expires_at, provider, user_id}`.
+4. Every gated route accepts `Authorization: Bearer`. `POST /auth/native/refresh {refresh_token,
+   provider}` rotates both tokens; 401 `session_expired` means sign in again.
+
+Hermes Desktop runs these steps itself (the password form is ours, so no browser or loopback
+listener is needed; the `redirect_uri` is only echoed back). Hermes' own
+`hermes_cli/gateway_connections_oauth.py` drives the same endpoints (`REFRESH_SKEW_S = 60`), and
+hermacos (`core/src/auth.rs`) uses the same headless password variant.
+
+**Session handling in the app.**
+* Tokens are refreshed 120 s before `expires_at`, once for all callers (single-flight), and the
+  rotated pair is written back to the keychain. A REST 401 triggers one refresh and one retry.
+* If the refresh token is dead (password changed, 30 days passed) and the user ticked *Stay signed
+  in*, the app signs in again silently with the password kept in the keychain. Otherwise the link
+  goes to *Sign in required* and Settings → Account offers **Sign in**.
+* Every WebSocket (re)connect mints a fresh ticket via `/api/auth/ws-ticket`.
+* **Sign out** deletes the keychain entry (what the native-flow docs prescribe; `/auth/logout` only
+  revokes cookie sessions, so it isn't called).
+* **Loopback dashboards** (no accounts): the page injects `window.__HERMES_SESSION_TOKEN__`
+  (`web_server_dashboard.py:167/221`, docs ~L7722), rotated on every restart. The app reads it
+  from `/` on each connect and sends it as `X-Hermes-Session-Token` / `?token=`
+  (`web_server.py:299 _has_valid_session_token`).
+* **Advanced:** a deployment session token (`HERMES_DASHBOARD_SESSION_TOKEN`) can still be pasted;
+  it is sent the same way.
+* What is stored: one keychain item per server (service `dev.hermes-desktop`, account = connection id)
+  holding JSON `{kind, access/refresh tokens or token, provider, username, password?}`. The config
+  file only has the server's name and address; the shown username lives in the local cache DB.
+
+**What does not exist.** There is no official endpoint that issues an API key or gateway token
+after a password login. The `/v1` API server (port 8642) is separate and uses its own
+`API_SERVER_KEY` bearer, so a dashboard sign-in does not reach `/v1`. `/api/env/reveal` can show
+secrets to an admin, but using it to fish out keys would be off-label, so the app doesn't.
 
 ## Bot Mode
 | What | Call |

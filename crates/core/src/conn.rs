@@ -187,6 +187,13 @@ impl Config {
 /// Keychain access for a connection's secret.
 pub struct Secrets;
 
+/// Tests and scripted runs set `HERMES_DESKTOP_EPHEMERAL_SECRETS=1` to keep secrets in
+/// process memory instead of the real keychain (never on disk either way).
+fn ephemeral() -> Option<&'static std::sync::Mutex<std::collections::HashMap<String, String>>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> = std::sync::OnceLock::new();
+    std::env::var_os("HERMES_DESKTOP_EPHEMERAL_SECRETS").map(|_| M.get_or_init(Default::default))
+}
+
 impl Secrets {
     fn entry(conn_id: &str) -> Result<keyring::Entry> {
         keyring::Entry::new(KEYRING_SERVICE, conn_id).map_err(|e| anyhow!("keychain: {e}"))
@@ -196,12 +203,23 @@ impl Secrets {
         if let Ok(t) = std::env::var(format!("HERMES_TOKEN_{}", conn_id.to_uppercase().replace('-', "_"))) {
             return Some(t);
         }
+        if let Some(m) = ephemeral() {
+            return m.lock().unwrap().get(conn_id).cloned();
+        }
         Self::entry(conn_id).ok()?.get_password().ok()
     }
     pub fn set(conn_id: &str, secret: &str) -> Result<()> {
+        if let Some(m) = ephemeral() {
+            m.lock().unwrap().insert(conn_id.to_owned(), secret.to_owned());
+            return Ok(());
+        }
         Self::entry(conn_id)?.set_password(secret).map_err(|e| anyhow!("keychain: {e}"))
     }
     pub fn delete(conn_id: &str) {
+        if let Some(m) = ephemeral() {
+            m.lock().unwrap().remove(conn_id);
+            return;
+        }
         if let Ok(e) = Self::entry(conn_id) {
             let _ = e.delete_credential();
         }

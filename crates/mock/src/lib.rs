@@ -54,6 +54,28 @@ struct Inner {
     connected: Vec<String>,
     mcp_installed: Vec<String>,
     toolsets_off: Vec<String>,
+    /// Gated mode (`--basic-auth`): the `basic` provider's account, as on a non-loopback bind.
+    basic: Option<(String, String)>,
+    login: LoginState,
+}
+
+/// Sign-in bookkeeping for gated mode (shapes of `hermes_cli/dashboard_auth` + `web_server_auth`).
+#[derive(Default)]
+struct LoginState {
+    access_ttl: i64,
+    seq: u64,
+    /// pkce cookie -> (challenge, redirect_uri, state)
+    pkce: HashMap<String, (String, String, String)>,
+    /// code -> (challenge, user)
+    codes: HashMap<String, (String, String)>,
+    /// access token -> expires_at
+    access: HashMap<String, i64>,
+    refresh: HashMap<String, String>,
+    tickets: Vec<String>,
+    attempts: Vec<f64>,
+    /// Counters for tests.
+    pub refreshed: u32,
+    pub logins: u32,
 }
 
 #[derive(Clone)]
@@ -123,7 +145,33 @@ impl Mock {
             connected: vec!["github".into()],
             mcp_installed: vec!["filesystem".into()],
             toolsets_off: vec!["image_gen".into()],
+            basic: None,
+            login: LoginState { access_ttl: 12 * 3600, ..Default::default() },
         })))
+    }
+
+    /// Require the `basic` provider's username/password, like a dashboard on a public bind.
+    pub fn with_basic_auth(self, user: &str, pass: &str) -> Mock {
+        self.0.lock().unwrap().basic = Some((user.to_owned(), pass.to_owned()));
+        self
+    }
+
+    /// Access-token lifetime in seconds (default 12 h, as `session_ttl_seconds`).
+    pub fn set_access_ttl(&self, secs: i64) {
+        self.0.lock().unwrap().login.access_ttl = secs;
+    }
+
+    /// Revoke every native session (as changing the password does).
+    pub fn revoke_sessions(&self) {
+        let mut i = self.0.lock().unwrap();
+        i.login.access.clear();
+        i.login.refresh.clear();
+    }
+
+    /// (refreshes, password logins) so far.
+    pub fn auth_counts(&self) -> (u32, u32) {
+        let i = self.0.lock().unwrap();
+        (i.login.refreshed, i.login.logins)
     }
 
     pub fn set_pace(&self, ms: u64) {
@@ -132,7 +180,15 @@ impl Mock {
 
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/", get(index))
             .route("/api/status", get(status))
+            .route("/api/auth/providers", get(providers))
+            .route("/api/auth/me", get(me))
+            .route("/api/auth/ws-ticket", post(ws_ticket))
+            .route("/auth/native/authorize", get(native_authorize))
+            .route("/auth/password-login", post(password_login))
+            .route("/auth/native/token", post(native_token))
+            .route("/auth/native/refresh", post(native_refresh))
             .route("/api/ws", get(ws))
             .route("/api/sessions/{id}/messages", get(messages))
             .route("/api/analytics/usage", get(usage))
@@ -165,12 +221,154 @@ impl Mock {
 }
 
 fn authed(m: &Mock, h: &HeaderMap) -> bool {
-    let t = m.0.lock().unwrap().token.clone();
-    t.is_empty() || h.get("x-hermes-session-token").and_then(|v| v.to_str().ok()) == Some(t.as_str())
+    who(m, h).is_some()
 }
 
-async fn status() -> Json<Value> {
-    Json(json!({"version": "mock", "auth_providers": ["session_token"], "gateway_running": true}))
+/// The caller's identity: the deployment session token (header or Bearer), or a live native
+/// access token (`Authorization: Bearer`), as `web_server.py` accepts them.
+fn who(m: &Mock, h: &HeaderMap) -> Option<String> {
+    let i = m.0.lock().unwrap();
+    let hv = |k: &str| h.get(k).and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let bearer = hv("authorization").and_then(|a| a.strip_prefix("Bearer ").map(str::to_owned));
+    if i.token.is_empty() && i.basic.is_none() {
+        return Some("local".into());
+    }
+    if !i.token.is_empty() && (hv("x-hermes-session-token").as_deref() == Some(i.token.as_str()) || bearer.as_deref() == Some(i.token.as_str())) {
+        return Some("session-token".into());
+    }
+    let b = bearer?;
+    let exp = *i.login.access.get(&b)?;
+    (exp > now() as i64).then(|| i.basic.as_ref().map(|(u, _)| u.clone()).unwrap_or_default())
+}
+
+fn next_id(i: &mut Inner, kind: &str) -> String {
+    i.login.seq += 1;
+    format!("{kind}-{}-{}", i.login.seq, (now() * 1000.0) as u64 % 100_000)
+}
+
+fn err(code: StatusCode, detail: &str) -> Response {
+    (code, Json(json!({"detail": detail}))).into_response()
+}
+
+/// A loopback dashboard serves its SPA with the session token injected.
+async fn index(State(m): State<Mock>) -> Response {
+    let i = m.0.lock().unwrap();
+    if i.basic.is_some() {
+        return axum::response::Redirect::to("/login").into_response();
+    }
+    let page = format!("<!doctype html><html><head><script>window.__HERMES_SESSION_TOKEN__=\"{}\";</script></head><body><div id=root></div></body></html>", i.token);
+    axum::response::Html(page).into_response()
+}
+
+async fn status(State(m): State<Mock>) -> Json<Value> {
+    let gated = m.0.lock().unwrap().basic.is_some();
+    if gated {
+        Json(json!({"version": "mock", "auth_required": true, "auth_providers": ["basic"], "auth_flows": ["native_pkce"], "gateway_running": true}))
+    } else {
+        Json(json!({"version": "mock", "auth_required": false, "auth_providers": ["session_token"], "gateway_running": true}))
+    }
+}
+
+async fn providers(State(m): State<Mock>) -> Response {
+    if m.0.lock().unwrap().basic.is_none() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, "no auth provider registered");
+    }
+    Json(json!({"providers": [{"name": "basic", "display_name": "Username & password", "supports_password": true}]})).into_response()
+}
+
+async fn me(State(m): State<Mock>, h: HeaderMap) -> Response {
+    match who(&m, &h) {
+        Some(u) => Json(json!({"user_id": u, "provider": "basic", "display_name": u})).into_response(),
+        None => err(StatusCode::UNAUTHORIZED, "unauthenticated"),
+    }
+}
+
+async fn native_authorize(State(m): State<Mock>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let mut i = m.0.lock().unwrap();
+    if i.basic.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let g = |k: &str| q.get(k).cloned().unwrap_or_default();
+    if g("code_challenge_method") != "S256" || g("code_challenge").is_empty() || !g("redirect_uri").starts_with("http://127.0.0.1:") || g("provider") != "basic" {
+        return err(StatusCode::BAD_REQUEST, "invalid authorize request");
+    }
+    let c = next_id(&mut i, "pkce");
+    i.login.pkce.insert(c.clone(), (g("code_challenge"), g("redirect_uri"), g("state")));
+    let mut r = axum::response::Redirect::to("/login").into_response();
+    r.headers_mut().insert("set-cookie", format!("hermes_session_pkce={c}; HttpOnly; SameSite=Lax; Path=/").parse().unwrap());
+    r.headers_mut().insert(axum::http::header::LOCATION, "/login".parse().unwrap());
+    *r.status_mut() = StatusCode::FOUND;
+    r
+}
+
+async fn password_login(State(m): State<Mock>, h: HeaderMap, Json(b): Json<Value>) -> Response {
+    let mut i = m.0.lock().unwrap();
+    let Some((user, pass)) = i.basic.clone() else { return StatusCode::NOT_FOUND.into_response() };
+    if b.get("provider").and_then(Value::as_str) != Some("basic") {
+        return err(StatusCode::NOT_FOUND, "unknown provider");
+    }
+    let t = now();
+    i.login.attempts.retain(|a| t - a < 60.0);
+    if i.login.attempts.len() >= 10 {
+        return err(StatusCode::TOO_MANY_REQUESTS, "Too many sign-in attempts");
+    }
+    i.login.attempts.push(t);
+    let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
+    if s("username") != user || s("password") != pass {
+        return err(StatusCode::UNAUTHORIZED, "Invalid credentials");
+    }
+    let cookie = h.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or_default();
+    let pk = cookie.split(';').filter_map(|c| c.trim().strip_prefix("hermes_session_pkce=")).next().map(str::to_owned);
+    match pk.and_then(|k| i.login.pkce.remove(&k)) {
+        Some((challenge, redirect, state)) => {
+            let code = next_id(&mut i, "code");
+            i.login.codes.insert(code.clone(), (challenge, user));
+            Json(json!({"ok": true, "next": format!("{redirect}?code={code}&state={state}")})).into_response()
+        }
+        // The browser flow would set hermes_session_at/rt cookies here; the app never uses it.
+        None => Json(json!({"ok": true, "next": s("next")})).into_response(),
+    }
+}
+
+fn mint(i: &mut Inner, user: &str) -> Value {
+    let at = next_id(i, "at");
+    let rt = next_id(i, "rt");
+    let exp = now() as i64 + i.login.access_ttl;
+    i.login.access.insert(at.clone(), exp);
+    i.login.refresh.insert(rt.clone(), user.to_owned());
+    json!({"access_token": at, "refresh_token": rt, "token_type": "Bearer", "expires_at": exp, "provider": "basic", "user_id": user})
+}
+
+async fn native_token(State(m): State<Mock>, Json(b): Json<Value>) -> Response {
+    use sha2::Digest as _;
+    let mut i = m.0.lock().unwrap();
+    let code = b.get("code").and_then(Value::as_str).unwrap_or_default();
+    let verifier = b.get("code_verifier").and_then(Value::as_str).unwrap_or_default();
+    let Some((challenge, user)) = i.login.codes.remove(code) else { return err(StatusCode::BAD_REQUEST, "invalid_grant") };
+    let want = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
+    if want != challenge {
+        return err(StatusCode::BAD_REQUEST, "invalid_grant");
+    }
+    i.login.logins += 1;
+    Json(mint(&mut i, &user)).into_response()
+}
+
+async fn native_refresh(State(m): State<Mock>, Json(b): Json<Value>) -> Response {
+    let mut i = m.0.lock().unwrap();
+    let rt = b.get("refresh_token").and_then(Value::as_str).unwrap_or_default();
+    let Some(user) = i.login.refresh.remove(rt) else { return err(StatusCode::UNAUTHORIZED, "session_expired") };
+    i.login.refreshed += 1;
+    Json(mint(&mut i, &user)).into_response()
+}
+
+async fn ws_ticket(State(m): State<Mock>, h: HeaderMap) -> Response {
+    if !authed(&m, &h) {
+        return err(StatusCode::UNAUTHORIZED, "unauthenticated");
+    }
+    let mut i = m.0.lock().unwrap();
+    let t = next_id(&mut i, "ticket");
+    i.login.tickets.push(t.clone());
+    Json(json!({"ticket": t, "ttl_seconds": 30})).into_response()
 }
 
 async fn capabilities(State(_m): State<Mock>) -> Json<Value> {
@@ -266,9 +464,14 @@ async fn media(State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<Stri
 }
 
 async fn ws(State(m): State<Mock>, Query(q): Query<HashMap<String, String>>, up: WebSocketUpgrade) -> Response {
-    let tok = m.0.lock().unwrap().token.clone();
-    if !tok.is_empty() && q.get("token") != Some(&tok) {
-        return StatusCode::FORBIDDEN.into_response();
+    {
+        let mut i = m.0.lock().unwrap();
+        // Single-use tickets (`_consume_ws_ticket`) or the deployment session token.
+        let ticket_ok = q.get("ticket").and_then(|t| i.login.tickets.iter().position(|x| x == t)).map(|p| i.login.tickets.remove(p)).is_some();
+        let token_ok = (!i.token.is_empty() && q.get("token") == Some(&i.token)) || (i.token.is_empty() && i.basic.is_none());
+        if !ticket_ok && !token_ok {
+            return StatusCode::FORBIDDEN.into_response();
+        }
     }
     up.max_message_size(400 << 20).on_upgrade(move |s| socket(m, s))
 }

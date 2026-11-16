@@ -2,6 +2,7 @@
 
 mod app;
 mod assets;
+mod onboard;
 mod overlays;
 mod theme;
 mod ui;
