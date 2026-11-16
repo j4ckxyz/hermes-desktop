@@ -517,6 +517,14 @@ pub struct Auth {
     revoked: std::sync::atomic::AtomicBool,
 }
 
+/// Run blocking keychain work without stalling other tasks on a multi-thread runtime.
+fn off_runtime<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
+
 impl Auth {
     pub fn new(conn_id: &str, base: Url, stored: Stored, persist: bool) -> Arc<Auth> {
         Arc::new(Auth { conn_id: conn_id.to_owned(), base, http: http(), stored: Mutex::new(stored), loopback: Mutex::new(None), gate: tokio::sync::Mutex::new(()), persist, revoked: Default::default() })
@@ -546,7 +554,8 @@ impl Auth {
             return;
         }
         if self.persist {
-            if let Err(e) = s.save(&self.conn_id) {
+            // A keychain write can block (or wait on an OS prompt): keep it off the async workers.
+            if let Err(e) = off_runtime(|| s.save(&self.conn_id)) {
                 log::warn!("couldn't save renewed sign-in to the keychain: {e}");
             }
         }
