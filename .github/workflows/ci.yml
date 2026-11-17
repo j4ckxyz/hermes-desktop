@@ -40,4 +40,6 @@ jobs:
         shell: bash
         run: |
           cargo build -p hermes-desktop --locked
-          ./target/debug/hermes-desktop --version | tee /dev/stderr | grep -q "hermes-desktop $(cat VERSION)"
+          v="$(./target/debug/hermes-desktop --version | tr -d '\r')"
+          echo "$v"
+          test "$v" = "hermes-desktop $(cat VERSION)"
