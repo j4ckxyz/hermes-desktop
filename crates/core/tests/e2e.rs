@@ -632,3 +632,29 @@ fn compacted_bot_chat_opens_at_its_live_tip() {
     }
     assert_eq!(mock.refusals(), vec![]);
 }
+
+/// Regression (v0.7.0 against a real Hermes 0.22.5 server): the stream and thread list showed
+/// only weeks-old messages. The server's 13 newest sessions were all empty cron runs and idle TUI
+/// windows, so the app's "recent sessions" window held no real conversation. Conversations are
+/// now listed with `GET /api/sessions?order=recent&min_messages=1` without cron (as the official
+/// desktop's recents are), so real ones survive any amount of such noise.
+#[test]
+fn empty_sessions_do_not_crowd_out_real_conversations() {
+    let (_rt, mock, url) = mock_rt();
+    mock.add_empty_sessions("coder", 20);
+    let svc = start(&url, "n1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let key = BotKey::new("n1", "coder");
+    svc.send(Cmd::OpenBot(key.clone()));
+    let texts: Vec<String> = first_history(&svc, &key).into_iter().map(|m| m.text).collect();
+    assert!(texts.iter().any(|t| t == "Refactor auth · from cli"), "{texts:?}");
+    assert!(texts.iter().any(|t| t.contains("bump the version")), "{texts:?}");
+    svc.send(Cmd::Threads { key: key.clone(), tag: "noise".into() });
+    let rows = wait(&svc, 10, |e| match e {
+        Ev::Rpc { tag, result: Ok(v), .. } if tag == "noise" => Some(v["sessions"].as_array().cloned().unwrap_or_default()),
+        _ => None,
+    });
+    let ids: Vec<&str> = rows.iter().filter_map(|r| r["id"].as_str()).filter(|id| !id.starts_with("s-coder-bot")).collect();
+    assert_eq!(ids, ["s-coder-old", "s-coder-tg"]);
+    assert_eq!(mock.refusals(), vec![]);
+}

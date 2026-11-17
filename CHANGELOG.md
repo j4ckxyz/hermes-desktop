@@ -17,19 +17,29 @@ Protocol fixes found running 0.7.0 against a real Hermes 0.22.5 server.
   - On the session authority: `session.list` asks for stored sessions, `session.interrupt` sends
     the execution generation, and the compact fallback sends its revision and generation fences.
   - `toolsets.list` sends only `session_id`.
-- A long-lived Bot Chat opened at weeks-old messages, and the next message took the "long break"
-  path ("Back after 16 days"). After a compaction, `canonical_session.id` is the registry row,
-  whose transcript stops at the first compaction. The app now opens and sends to the live
-  compression tip (`resolved_id`).
-- The thread list dated conversations by the day they began. It now uses
-  `GET /api/sessions?order=recent`, which sorts by and reports each conversation's latest
-  activity, with each compressed conversation listed once.
+- The chat showed only weeks-old messages ("Back after 16 days") even though other
+  conversations were active that day. On a busy server, the newest sessions are empty cron runs
+  and idle TUI windows. On the real server these filled all 13 rows of the window the stream
+  merged, so no real conversation got in.
+  - The stream now over-fetches and keeps only sessions with messages from conversation sources.
+  - The thread list now uses `GET /api/sessions?order=recent&min_messages=1`, without cron
+    sessions (the official desktop leaves them out of its recents too). It dates each
+    conversation by its last activity, not the day it began.
+- Opening a session that has no messages yet showed "Couldn't load history: 404". The server
+  stores a session's row with its first prompt, so this now shows an empty chat.
+- After a compaction, the app opened the Bot Chat's registry row (`canonical_session.id`), whose
+  transcript stops at the first compaction. It now opens and sends to the live compression tip
+  (`resolved_id`).
 - `install.sh` no longer replaces an `/Applications/Hermes.app` that is a different app (the
   official Hermes app can have the same name).
 
 ### Changed
-- The mock server enforces Hermes 0.22.5's param contracts for both socket modes and models
-  compression lineages, so a stray key or a root/tip mix-up fails the tests.
+- The mock server enforces Hermes 0.22.5's param contracts for both socket modes. It also models
+  compression lineages, sessions with no stored row yet, and empty cron and TUI sessions, so each
+  of these bugs fails a test.
+- `crates/core/tests/live.rs`: an opt-in (`--ignored`) check against a real server. It signs in
+  with credentials held in memory only and reads the socket mode, roster, stream and threads.
+  With `HERMES_LIVE_WRITE=1`, it also creates one test session and sends one message.
 
 ## [0.7.0] - 2026-11-16
 

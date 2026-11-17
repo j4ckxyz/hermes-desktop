@@ -16,6 +16,19 @@ use reqwest::Method;
 use crate::files;
 use crate::auth::Auth;
 
+/// A 404 from the dashboard. For a session the gateway has just created or resumed, it means
+/// the session has no stored rows yet (a row appears with its first prompt).
+#[derive(Debug)]
+pub struct NotFound(pub String);
+
+impl std::fmt::Display for NotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Hermes answered 404 Not Found {}", self.0)
+    }
+}
+
+impl std::error::Error for NotFound {}
+
 #[derive(Clone)]
 pub struct Rest {
     pub auth: Arc<Auth>,
@@ -87,6 +100,9 @@ impl Rest {
         }
         if !st.is_success() {
             let d = body.get("detail").map(|d| d.to_string()).unwrap_or_default();
+            if st.as_u16() == 404 {
+                return Err(NotFound(d).into());
+            }
             bail!("Hermes answered {st} {d}");
         }
         Ok(body)
@@ -112,12 +128,12 @@ impl Rest {
         self.json(Method::GET, &path, None).await
     }
 
-    /// `GET /api/sessions?order=recent`: a profile's sessions by latest activity across each
-    /// compression chain, with `last_active` (source `hermes_cli/web_routers/sessions.py`).
-    /// Internal sources are left out, as the gateway's own listing does
-    /// (`INTERNAL_LISTING_SOURCES` in `hermes_state_sessions.py`).
+    /// `GET /api/sessions?order=recent&min_messages=1`: a profile's conversations by latest
+    /// activity across each compression chain, with `last_active` (source
+    /// `hermes_cli/web_routers/sessions.py`). Empty sessions, cron runs (as the official desktop's
+    /// recents leave them out) and internal sources (`INTERNAL_LISTING_SOURCES`) are excluded.
     pub async fn sessions(&self, profile: &str, limit: usize) -> Result<Vec<Value>> {
-        let path = format!("/api/sessions?profile={}&limit={limit}&order=recent&exclude_sources=kanban,tool,oneshot", enc(profile));
+        let path = format!("/api/sessions?profile={}&limit={limit}&order=recent&min_messages=1&exclude_sources={}", enc(profile), crate::wire::NOT_CONVERSATIONS.join(","));
         let v = self.json(Method::GET, &path, None).await?;
         Ok(v.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default())
     }

@@ -82,6 +82,19 @@ pub fn toolsets_params(session_id: Option<&str>) -> Value {
     }
 }
 
+/// Session sources that are not conversations with the bot: cron runs (the official desktop
+/// lists them apart from its recents) and the gateway's internal sources
+/// (`INTERNAL_LISTING_SOURCES` in `hermes_state_sessions.py`).
+pub const NOT_CONVERSATIONS: [&str; 4] = ["cron", "kanban", "tool", "oneshot"];
+
+/// Listing rows that are conversations: at least one message, from a human-facing source.
+pub fn conversations(rows: Vec<Value>) -> Vec<Value> {
+    rows.into_iter()
+        .filter(|r| r.get("message_count").and_then(Value::as_u64).unwrap_or(0) > 0)
+        .filter(|r| !NOT_CONVERSATIONS.contains(&r.get("source").and_then(Value::as_str).unwrap_or_default()))
+        .collect()
+}
+
 /// A listing row's live id: the compression tip when the row names one.
 pub fn live_id(row: &Value) -> Option<String> {
     ["resolved_id", "id", "session_id"]
@@ -198,6 +211,17 @@ mod tests {
             canonical_from_list(&json!({"sessions": [{"id": "x", "title": "Other"}]})),
             None
         );
+    }
+
+    #[test]
+    fn empty_and_cron_sessions_are_not_conversations() {
+        let rows = vec![
+            json!({"id": "a", "source": "cron", "message_count": 4}),
+            json!({"id": "b", "source": "tui", "message_count": 0}),
+            json!({"id": "c", "source": "discord", "message_count": 3}),
+        ];
+        let kept: Vec<_> = conversations(rows).into_iter().map(|r| r["id"].clone()).collect();
+        assert_eq!(kept, ["c"]);
     }
 
     #[test]

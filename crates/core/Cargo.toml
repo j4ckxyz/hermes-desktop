@@ -29,4 +29,5 @@ libc = "0.2"
 
 [dev-dependencies]
 hermes-mock = { path = "../mock" }
+env_logger.workspace = true
 axum.workspace = true

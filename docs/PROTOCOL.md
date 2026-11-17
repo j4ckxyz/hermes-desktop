@@ -136,7 +136,7 @@ No custom backend: the stream is assembled from official session calls, and the 
 policy only chooses which official call runs before the next message.
 | What | Call |
 |---|---|
-| Stream | Canonical Bot Chat (above) plus `session.list {profile, limit:13, include_hidden:true}`; up to 12 other sessions' latest 60 messages each (`GET /api/sessions/{id}/messages?profile=&limit=60&order=latest`) are merged by timestamp. Each foreign session gets a marker chip "Title · from source" |
+| Stream | Canonical Bot Chat (above) plus `session.list {profile, limit:200, include_hidden:true}`, keeping only conversations (`message_count > 0`, source not `cron`/`kanban`/`tool`/`oneshot`; on a real server the newest rows are mostly empty cron runs and idle TUI windows); up to 12 other sessions' latest 60 messages each (`GET /api/sessions/{id}/messages?profile=&limit=60&order=latest`) are merged by timestamp. Each foreign session gets a marker chip "Title · from source" |
 | Date dividers | Client-side, from message timestamps |
 | Long break → **Compact** (default) | `session.compress {session_id, profile}` on the canonical session; if refused (-32601), `session.mutate {operation:"compress"}`. Same session, older context summarised |
 | Long break → **New session** | `session.create {profile, title:"Bot Chat", hidden:true, …}` + resume, so the new turn starts with an empty context; older sessions stay visible in the stream |
@@ -206,7 +206,8 @@ Research result: Hermes has official directories, and the app uses only those.
 * On the shared gateway these are "older handler" methods. They answer only when the
   connection's ticket carries the full interactive grant, otherwise -32601. The page shows a
   per-source notice in that case.
-* Threads: `GET /api/sessions?profile=&limit=31&order=recent&exclude_sources=kanban,tool,oneshot` (each compression chain once, as its tip, by latest activity, with `last_active`); if REST is unavailable, `session.list {profile, limit}`, whose rows carry only `started_at`, so no time is shown. Plus `profiles.describe {name}`.
+* Threads: `GET /api/sessions?profile=&limit=31&order=recent&min_messages=1&exclude_sources=cron,kanban,tool,oneshot` (each compression chain once, as its tip, by latest activity, with `last_active`); if REST is unavailable, `session.list` filtered the same way client-side, whose rows carry only `started_at`, so no time is shown.
+* History: `GET /api/sessions/{id}/messages`. A 404 for a session the gateway just created or resumed means it has no stored rows yet (a row appears with its first prompt): shown as an empty chat. Plus `profiles.describe {name}`.
 
 ## Gaps (no official API, so nothing was invented)
 * **Cross-machine bot DMs via the Desktop relay** (`bot_relay.*`). The official Desktop acts as a

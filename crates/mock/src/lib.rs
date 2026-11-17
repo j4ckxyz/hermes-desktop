@@ -523,6 +523,17 @@ impl Mock {
         self.0.lock().unwrap().refusals.clone()
     }
 
+    /// Add `n` empty sessions (cron runs and idle TUI windows) newer than everything else, as a
+    /// busy real server has: they must not crowd real conversations out of the stream.
+    pub fn add_empty_sessions(&self, profile: &str, n: usize) {
+        let mut i = self.0.lock().unwrap();
+        for k in 0..n {
+            let kind = if k % 2 == 0 { "cron" } else { "tui" };
+            let s = Session { parent: None, profile: profile.to_owned(), title: String::new(), messages: vec![], last_active: now() - k as f64 };
+            i.sessions.insert(format!("local-{k}-{kind}"), s);
+        }
+    }
+
     /// How many times `method` reached its handler (tests).
     pub fn handled(&self, method: &str) -> usize {
         self.0
@@ -867,7 +878,8 @@ async fn messages(State(m): State<Mock>, h: HeaderMap, Path(id): Path<String>) -
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let i = m.0.lock().unwrap();
-    match i.sessions.get(&id) {
+    match i.sessions.get(&id).filter(|s| !s.messages.is_empty()) {
+        // A created session has no stored row until its first prompt (`session.create`).
         Some(s) => Json(json!({"session_id": id, "profile": s.profile, "messages": s.messages, "pagination": {"limit": 120, "offset": 0, "order": "latest", "returned": s.messages.len()}})).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -891,12 +903,15 @@ async fn sessions_list(
         .unwrap_or_else(|| "default".into());
     let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
     let recent = q.get("order").map(String::as_str) == Some("recent");
+    let min_messages: usize = q.get("min_messages").and_then(|l| l.parse().ok()).unwrap_or(0);
+    let excluded: Vec<&str> = q.get("exclude_sources").map(|s| s.split(',').collect()).unwrap_or_default();
     let mut rows: Vec<(f64, f64, Value)> = i
         .sessions
         .iter()
         .filter(|(id, s)| {
             s.profile == profile && i.tip(id) == **id && i.sessions[&i.root(id)].title != "Bot Chat"
         })
+        .filter(|(id, s)| s.messages.len() >= min_messages && !excluded.contains(&source_of(id)))
         .map(|(id, s)| {
             let root = i.root(id);
             let started = i.sessions[&root]
@@ -906,11 +921,7 @@ async fn sessions_list(
                 .unwrap_or(0.0);
             let mut v = summary(id, s);
             v["started_at"] = json!(started);
-            v["source"] = json!(if id.ends_with("-tg") {
-                "telegram"
-            } else {
-                "cli"
-            });
+            v["source"] = json!(source_of(id));
             v["_lineage_root_id"] = if root == *id {
                 Value::Null
             } else {
@@ -1122,6 +1133,19 @@ const TOOLSETS: &[(&str, &str, u32)] = &[
     ("memory", "Long-term memory", 2),
 ];
 
+/// Where a mock session came from, by its id's suffix.
+fn source_of(id: &str) -> &'static str {
+    if id.ends_with("-tg") {
+        "telegram"
+    } else if id.ends_with("-cron") {
+        "cron"
+    } else if id.ends_with("-tui") {
+        "tui"
+    } else {
+        "cli"
+    }
+}
+
 fn summary(id: &str, s: &Session) -> Value {
     let last = s.messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default();
     let preview: String = last.chars().take(80).collect();
@@ -1211,11 +1235,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                     .chars()
                     .take(80)
                     .collect();
-                let source = if id.ends_with("-tg") {
-                    "telegram"
-                } else {
-                    "cli"
-                };
+                let source = source_of(id);
                 let started = s
                     .messages
                     .first()

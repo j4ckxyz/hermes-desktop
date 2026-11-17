@@ -919,17 +919,21 @@ impl Svc {
     /// by activity across each compression chain and reports `last_active`; the RPC listing
     /// (the fallback) reports only `started_at`, which would date a chat used today by the day it
     /// began.
+    ///
+    /// `GET /api/sessions?order=recent&min_messages=1` leaves out empty sessions and cron runs, as
+    /// the official desktop's recents do; on a busy server those otherwise fill the whole window.
+    /// The RPC fallback can't filter server-side, so it over-fetches and drops them here.
     async fn threads(&self, key: &BotKey) -> Result<Value, String> {
-        const LIMIT: usize = 30;
+        const LIMIT: usize = 31;
         if let Some(rest) = self.rest(&key.conn) {
-            match rest.sessions(&key.profile, LIMIT + 1).await {
+            match rest.sessions(&key.profile, LIMIT).await {
                 Ok(rows) => return Ok(json!({"sessions": wire::thread_rows(&rows, true)})),
                 Err(e) => log::info!("REST session list unavailable, using session.list: {e}"),
             }
         }
         let gw = self.gw(&key.conn).ok_or("Not connected.")?;
-        let r = gw.call("session.list", wire::list_params(self.session_authority(&key.conn), &key.profile, None, LIMIT + 1)).await.map_err(|e| rpc_msg(&e))?;
-        let rows = r.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default();
+        let r = gw.call("session.list", wire::list_params(self.session_authority(&key.conn), &key.profile, None, 200)).await.map_err(|e| rpc_msg(&e))?;
+        let rows: Vec<Value> = wire::conversations(r.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default()).into_iter().take(LIMIT).collect();
         Ok(json!({"sessions": wire::thread_rows(&rows, false)}))
     }
 
@@ -960,7 +964,12 @@ impl Svc {
             }
         };
         let Some(rest) = self.rest(&key.conn) else { return };
-        match rest.messages(&stored, &key.profile, 120).await {
+        // The gateway just resumed or created `stored`, so a 404 means no stored rows yet.
+        let rows = match rest.messages(&stored, &key.profile, 120).await {
+            Err(e) if e.downcast_ref::<crate::rest::NotFound>().is_some() => Ok(Vec::new()),
+            other => other,
+        };
+        match rows {
             Ok(rows) => {
                 let mut msgs = transcript::from_history(&rows);
                 // One continuous stream per bot: fold in its other stored sessions (CLI, messaging,
@@ -982,15 +991,19 @@ impl Svc {
     async fn merge_other_sessions(&self, key: &BotKey, canonical: &str, mut msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
         const MAX_SESSIONS: usize = 12;
         let (Some(gw), Some(rest)) = (self.gw(&key.conn), self.rest(&key.conn)) else { return msgs };
+        // The RPC listing, because it includes hidden sessions (earlier Bot Chats). Its window is
+        // over-fetched and filtered here: on a busy server the newest rows are empty cron runs and
+        // idle TUI windows (seen on a real 0.22.5 server: all of the 13 newest).
         let auth = self.session_authority(&key.conn);
-        let Ok(r) = gw.call("session.list", wire::list_params(auth, &key.profile, None, MAX_SESSIONS + 1)).await else { return msgs };
-        let rows = r.get("sessions").or_else(|| r.get("rows")).or(Some(&r)).and_then(Value::as_array).cloned().unwrap_or_default();
+        let Ok(r) = gw.call("session.list", wire::list_params(auth, &key.profile, None, 200)).await else { return msgs };
+        let rows = wire::conversations(r.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default());
         let wanted: Vec<(String, String, String, String)> = rows
             .iter()
             .filter_map(|row| {
-                let id = row.get("resolved_id").or_else(|| row.get("session_id")).or_else(|| row.get("id")).and_then(Value::as_str)?;
+                let id = wire::live_id(row)?;
                 let s = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or_default().to_owned();
-                (id != canonical).then(|| (id.to_owned(), s("title"), s("source"), activity_stamp(row)))
+                let root = row.get("_lineage_root_id").and_then(Value::as_str);
+                (id != canonical && root != Some(canonical)).then(|| (id, s("title"), s("source"), activity_stamp(row)))
             })
             .take(MAX_SESSIONS)
             .collect();
@@ -1014,7 +1027,13 @@ impl Svc {
         .await;
         let mut extra = Vec::new();
         for ((id, title, source, stamp), hist) in wanted.into_iter().zip(fetched) {
-            let Ok((part, fresh)) = hist else { continue };
+            let (part, fresh) = match hist {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("couldn't load session {id} for the stream: {e}");
+                    continue;
+                }
+            };
             if fresh && !stamp.is_empty() {
                 self.others.lock().unwrap().insert((key.conn.clone(), id.clone()), (stamp, part.clone()));
             }
