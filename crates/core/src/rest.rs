@@ -112,6 +112,16 @@ impl Rest {
         self.json(Method::GET, &path, None).await
     }
 
+    /// `GET /api/sessions?order=recent`: a profile's sessions by latest activity across each
+    /// compression chain, with `last_active` (source `hermes_cli/web_routers/sessions.py`).
+    /// Internal sources are left out, as the gateway's own listing does
+    /// (`INTERNAL_LISTING_SOURCES` in `hermes_state_sessions.py`).
+    pub async fn sessions(&self, profile: &str, limit: usize) -> Result<Vec<Value>> {
+        let path = format!("/api/sessions?profile={}&limit={limit}&order=recent&exclude_sources=kanban,tool,oneshot", enc(profile));
+        let v = self.json(Method::GET, &path, None).await?;
+        Ok(v.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default())
+    }
+
     /// Stored history of a session, newest page (source `hermes_cli/web_routers/sessions.py`).
     pub async fn messages(&self, session_id: &str, profile: &str, limit: u32) -> Result<Vec<Value>> {
         let path = format!(

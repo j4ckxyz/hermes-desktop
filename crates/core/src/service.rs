@@ -17,6 +17,7 @@ use crate::rest::Rest;
 use crate::roster::{self, Bot, BotKey, BOT_CHAT_TITLE, UI_META_KEY};
 use crate::store::Store;
 use crate::transcript::{self, Activity, ChatMessage, Role, ToolState};
+use crate::wire;
 
 /// Image upload limit (`tui_gateway/prompt_attachments.py`).
 pub const MAX_IMAGE_BYTES: u64 = 25 << 20;
@@ -67,6 +68,9 @@ pub enum Cmd {
     /// Any official gateway method, answered with `Ev::Rpc { tag }`. Used by the Apps page, bot
     /// settings and the thread list, whose wire shapes live in `apps.rs` / `roster.rs`.
     Rpc { conn: String, method: String, params: Value, tag: String },
+    /// A bot's other conversations, most recently active first, answered with
+    /// `Ev::Rpc { tag, result: {"sessions": [...]} }` (rows as in `wire::thread_rows`).
+    Threads { key: BotKey, tag: String },
     CreateBot { conn: String, name: String, title: String, description: String },
     SetMeta { key: BotKey, patch: Value },
     RefreshRoster,
@@ -282,7 +286,18 @@ impl Svc {
             Cmd::Stop(key) => {
                 tokio::spawn(async move {
                     if let Some((gw, sid)) = s.live_of(&key) {
-                        let _ = gw.call("session.interrupt", json!({"session_id": sid, "profile": key.profile})).await;
+                        let mut params = json!({"session_id": sid, "profile": key.profile});
+                        if s.session_authority(&key.conn) {
+                            // The authority interrupts one execution generation, never "whatever runs now".
+                            let stored = s.st.lock().unwrap().conns.get(&key.conn).and_then(|c| c.live.get(&key.slot()).map(|l| l.stored.clone())).unwrap_or_else(|| sid.clone());
+                            match s.fence(&gw, &stored, &key.profile).await {
+                                Ok((_, generation)) => params["execution_generation"] = generation,
+                                Err(m) => return log::warn!("couldn't stop the turn: {m}"),
+                            }
+                        }
+                        if let Err(e) = gw.call("session.interrupt", params).await {
+                            log::warn!("session.interrupt failed: {}", e.message);
+                        }
                     }
                 });
             }
@@ -344,7 +359,22 @@ impl Svc {
                     gw.respond(&request_id, json!({"choice": choice}));
                 }
             }
+            Cmd::Threads { key, tag } => {
+                tokio::spawn(async move {
+                    let result = s.threads(&key).await;
+                    s.emit(Ev::Rpc { tag, conn: key.conn.clone(), result });
+                });
+            }
             Cmd::Rpc { conn, method, params, tag } => {
+                let params = if method == "toolsets.list" {
+                    // Session-scoped on the wire (no `profile` key): name the bot's live session so
+                    // the server reads that profile's config, else the launch profile's.
+                    let profile = params.get("profile").and_then(Value::as_str).unwrap_or_default().to_owned();
+                    let sid = s.live_of(&BotKey::new(&conn, &profile)).map(|(_, sid)| sid);
+                    wire::toolsets_params(sid.as_deref())
+                } else {
+                    params
+                };
                 tokio::spawn(async move {
                     let result = match s.gw(&conn) {
                         None => Err("Not connected.".to_owned()),
@@ -756,26 +786,17 @@ impl Svc {
         let gw = self.gw(&key.conn).ok_or("Not connected.")?;
         let p = &key.profile;
         // A thread is an existing stored session: resume it as is.
-        // 1. canonical id from the roster, else look it up by title.
+        // 1. canonical chat from the roster, else look it up by title. Either way resume the
+        // lineage's live compression tip (`resolved_id`), never the registry row (`id`): after a
+        // compaction the row still holds the old transcript.
         let mut stored = match &key.thread {
             Some(t) => Some(t.clone()),
-            None => self.bot(key).and_then(|b| b.canonical.map(|c| c.id)).filter(|s| !s.is_empty()),
+            None => self.bot(key).and_then(|b| b.canonical.map(|c| c.live_id().to_owned())).filter(|s| !s.is_empty()),
         };
         if stored.is_none() {
-            if let Ok(r) = gw.call("session.list", json!({"profile": p, "title": BOT_CHAT_TITLE, "limit": 20, "include_hidden": true})).await {
-                let rows = r.get("sessions").or_else(|| r.get("rows")).or(Some(&r)).and_then(Value::as_array).cloned().unwrap_or_default();
-                stored = rows
-                    .iter()
-                    .filter(|row| {
-                        let t = row.get("root_title").and_then(Value::as_str).filter(|s| !s.is_empty()).or_else(|| row.get("title").and_then(Value::as_str));
-                        t == Some(BOT_CHAT_TITLE)
-                    })
-                    .max_by(|a, b| {
-                        let la = a.get("last_active_at").or_else(|| a.get("started_at")).and_then(Value::as_f64).unwrap_or(0.0);
-                        let lb = b.get("last_active_at").or_else(|| b.get("started_at")).and_then(Value::as_f64).unwrap_or(0.0);
-                        la.partial_cmp(&lb).unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .and_then(|row| row.get("resolved_id").or_else(|| row.get("session_id")).or_else(|| row.get("id")).and_then(Value::as_str).map(str::to_owned));
+            let auth = self.session_authority(&key.conn);
+            if let Ok(r) = gw.call("session.list", wire::list_params(auth, p, Some(BOT_CHAT_TITLE), 20)).await {
+                stored = wire::canonical_from_list(&r);
             }
         }
         let (runtime, stored) = match stored {
@@ -790,7 +811,7 @@ impl Svc {
                 self.after_resume(key, &r);
                 (rt, st)
             }
-            None => self.create_canonical(&gw, p).await?,
+            None => self.create_canonical(&gw, &key.conn, p).await?,
         };
         self.bind_live(key, &runtime, &stored);
         Ok((gw, runtime, stored))
@@ -798,12 +819,9 @@ impl Svc {
 
     /// Create a canonical Bot Chat (official createCanonicalChat shape): a hidden session titled
     /// "Bot Chat". Used when a bot is born and when a long break starts a fresh session.
-    async fn create_canonical(&self, gw: &Gateway, p: &str) -> Result<(String, String), String> {
+    async fn create_canonical(&self, gw: &Gateway, conn: &str, p: &str) -> Result<(String, String), String> {
                 let r = gw
-                    .call(
-                        "session.create",
-                        json!({"profile": p, "title": BOT_CHAT_TITLE, "hidden": true, "follow_profile_config": true, "request_id": uuid::Uuid::new_v4().to_string(), "source": "gui"}),
-                    )
+                    .call("session.create", wire::create_params(self.session_authority(conn), p, &uuid::Uuid::new_v4().to_string()))
                     .await
                     .map_err(|e| rpc_msg(&e))?;
                 let rt = r.get("session_id").and_then(Value::as_str).ok_or("Hermes didn't return a session.")?.to_owned();
@@ -878,15 +896,52 @@ impl Svc {
 
     /// `session.compress`, falling back to `session.mutate compress` where the shared gateway
     /// refuses the former (docs: gateway method ledger).
-    async fn compress(&self, gw: &Gateway, sid: &str, p: &str, focus: Option<&str>) -> Result<(), String> {
+    async fn compress(&self, gw: &Gateway, sid: &str, stored: &str, p: &str, focus: Option<&str>) -> Result<(), String> {
         let r = gw.call_timeout("session.compress", json!({"session_id": sid, "focus_topic": focus, "profile": p}), Duration::from_secs(300)).await;
         let r = match r {
             Err(e) if e.code == METHOD_NOT_FOUND || e.code == -32602 => {
-                gw.call_timeout("session.mutate", json!({"session_id": sid, "request_id": uuid::Uuid::new_v4().to_string(), "operation": "compress", "payload": {"focus": focus}, "profile": p}), Duration::from_secs(300)).await
+                // The authority's compress is revision- and generation-fenced; read both from a
+                // fresh snapshot first, as the official client does (`gateway_agent.py`).
+                let (revision, generation) = self.fence(gw, stored, p).await?;
+                let mut payload = json!({});
+                if let Some(f) = focus {
+                    payload["focus"] = json!(f);
+                }
+                let params = json!({"session_id": sid, "request_id": uuid::Uuid::new_v4().to_string(), "expected_revision": revision, "expected_generation": generation, "operation": "compress", "payload": payload, "profile": p});
+                gw.call_timeout("session.mutate", params, Duration::from_secs(300)).await
             }
             other => other,
         };
         r.map(|_| ()).map_err(|e| e.message)
+    }
+
+    /// The bot's other conversations for the info panel. `GET /api/sessions?order=recent` sorts
+    /// by activity across each compression chain and reports `last_active`; the RPC listing
+    /// (the fallback) reports only `started_at`, which would date a chat used today by the day it
+    /// began.
+    async fn threads(&self, key: &BotKey) -> Result<Value, String> {
+        const LIMIT: usize = 30;
+        if let Some(rest) = self.rest(&key.conn) {
+            match rest.sessions(&key.profile, LIMIT + 1).await {
+                Ok(rows) => return Ok(json!({"sessions": wire::thread_rows(&rows, true)})),
+                Err(e) => log::info!("REST session list unavailable, using session.list: {e}"),
+            }
+        }
+        let gw = self.gw(&key.conn).ok_or("Not connected.")?;
+        let r = gw.call("session.list", wire::list_params(self.session_authority(&key.conn), &key.profile, None, LIMIT + 1)).await.map_err(|e| rpc_msg(&e))?;
+        let rows = r.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(json!({"sessions": wire::thread_rows(&rows, false)}))
+    }
+
+    /// `(revision, execution_generation)` of one session from a fresh `session.resume`
+    /// snapshot: the fence the session authority requires on `session.mutate` and
+    /// `session.interrupt`.
+    async fn fence(&self, gw: &Gateway, stored: &str, p: &str) -> Result<(Value, Value), String> {
+        let r = gw
+            .call("session.resume", json!({"session_id": stored, "defer_history": true, "omit_messages": true, "profile": p}))
+            .await
+            .map_err(|e| rpc_msg(&e))?;
+        Ok((r.get("revision").cloned().unwrap_or(Value::Null), r.get("execution_generation").cloned().unwrap_or(Value::Null)))
     }
 
     async fn open_bot(&self, key: BotKey, from_cache: bool) {
@@ -927,7 +982,8 @@ impl Svc {
     async fn merge_other_sessions(&self, key: &BotKey, canonical: &str, mut msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
         const MAX_SESSIONS: usize = 12;
         let (Some(gw), Some(rest)) = (self.gw(&key.conn), self.rest(&key.conn)) else { return msgs };
-        let Ok(r) = gw.call("session.list", json!({"profile": key.profile, "limit": MAX_SESSIONS + 1, "include_hidden": true})).await else { return msgs };
+        let auth = self.session_authority(&key.conn);
+        let Ok(r) = gw.call("session.list", wire::list_params(auth, &key.profile, None, MAX_SESSIONS + 1)).await else { return msgs };
         let rows = r.get("sessions").or_else(|| r.get("rows")).or(Some(&r)).and_then(Value::as_array).cloned().unwrap_or_default();
         let wanted: Vec<(String, String, String, String)> = rows
             .iter()
@@ -983,13 +1039,13 @@ impl Svc {
     }
 
     async fn send(&self, key: BotKey, text: String, files: Vec<LocalFile>, refresh: Option<GapAction>, slash: bool) -> Result<(), String> {
-        let (gw, mut sid, _) = self.ensure_live(&key).await?;
+        let (gw, mut sid, stored) = self.ensure_live(&key).await?;
         let p = key.profile.clone();
         // /new and /reset would fork the forever-chat: compact instead (docs: Bot Mode).
         if files.is_empty() {
             if let Some(cmd) = roster::rewrite_bot_chat_command(&text) {
                 let focus = cmd.strip_prefix("/compact").map(str::trim).filter(|s| !s.is_empty());
-                return match self.compress(&gw, &sid, &p, focus).await {
+                return match self.compress(&gw, &sid, &stored, &p, focus).await {
                     Ok(()) => {
                         self.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: None });
                         self.emit(Ev::Info { message: "Bot Chat compacted: fresh working context, same conversation.".into() });
@@ -1034,12 +1090,12 @@ impl Svc {
         }
         // Long break: refresh the working context before this prompt.
         match refresh {
-            Some(GapAction::Compact) => match self.compress(&gw, &sid, &p, None).await {
+            Some(GapAction::Compact) => match self.compress(&gw, &sid, &stored, &p, None).await {
                 Ok(()) => self.emit(Ev::Refreshed { key: key.clone(), action: GapAction::Compact }),
                 Err(m) => log::warn!("long-break compaction failed: {m}"),
             },
             Some(GapAction::Fresh) if key.thread.is_none() => {
-                let (rt, st) = self.create_canonical(&gw, &p).await?;
+                let (rt, st) = self.create_canonical(&gw, &key.conn, &p).await?;
                 self.bind_live(&key, &rt, &st);
                 sid = rt;
                 self.emit(Ev::Refreshed { key: key.clone(), action: GapAction::Fresh });
@@ -1049,6 +1105,9 @@ impl Svc {
         let mut text = text;
         let mut attachments = Vec::new();
         let rest = self.rest(&key.conn).ok_or("Not connected.")?;
+        // Only the session authority's `prompt.submit` takes `attachments`; a plain gateway
+        // socket attaches images to the session with `image.attach_bytes` instead.
+        let authority = self.session_authority(&key.conn);
         for f in files {
             if f.size > MAX_FILE_BYTES {
                 return Err(format!("{} is larger than Hermes accepts (256 MB).", f.name));
@@ -1071,17 +1130,18 @@ impl Svc {
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("Couldn't read {}: {e}", f.name))?;
             if f.mime.starts_with("image/") && f.size <= MAX_IMAGE_BYTES {
-                match rest.upload_image(&p, &f.name, data_url.clone()).await {
-                    Ok(v) if v.get("path").is_some() => {
-                        attachments.push(json!({"path": v["path"], "mime": v.get("mime_type").cloned().unwrap_or(json!(f.mime))}));
-                        continue;
-                    }
-                    _ => {
-                        let r = gw.call_timeout("image.attach_bytes", json!({"session_id": sid, "content_base64": b64_of(&data_url), "filename": f.name, "profile": p}), Duration::from_secs(300)).await;
-                        if r.is_ok() {
+                if authority {
+                    if let Ok(v) = rest.upload_image(&p, &f.name, data_url.clone()).await {
+                        if let Some(path) = v.get("path").and_then(Value::as_str) {
+                            let mime = v.get("mime_type").and_then(Value::as_str).unwrap_or(&f.mime);
+                            attachments.push(json!({"path": path, "mime": mime}));
                             continue;
                         }
                     }
+                }
+                let r = gw.call_timeout("image.attach_bytes", json!({"session_id": sid, "content_base64": b64_of(&data_url), "filename": f.name, "profile": p}), Duration::from_secs(300)).await;
+                if r.is_ok() {
+                    continue;
                 }
             }
             let r = gw
@@ -1096,13 +1156,8 @@ impl Svc {
         if let Some(note) = roster::mention_note(&roster::resolve_mentions(&text, &self.all_bots(), &key.conn)) {
             text.push_str(&note);
         }
-        let id_key = if self.session_authority(&key.conn) { "input_id" } else { "submission_id" };
-        let mut params = json!({"session_id": sid, "text": text, "profile": p});
-        params[id_key] = json!(uuid::Uuid::new_v4().to_string());
-        if !attachments.is_empty() {
-            params["attachments"] = Value::Array(attachments);
-        }
-        gw.call("prompt.submit", params).await.map_err(|e| e.message)?;
+        let params = wire::submit_params(authority, &sid, &text, &p, &uuid::Uuid::new_v4().to_string(), attachments);
+        gw.call("prompt.submit", params).await.map_err(|e| rpc_msg(&e))?;
         Ok(())
     }
 

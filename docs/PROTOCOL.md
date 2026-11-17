@@ -98,14 +98,34 @@ after a password login. The `/v1` API server (port 8642) is separate and uses it
 `API_SERVER_KEY` bearer, so a dashboard sign-in does not reach `/v1`. `/api/env/reveal` can show
 secrets to an admin, but using it to fish out keys would be off-label, so the app doesn't.
 
+## Two socket modes
+A gateway WebSocket is either a **plain gateway** socket (the dashboard's `server.dispatch`;
+contracts in `tui_gateway/contracts/*.py`) or a **session authority** socket (`gateway.ready`
+carries `session_authority: true`; contracts in `tui_gateway/contracts/canonical*.py`). Both
+refuse any key a method's contract does not declare: the plain socket with `4000 invalid params
+for <method>: <key>: Extra inputs are not permitted …`, the authority with `4001 invalid_params`
+(which also covers missing required keys). The shapes that differ are built in
+`crates/core/src/wire.rs`, checked against hermes-agent v0.22.5, and the mock enforces both
+contract sets so a stray key fails the tests.
+
+| Call | Plain gateway | Session authority |
+|---|---|---|
+| `session.create` retry key | `idempotency_key` | `request_id` |
+| `prompt.submit` | `{session_id, text, profile}`; images staged first with `image.attach_bytes` | adds `input_id` and `attachments:[{path, mime}]` (images from `/api/chat/image-upload`) |
+| `session.list` | stored sessions | `scope:"stored"` (the default scope is live sessions only) |
+| `session.interrupt` | `{session_id}` | adds `execution_generation` from a fresh `session.resume` |
+| Rename, compact | `session.title`, `session.compress` | `session.mutate {request_id, expected_revision, operation, payload}` (compress also `expected_generation`) |
+
+`toolsets.list` takes only `{session_id}` in both modes (it reads that session's profile).
+
 ## Bot Mode
 | What | Call |
 |---|---|
-| Roster | `profiles.list {}` (polled every 5 s; the UI updates only when something changed) |
+| Roster | `profiles.list {}` (polled every 5 s; the UI updates only when something changed). `canonical_session.id` is the Bot Chat's registry row; `resolved_id` is its live compression tip, which `preview` and `last_active` describe and which the app opens |
 | Metadata | `profiles.configure {name, ui_meta:{"hermes-bots":{…}}, ui_meta_expected_revisions}`, a compare-and-swap that retries up to 3 times. The patch is applied to the raw stored object, so keys this client can't parse survive |
 | New bot | `profiles.create {name, description, model?}` |
-| Canonical chat | `session.list {profile, title:"Bot Chat", include_hidden:true}`, then if needed `session.create {profile, title:"Bot Chat", hidden:true, follow_profile_config:true, source:"gui"}`, then `session.resume {…, defer_history:true, omit_messages:true}` |
-| Send | `prompt.submit {session_id, text, profile, submission_id\|input_id, attachments}` (`input_id` when `gateway.ready.session_authority` is set) |
+| Canonical chat | The roster's `canonical_session.resolved_id`, else `session.list {profile, title:"Bot Chat", include_hidden:true}` (its row's `resolved_id`), else `session.create {profile, title:"Bot Chat", hidden:true, follow_profile_config:true, source:"gui", idempotency_key\|request_id}`; then `session.resume {…, defer_history:true, omit_messages:true}`. Resuming the registry row instead would replay the transcript from before the first compaction |
+| Send | `prompt.submit`, shaped per socket mode (above) |
 | `/new`, `/reset` | Become `/compact` through `session.compress` (fallback: `session.mutate {operation:"compress"}`), so the bot keeps a single chat |
 | @mentions | The official note `[@mentions resolved from the Bot Mode roster — …]` is appended, and the agent uses `message_agent` |
 | Agent notices | Rows with `role:user` that start `Message from 🤖 Name (@handle[@conn]):` are shown as cards |
@@ -179,14 +199,14 @@ Research result: Hermes has official directories, and the app uses only those.
 * **Curated MCP presets**: `mcp.catalog`, `mcp.servers.add {name, preset}` / `remove`. Presets
   that need API keys list them in `requires`; the app tells the user to set them on the host
   and never sends secrets.
-* **Toolsets**: `toolsets.list`, `tools.configure {action, names, profile}`.
+* **Toolsets**: `toolsets.list {session_id}` (the bot's live session), `tools.configure {action, names, profile}`.
 * **Skills**: `skills.manage {action:"list"}`.
 * **Plugin catalog** (human-reviewed YAML in `plugin-catalog/`, `plugins.catalog.lookup`): exists
   but is **not shown yet**.
 * On the shared gateway these are "older handler" methods. They answer only when the
   connection's ticket carries the full interactive grant, otherwise -32601. The page shows a
   per-source notice in that case.
-* Threads: `session.list {profile, limit}` (non-hidden sessions) and `profiles.describe {name}`.
+* Threads: `GET /api/sessions?profile=&limit=31&order=recent&exclude_sources=kanban,tool,oneshot` (each compression chain once, as its tip, by latest activity, with `last_active`); if REST is unavailable, `session.list {profile, limit}`, whose rows carry only `started_at`, so no time is shown. Plus `profiles.describe {name}`.
 
 ## Gaps (no official API, so nothing was invented)
 * **Cross-machine bot DMs via the Desktop relay** (`bot_relay.*`). The official Desktop acts as a

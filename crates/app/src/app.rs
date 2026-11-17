@@ -1987,7 +1987,7 @@ impl HermesApp {
             self.info = Some(InfoState { key: key.clone(), describe: None, threads: None, edit: None });
         }
         self.rpc(&key.conn, "profiles.describe", json!({"name": key.profile, "profile": key.profile}), rpc_tag(&["describe", &key.conn, &key.profile]));
-        self.rpc(&key.conn, "session.list", json!({"profile": key.profile, "limit": 30}), rpc_tag(&["threads", &key.conn, &key.profile]));
+        self.svc.send(Cmd::Threads { key: key.clone(), tag: rpc_tag(&["threads", &key.conn, &key.profile]) });
         cx.notify();
     }
 
@@ -2178,16 +2178,20 @@ impl HermesApp {
                 if kind == "describe" {
                     info.describe = Some(result);
                 } else {
-                    let canonical = self.bots.iter().find(|b| b.key.same_bot(&info.key)).and_then(|b| b.canonical.as_ref().map(|c| c.id.clone()));
+                    let canonical = self.bots.iter().find(|b| b.key.same_bot(&info.key)).and_then(|b| b.canonical.clone());
                     info.threads = Some(result.map(|v| {
                         v.get("sessions")
                             .and_then(Value::as_array)
                             .map(|rows| {
+                                // Rows from `wire::thread_rows`: `id` is the live tip, `root_id` its lineage root.
                                 rows.iter()
                                     .filter_map(|r| {
-                                        let id = r.get("id").or_else(|| r.get("session_id")).and_then(Value::as_str)?.to_owned();
+                                        let id = r.get("id").and_then(Value::as_str)?.to_owned();
                                         let title = r.get("title").and_then(Value::as_str).unwrap_or_default().to_owned();
-                                        if Some(&id) == canonical.as_ref() || title == roster::BOT_CHAT_TITLE {
+                                        let is_canonical = canonical.as_ref().is_some_and(|c| {
+                                            ["id", "root_id", "row_id"].iter().any(|k| r.get(*k).and_then(Value::as_str).is_some_and(|x| c.is(x)))
+                                        });
+                                        if is_canonical || title == roster::BOT_CHAT_TITLE {
                                             return None;
                                         }
                                         let preview = r.get("preview").and_then(Value::as_str).map(|p| roster::one_line(&roster::strip_inline_md(p), 90)).unwrap_or_default();
@@ -2195,7 +2199,7 @@ impl HermesApp {
                                             title: if title.is_empty() { if preview.is_empty() { "Untitled".into() } else { roster::one_line(&preview, 40) } } else { title },
                                             preview,
                                             source: r.get("source").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("hermes").to_owned(),
-                                            last: r.get("last_active_at").or_else(|| r.get("last_active")).or_else(|| r.get("started_at")).and_then(Value::as_f64).unwrap_or(0.0),
+                                            last: r.get("last_active").and_then(Value::as_f64).unwrap_or(0.0),
                                             count: r.get("message_count").and_then(Value::as_u64).unwrap_or(0),
                                             id,
                                         })

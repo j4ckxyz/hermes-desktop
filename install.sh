@@ -73,6 +73,12 @@ if [ "$os" = macos ]; then
   fi
   ditto -x -k "$tmp/$asset" "$tmp/unpacked"
   [ -d "$tmp/unpacked/Hermes.app" ] || die "archive has no Hermes.app"
+  # Only ever replace our own app: the official Hermes Agent app may also be called Hermes.app.
+  if [ -e "$dest/Hermes.app" ]; then
+    ours="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$tmp/unpacked/Hermes.app/Contents/Info.plist")"
+    theirs="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$dest/Hermes.app/Contents/Info.plist" 2>/dev/null || true)"
+    [ "$theirs" = "$ours" ] || die "$dest/Hermes.app is another app (${theirs:-unknown}); not replacing it. Set HERMES_APP_DIR to install elsewhere."
+  fi
   rm -rf "$dest/Hermes.app"
   ditto "$tmp/unpacked/Hermes.app" "$dest/Hermes.app"
   # The app is ad-hoc signed (no paid Apple Developer ID), so clear the download quarantine flag

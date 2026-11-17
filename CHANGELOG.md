@@ -3,6 +3,34 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.7.1] - 2026-11-17
+
+Protocol fixes found running 0.7.0 against a real Hermes 0.22.5 server.
+
+### Fixed
+- Sending failed with "invalid params for session.create: request_id: Extra inputs are not
+  permitted". Hermes refuses any key outside a method's contract, and the app mixed the two
+  socket modes' shapes. Requests are now built per mode (`gateway.ready.session_authority`)
+  from the 0.22.5 contracts:
+  - On a plain gateway socket, `session.create` sends `idempotency_key`, and `prompt.submit`
+    sends no `submission_id` or `attachments`. Images go through `image.attach_bytes` instead.
+  - On the session authority: `session.list` asks for stored sessions, `session.interrupt` sends
+    the execution generation, and the compact fallback sends its revision and generation fences.
+  - `toolsets.list` sends only `session_id`.
+- A long-lived Bot Chat opened at weeks-old messages, and the next message took the "long break"
+  path ("Back after 16 days"). After a compaction, `canonical_session.id` is the registry row,
+  whose transcript stops at the first compaction. The app now opens and sends to the live
+  compression tip (`resolved_id`).
+- The thread list dated conversations by the day they began. It now uses
+  `GET /api/sessions?order=recent`, which sorts by and reports each conversation's latest
+  activity, with each compressed conversation listed once.
+- `install.sh` no longer replaces an `/Applications/Hermes.app` that is a different app (the
+  official Hermes app can have the same name).
+
+### Changed
+- The mock server enforces Hermes 0.22.5's param contracts for both socket modes and models
+  compression lineages, so a stray key or a root/tip mix-up fails the tests.
+
 ## [0.7.0] - 2026-11-16
 
 ### Added

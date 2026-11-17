@@ -17,6 +17,7 @@ pub mod usage;
 pub mod service;
 pub mod store;
 pub mod transcript;
+pub mod wire;
 
 pub use roster::{Bot, BotKey};
 pub use service::{Cmd, Ev, LocalFile, Service};

@@ -32,6 +32,10 @@ struct Profile {
 
 #[derive(Clone)]
 struct Session {
+    /// Compression parent: this session continues `parent` after a compaction. The registry
+    /// row (the root) keeps the pre-compaction transcript; the chain's last session is the
+    /// live tip (`get_compression_tip`).
+    parent: Option<String>,
     profile: String,
     title: String,
     messages: Vec<Value>,
@@ -65,6 +69,308 @@ struct Inner {
     open_reqs: HashMap<String, Vec<Value>>,
     /// Closes every socket (tests: simulate a dropped connection).
     kill: Option<tokio::sync::broadcast::Sender<()>>,
+    /// Serve sockets as the session authority (`gateway.ready.session_authority`), with the
+    /// canonical contracts, instead of the plain gateway dispatcher.
+    authority: bool,
+    /// `session.create` retry keys already answered → stored id (`idempotency_key` /
+    /// `request_id`), so a retried create returns the same session.
+    created: HashMap<String, String>,
+    /// Images attached with `image.attach_bytes`, waiting for the session's next prompt.
+    staged: HashMap<String, Vec<Value>>,
+    /// Requests refused for keys outside their contract: `(method, message)`.
+    refusals: Vec<(String, String)>,
+    /// Methods answered without a contract refusal, in order.
+    handled: Vec<String>,
+}
+
+impl Inner {
+    /// Live tip of a compression chain (`get_compression_tip`): the input when nothing continues it.
+    fn tip(&self, id: &str) -> String {
+        let mut cur = id.to_owned();
+        while let Some((child, _)) = self
+            .sessions
+            .iter()
+            .find(|(_, s)| s.parent.as_deref() == Some(cur.as_str()))
+        {
+            cur = child.clone();
+        }
+        cur
+    }
+
+    /// Root of the chain `id` belongs to.
+    fn root(&self, id: &str) -> String {
+        let mut cur = id.to_owned();
+        while let Some(p) = self.sessions.get(&cur).and_then(|s| s.parent.clone()) {
+            cur = p;
+        }
+        cur
+    }
+
+    /// The profile's canonical "Bot Chat" registry row (title identity, as `get_session_by_title`).
+    fn canonical_root(&self, profile: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|(_, s)| s.profile == profile && s.title == "Bot Chat" && s.parent.is_none())
+            .map(|(id, _)| id.clone())
+    }
+}
+
+/// Keys each method's params may carry, from hermes-agent v0.22.5 `tui_gateway/contracts`
+/// (plain dispatcher: `METHODS`; authority: `CANONICAL_METHODS`, where `profile` is implicit).
+/// Both refuse unknown keys before any handler runs (`registry.validate_params`,
+/// `canonical_param_problems`); the authority also refuses missing required keys.
+fn contract(
+    method: &str,
+    authority: bool,
+) -> Option<(&'static [&'static str], &'static [&'static str], bool)> {
+    const NONE: &[&str] = &[];
+    let canonical: Option<(&[&str], &[&str])> = match method {
+        "session.create" => Some((
+            &[
+                "profile",
+                "request_id",
+                "source",
+                "cwd",
+                "row_cwd",
+                "model",
+                "provider",
+                "base_url",
+                "api_key",
+                "toolsets",
+                "reasoning",
+                "max_turns",
+                "ignore_rules",
+                "yolo",
+                "safe_mode",
+                "ignore_user_config",
+                "skills",
+                "checkpoints",
+                "accept_hooks",
+                "pass_session_id",
+                "editor",
+                "title",
+                "hidden",
+                "follow_profile_config",
+                "service_tier",
+                "cwd_explicit",
+                "run_budget",
+                "verbose",
+                "client_env",
+            ],
+            NONE,
+        )),
+        "session.resume" => Some((
+            &[
+                "profile",
+                "session_id",
+                "title",
+                "latest",
+                "workspace",
+                "source",
+                "editor",
+                "api_key",
+                "defer_history",
+                "omit_messages",
+                "cols",
+                "display_projection",
+            ],
+            NONE,
+        )),
+        "session.list" => Some((
+            &["profile", "scope", "limit", "title", "include_hidden"],
+            NONE,
+        )),
+        "session.interrupt" => Some((
+            &["profile", "session_id", "execution_generation"],
+            &["session_id", "execution_generation"],
+        )),
+        "prompt.submit" => Some((
+            &[
+                "profile",
+                "session_id",
+                "text",
+                "submission_id",
+                "input_id",
+                "queued",
+                "attachments",
+                "finite",
+                "unattended",
+                "surface",
+                "voice_context",
+                "interrupted",
+                "voice_turn",
+                "display_kind",
+                "title_preview",
+                "turn_author",
+                "api_text",
+                "model_override",
+                "clarify_batch",
+            ],
+            &["session_id", "text"],
+        )),
+        "session.mutate" => Some((
+            &[
+                "profile",
+                "session_id",
+                "request_id",
+                "expected_revision",
+                "operation",
+                "payload",
+                "expected_generation",
+            ],
+            &[
+                "session_id",
+                "request_id",
+                "expected_revision",
+                "operation",
+                "payload",
+            ],
+        )),
+        _ => None,
+    };
+    if let (true, Some((keys, required))) = (authority, canonical) {
+        return Some((keys, required, true));
+    }
+    let keys: &[&str] = match method {
+        "client.capabilities" => &["server_requests", "desktop_local"],
+        "profiles.list" => &["profile", "include_sessions"],
+        "profiles.configure" => &[
+            "profile",
+            "name",
+            "ui_meta",
+            "ui_meta_expected_revisions",
+            "soul",
+            "description",
+            "model",
+            "provider",
+            "confirm_expensive_model",
+            "disabled_skills",
+            "enabled_toolsets",
+            "enabled_mcp_servers",
+        ],
+        "profiles.create" => &[
+            "profile",
+            "name",
+            "description",
+            "clone_from",
+            "clone_all",
+            "clone_channels",
+            "no_skills",
+            "no_alias",
+            "soul",
+            "model",
+            "provider",
+            "share_auth",
+            "mirror_credentials",
+        ],
+        "profiles.describe" => &["profile", "name"],
+        "session.list" => &["profile", "title", "limit", "include_hidden"],
+        "session.create" => &[
+            "profile",
+            "cols",
+            "source",
+            "cwd",
+            "cwd_explicit",
+            "messages",
+            "parent_session_id",
+            "title",
+            "model",
+            "provider",
+            "reasoning_effort",
+            "fast",
+            "service_tier",
+            "close_on_disconnect",
+            "hidden",
+            "room_plumbing",
+            "follow_profile_config",
+            "idempotency_key",
+        ],
+        "session.title" => &["session_id", "profile", "title"],
+        "session.resume" => &[
+            "session_id",
+            "profile",
+            "cols",
+            "source",
+            "lazy",
+            "defer_history",
+            "omit_messages",
+            "eager_build",
+            "close_on_disconnect",
+            "inline_images",
+        ],
+        "session.interrupt" => &["session_id", "profile", "expected_hosted_task_id"],
+        "session.compress" => &["session_id", "profile", "focus_topic"],
+        "slash.exec" => &["session_id", "command", "profile"],
+        "image.attach_bytes" => &[
+            "session_id",
+            "profile",
+            "content_base64",
+            "data",
+            "filename",
+            "ext",
+        ],
+        "file.attach" => &["session_id", "profile", "path", "data_url", "name"],
+        "prompt.submit" => &[
+            "session_id",
+            "profile",
+            "text",
+            "display_kind",
+            "interrupted",
+            "queued",
+            "surface",
+            "voice_context",
+            "voice_turn",
+            "title_preview",
+            "truncate_before_user_ordinal",
+            "truncate_before_row_id",
+            "truncate_before_message_id",
+            "confirm_truncate",
+            "confirm_empty_truncate",
+            "confirm_deep_truncate",
+            "rebind_survivor_row_ids",
+        ],
+        "commands.catalog" => &["session_id", "profile"],
+        "connectors.catalog" | "mcp.catalog" => &["profile"],
+        "connectors.list" => &["profile", "owner"],
+        "connectors.connect" => &[
+            "profile",
+            "owner",
+            "connectors",
+            "reconnect",
+            "alias",
+            "connection_id",
+        ],
+        "connectors.tools" => &["profile", "slug", "refresh"],
+        "mcp.servers.add" => &["profile", "name", "preset", "config", "bearer_token"],
+        "mcp.servers.remove" => &["profile", "name"],
+        "toolsets.list" => &["session_id"],
+        "tools.configure" => &["action", "names", "session_id", "profile"],
+        "skills.manage" => &["profile", "action", "query", "page", "page_size"],
+        _ => return None,
+    };
+    Some((keys, NONE, false))
+}
+
+/// The gateway's refusal for params outside the method's contract, worded as Hermes words it.
+fn check_params(method: &str, p: &Value, authority: bool) -> Result<(), (i64, String)> {
+    let Some((allowed, required, canonical)) = contract(method, authority) else {
+        return Ok(());
+    };
+    let obj = p.as_object().cloned().unwrap_or_default();
+    if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        return Err(if canonical {
+            (4001, format!("invalid_params: {k}"))
+        } else {
+            (4000, format!("invalid params for {method}: {k}: Extra inputs are not permitted — the client and the Hermes backend are out of sync (different versions); run `hermes update` and restart both"))
+        });
+    }
+    if let Some(k) = required
+        .iter()
+        .find(|k| obj.get(**k).is_none_or(Value::is_null))
+    {
+        return Err((4001, format!("invalid_params: {k}")));
+    }
+    Ok(())
 }
 
 /// Sign-in bookkeeping for gated mode (shapes of `hermes_cli/dashboard_auth` + `web_server_auth`).
@@ -114,6 +420,7 @@ impl Mock {
         sessions.insert(
             "s-default".to_owned(),
             Session {
+                parent: None,
                 profile: "default".into(),
                 title: "Bot Chat".into(),
                 messages: vec![
@@ -132,15 +439,57 @@ impl Mock {
         );
         sessions.insert(
             "s-researcher".to_owned(),
-            Session { profile: "researcher".into(), title: "Bot Chat".into(), messages: vec![row(10, "user", "Find papers on agent memory", t - 86400.0), row(11, "assistant", "On it. Top pick: *MemGPT* (2023).", t - 86300.0)], last_active: t - 86300.0 },
+            Session {
+                parent: None,
+                profile: "researcher".into(),
+                title: "Bot Chat".into(),
+                messages: vec![
+                    row(10, "user", "Find papers on agent memory", t - 86400.0),
+                    row(
+                        11,
+                        "assistant",
+                        "On it. Top pick: *MemGPT* (2023).",
+                        t - 86300.0,
+                    ),
+                ],
+                last_active: t - 86300.0,
+            },
         );
         sessions.insert(
             "s-coder-old".to_owned(),
-            Session { profile: "coder".into(), title: "Refactor auth".into(), messages: vec![row(20, "user", "refactor the auth module", t - 4000.0), row(21, "assistant", "Done: split into `token.rs` and `session.rs`.", t - 3900.0)], last_active: t - 3900.0 },
+            Session {
+                parent: None,
+                profile: "coder".into(),
+                title: "Refactor auth".into(),
+                messages: vec![
+                    row(20, "user", "refactor the auth module", t - 4000.0),
+                    row(
+                        21,
+                        "assistant",
+                        "Done: split into `token.rs` and `session.rs`.",
+                        t - 3900.0,
+                    ),
+                ],
+                last_active: t - 3900.0,
+            },
         );
         sessions.insert(
             "s-coder-tg".to_owned(),
-            Session { profile: "coder".into(), title: "Deploy checklist".into(), messages: vec![row(30, "user", "what's left before we deploy?", t - 90000.0), row(31, "assistant", "Two things: bump the version and run the migration.", t - 89900.0)], last_active: t - 89900.0 },
+            Session {
+                parent: None,
+                profile: "coder".into(),
+                title: "Deploy checklist".into(),
+                messages: vec![
+                    row(30, "user", "what's left before we deploy?", t - 90000.0),
+                    row(
+                        31,
+                        "assistant",
+                        "Two things: bump the version and run the migration.",
+                        t - 89900.0,
+                    ),
+                ],
+                last_active: t - 89900.0,
+            },
         );
         Mock(Arc::new(Mutex::new(Inner {
             token: token.to_owned(),
@@ -161,7 +510,74 @@ impl Mock {
             open_reqs: HashMap::new(),
             kill: Some(tokio::sync::broadcast::channel(4).0),
             login: LoginState { access_ttl: 12 * 3600, ..Default::default() },
+            authority: false,
+            created: HashMap::new(),
+            staged: HashMap::new(),
+            refusals: Vec::new(),
+            handled: Vec::new(),
         })))
+    }
+
+    /// Every request refused for params outside its contract, as `(method, message)` (tests).
+    pub fn refusals(&self) -> Vec<(String, String)> {
+        self.0.lock().unwrap().refusals.clone()
+    }
+
+    /// How many times `method` reached its handler (tests).
+    pub fn handled(&self, method: &str) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .handled
+            .iter()
+            .filter(|m| *m == method)
+            .count()
+    }
+
+    /// One stored session's own transcript (tests).
+    pub fn messages_in(&self, id: &str) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .map(|s| s.messages.clone())
+            .unwrap_or_default()
+    }
+
+    /// Serve every socket as the session authority (`gateway.ready.session_authority: true`).
+    pub fn as_session_authority(self) -> Mock {
+        self.0.lock().unwrap().authority = true;
+        self
+    }
+
+    /// Turn a profile's Bot Chat into a compressed lineage, as a long-lived chat on a real
+    /// server is: the registry row keeps two messages from `days_ago`, and a continuation (the
+    /// live tip, untitled) holds everything since. Returns `(root, tip)`.
+    pub fn compact_bot_chat(&self, profile: &str, days_ago: f64) -> (String, String) {
+        let mut i = self.0.lock().unwrap();
+        let root = i.canonical_root(profile).expect("profile has a Bot Chat");
+        let tip = format!("{root}-c1");
+        let old = now() - days_ago * 86400.0;
+        let s = i.sessions.get_mut(&root).unwrap();
+        let recent = std::mem::replace(
+            &mut s.messages,
+            vec![
+                json!({"id": 901, "role": "user", "content": "An old question from weeks ago", "timestamp": old}),
+                json!({"id": 902, "role": "assistant", "content": "An old answer from weeks ago", "timestamp": old + 5.0}),
+            ],
+        );
+        let last_active = s.last_active;
+        s.last_active = old + 5.0;
+        let continuation = Session {
+            parent: Some(root.clone()),
+            profile: profile.to_owned(),
+            title: String::new(),
+            messages: recent,
+            last_active,
+        };
+        i.sessions.insert(tip.clone(), continuation);
+        (root, tip)
     }
 
     /// Require the `basic` provider's username/password, like a dashboard on a public bind.
@@ -184,7 +600,13 @@ impl Mock {
 
     /// Number of canonical "Bot Chat" sessions a profile has (tests).
     pub fn bot_chats(&self, profile: &str) -> usize {
-        self.0.lock().unwrap().sessions.values().filter(|s| s.profile == profile && s.title == "Bot Chat").count()
+        self.0
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .filter(|s| s.profile == profile && s.title == "Bot Chat" && s.parent.is_none())
+            .count()
     }
 
     /// Drop every WebSocket, as a network blip would. Running turns keep going.
@@ -233,6 +655,7 @@ impl Mock {
             .route("/auth/native/token", post(native_token))
             .route("/auth/native/refresh", post(native_refresh))
             .route("/api/ws", get(ws))
+            .route("/api/sessions", get(sessions_list))
             .route("/api/sessions/{id}/messages", get(messages))
             .route("/api/analytics/usage", get(usage))
             .route("/api/chat/image-upload", post(image_upload))
@@ -256,7 +679,20 @@ impl Mock {
     /// Transcript of a stored session (for tests).
     pub fn messages_of(&self, profile: &str) -> Vec<Value> {
         let i = self.0.lock().unwrap();
-        i.sessions.values().filter(|s| s.profile == profile && s.title == "Bot Chat").flat_map(|s| s.messages.clone()).collect()
+        let Some(root) = i.canonical_root(profile) else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        let mut cur = Some(root);
+        while let Some(id) = cur {
+            out.extend(i.sessions[&id].messages.clone());
+            cur = i
+                .sessions
+                .iter()
+                .find(|(_, s)| s.parent.as_deref() == Some(id.as_str()))
+                .map(|(c, _)| c.clone());
+        }
+        out
     }
 
     pub fn ui_meta_of(&self, profile: &str) -> Value {
@@ -437,6 +873,65 @@ async fn messages(State(m): State<Mock>, h: HeaderMap, Path(id): Path<String>) -
     }
 }
 
+/// `GET /api/sessions` (`hermes_cli/web_routers/sessions.py`): `order=recent` sorts compression
+/// chains by their latest activity and lists each once, as its tip, with `last_active`; hidden
+/// sessions (canonical Bot Chats) are left out.
+async fn sessions_list(
+    State(m): State<Mock>,
+    h: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !authed(&m, &h) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let i = m.0.lock().unwrap();
+    let profile = q
+        .get("profile")
+        .cloned()
+        .unwrap_or_else(|| "default".into());
+    let limit: usize = q.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+    let recent = q.get("order").map(String::as_str) == Some("recent");
+    let mut rows: Vec<(f64, f64, Value)> = i
+        .sessions
+        .iter()
+        .filter(|(id, s)| {
+            s.profile == profile && i.tip(id) == **id && i.sessions[&i.root(id)].title != "Bot Chat"
+        })
+        .map(|(id, s)| {
+            let root = i.root(id);
+            let started = i.sessions[&root]
+                .messages
+                .first()
+                .and_then(|m| m["timestamp"].as_f64())
+                .unwrap_or(0.0);
+            let mut v = summary(id, s);
+            v["started_at"] = json!(started);
+            v["source"] = json!(if id.ends_with("-tg") {
+                "telegram"
+            } else {
+                "cli"
+            });
+            v["_lineage_root_id"] = if root == *id {
+                Value::Null
+            } else {
+                json!(root)
+            };
+            (s.last_active, started, v)
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        if recent {
+            b.0.total_cmp(&a.0)
+        } else {
+            b.1.total_cmp(&a.1)
+        }
+    });
+    let total = rows.len();
+    let sessions: Vec<Value> = rows.into_iter().take(limit).map(|r| r.2).collect();
+    Json(json!({"sessions": sessions, "total": total, "limit": limit, "offset": 0, "storage": {}}))
+        .into_response()
+}
+
 /// `GET /api/analytics/usage` (shape of `hermes_cli/web_routers/analytics.py`), with
 /// deterministic made-up numbers per profile so the Usage page has something to draw.
 async fn usage(State(m): State<Mock>, h: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
@@ -562,7 +1057,11 @@ async fn socket(m: Mock, s: WebSocket) {
             }
         }
     });
-    let _ = tx.send(event("gateway.ready", "", json!({"heartbeat": true, "change_events": true, "replay_epoch": "mock"})));
+    let mut ready = json!({"heartbeat": true, "change_events": true, "replay_epoch": "mock"});
+    if m.0.lock().unwrap().authority {
+        ready["session_authority"] = json!(true);
+    }
+    let _ = tx.send(event("gateway.ready", "", ready));
     let mut kill = m.0.lock().unwrap().kill.as_ref().map(|k| k.subscribe());
     loop {
         let next = match &mut kill {
@@ -631,6 +1130,16 @@ fn summary(id: &str, s: &Session) -> Value {
 
 fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String>) -> Result<Value, (i64, String)> {
     let mut i = m.0.lock().unwrap();
+    if let Err(e) = check_params(method, p, i.authority) {
+        i.refusals.push((method.to_owned(), e.1.clone()));
+        return Err(e);
+    }
+    i.handled.push(method.to_owned());
+    // The authority serves session verbs itself; methods only the plain dispatcher had are
+    // unknown there (`ws_legacy_fallback`: the session namespace never falls back).
+    if i.authority && matches!(method, "session.title" | "session.compress") {
+        return Err((-32601, format!("unknown method: {method}")));
+    }
     let profile = p["profile"].as_str().unwrap_or("default").to_owned();
     match method {
         "client.capabilities" => Ok(json!({"server_requests": ["approval", "clarify", "sudo", "secret"]})),
@@ -640,8 +1149,23 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                 .profiles
                 .iter()
                 .map(|pr| {
-                    let canon = i.sessions.iter().find(|(_, s)| s.profile == pr.name && s.title == "Bot Chat").map(|(id, s)| summary(id, s));
-                    let last = i.sessions.iter().filter(|(_, s)| s.profile == pr.name && s.title != "Bot Chat").max_by(|a, b| a.1.last_active.total_cmp(&b.1.last_active)).map(|(id, s)| summary(id, s));
+                    // `_canonical_session_row`: `id` is the registry row, `resolved_id` the live tip, and
+                    // the preview, title and times describe the tip.
+                    let canon = i.canonical_root(&pr.name).map(|root| {
+                        let tip = i.tip(&root);
+                        let t = &i.sessions[&tip];
+                        let mut v = summary(&tip, t);
+                        v["id"] = json!(root);
+                        v["resolved_id"] = json!(tip);
+                        v["root_title"] = json!("Bot Chat");
+                        v
+                    });
+                    let last = i
+                        .sessions
+                        .iter()
+                        .filter(|(id, s)| s.profile == pr.name && i.root(id) != i.canonical_root(&pr.name).unwrap_or_default())
+                        .max_by(|a, b| a.1.last_active.total_cmp(&b.1.last_active))
+                        .map(|(id, s)| summary(id, s));
                     json!({"name": pr.name, "path": format!("~/.hermes/profiles/{}", pr.name), "is_default": pr.name == "default", "model": "mock-model", "provider": "mock",
                         "description": pr.description, "display_name": "", "skill_count": 3, "previous_names": [],
                         "last_session": last, "canonical_session": canon, "ui_meta": pr.ui_meta, "ui_meta_revisions": {"hermes-bots": pr.revision}, "has_avatar": false})
@@ -675,31 +1199,150 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             Ok(json!({"ok": true, "name": name, "soul_set": false}))
         }
         "session.list" => {
-            let title = p["title"].as_str();
-            let rows: Vec<Value> = i
+            // `methods_session` (plain) / `CanonicalListParams` (authority, whose default scope is
+            // "live": only sessions attached right now).
+            let row = |i: &Inner, id: &str, tip: &str| {
+                let (s, t) = (&i.sessions[id], &i.sessions[tip]);
+                let preview: String = t
+                    .messages
+                    .last()
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or_default()
+                    .chars()
+                    .take(80)
+                    .collect();
+                let source = if id.ends_with("-tg") {
+                    "telegram"
+                } else {
+                    "cli"
+                };
+                let started = s
+                    .messages
+                    .first()
+                    .map(|m| m["timestamp"].clone())
+                    .unwrap_or(json!(0));
+                json!({"id": id, "title": s.title, "preview": preview, "started_at": started, "message_count": t.messages.len(), "source": source, "_lineage_root_id": Value::Null})
+            };
+            if let Some(title) = p["title"].as_str() {
+                // Exact-title lookup: the registry row, with the lineage's live tip as `resolved_id`.
+                let found = i
+                    .sessions
+                    .iter()
+                    .find(|(_, s)| s.profile == profile && s.title == title && s.parent.is_none())
+                    .map(|(id, _)| id.clone());
+                let Some(id) = found else {
+                    return Ok(json!({"sessions": []}));
+                };
+                let tip = i.tip(&id);
+                let mut r = row(&i, &id, &tip);
+                r["resolved_id"] = json!(tip);
+                return Ok(json!({"sessions": [r]}));
+            }
+            let live_only = i.authority && p["scope"].as_str().unwrap_or("live") == "live";
+            let limit = p["limit"].as_u64().unwrap_or(200) as usize;
+            let mut tips: Vec<(String, f64)> = i
                 .sessions
                 .iter()
-                .filter(|(_, s)| s.profile == profile && title.is_none_or(|t| s.title == t))
-                .filter(|(_, s)| p["include_hidden"].as_bool().unwrap_or(false) || title.is_some() || s.title != "Bot Chat")
-                .map(|(id, s)| {
-                    let preview: String = s.messages.last().and_then(|m| m["content"].as_str()).unwrap_or_default().chars().take(80).collect();
-                    let source = if id.ends_with("-tg") { "telegram" } else { "cli" };
-                    json!({"session_id": id, "id": id, "title": s.title, "root_title": s.title, "preview": preview, "source": source, "started_at": s.messages.first().map(|m| m["timestamp"].clone()), "message_count": s.messages.len(), "last_active_at": s.last_active, "running": false})
+                .filter(|(id, s)| s.profile == profile && i.tip(id) == **id)
+                .filter(|(id, _)| {
+                    p["include_hidden"].as_bool().unwrap_or(false)
+                        || i.sessions[&i.root(id)].title != "Bot Chat"
+                })
+                .filter(|(id, _)| !live_only || i.attached.contains_key(*id))
+                .map(|(id, s)| (id.clone(), s.last_active))
+                .collect();
+            // Most recently active first; the row itself carries no activity time.
+            tips.sort_by(|a, b| b.1.total_cmp(&a.1));
+            // A compressed chain is listed once, as its tip (an untitled continuation stays untitled),
+            // naming its root in `_lineage_root_id`.
+            let rows: Vec<Value> = tips
+                .iter()
+                .take(limit)
+                .map(|(id, _)| {
+                    let mut r = row(&i, id, id);
+                    let root = i.root(id);
+                    if root != *id {
+                        r["_lineage_root_id"] = json!(root);
+                    }
+                    r
                 })
                 .collect();
-            let mut rows = rows;
-            rows.sort_by(|a, b| b["last_active_at"].as_f64().unwrap_or(0.0).total_cmp(&a["last_active_at"].as_f64().unwrap_or(0.0)));
             Ok(json!({"sessions": rows}))
         }
         "session.create" => {
+            let retry = p
+                .get(if i.authority {
+                    "request_id"
+                } else {
+                    "idempotency_key"
+                })
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(stored) = retry.as_ref().and_then(|k| i.created.get(k)).cloned() {
+                let rt = i.attached.get(&stored).cloned().unwrap_or_default();
+                return Ok(
+                    json!({"session_id": rt, "stored_session_id": stored, "info": {"title": i.sessions[&stored].title, "model": "mock-model"}, "revision": 1, "execution_generation": 1}),
+                );
+            }
             let stored = format!("s-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-            let rt = format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-            // Like the real gateway, the title arrives through session.title afterwards.
-            i.sessions.insert(stored.clone(), Session { profile: profile.clone(), title: String::new(), messages: vec![], last_active: now() });
+            let rt = if i.authority {
+                stored.clone()
+            } else {
+                format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8])
+            };
+            // Like the real plain gateway, the title arrives through session.title afterwards.
+            i.sessions.insert(
+                stored.clone(),
+                Session {
+                    parent: None,
+                    profile: profile.clone(),
+                    title: String::new(),
+                    messages: vec![],
+                    last_active: now(),
+                },
+            );
             i.runtime.insert(rt.clone(), stored.clone());
             i.sinks.insert(rt.clone(), tx.clone());
             i.attached.insert(stored.clone(), rt.clone());
-            Ok(json!({"session_id": rt, "stored_session_id": stored, "info": {"title": "", "model": "mock-model"}, "revision": 1}))
+            if let Some(k) = retry {
+                i.created.insert(k, stored.clone());
+            }
+            Ok(
+                json!({"session_id": rt, "stored_session_id": stored, "info": {"title": "", "model": "mock-model"}, "revision": 1, "execution_generation": 1}),
+            )
+        }
+        "session.mutate" if i.authority => {
+            let rt = p["session_id"].as_str().unwrap_or_default();
+            let stored = i
+                .runtime
+                .get(rt)
+                .cloned()
+                .ok_or((4001, "not_found".to_owned()))?;
+            match p["operation"].as_str().unwrap_or_default() {
+                "rename" => {
+                    let title = p
+                        .pointer("/payload/title")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
+                    i.sessions.get_mut(&stored).unwrap().title = title.clone();
+                    Ok(
+                        json!({"session_id": stored, "operation": "rename", "revision": 2, "title": title}),
+                    )
+                }
+                "compress" => {
+                    if p.get("expected_generation").is_none_or(Value::is_null) {
+                        return Err((4001, "stale_generation".into()));
+                    }
+                    let row = i.next_row;
+                    i.next_row += 1;
+                    i.sessions.get_mut(&stored).unwrap().messages.push(json!({"id": row, "role": "user", "content": "", "display_kind": "context_compaction", "display_metadata": {"display_text": "Context compacted"}, "timestamp": now()}));
+                    Ok(
+                        json!({"session_id": stored, "operation": "compress", "revision": 2, "status": "compressed"}),
+                    )
+                }
+                other => Err((4001, format!("unsupported operation {other}"))),
+            }
         }
         "session.title" => {
             let rt = p["session_id"].as_str().unwrap_or_default();
@@ -710,21 +1353,36 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             Ok(json!({"ok": true}))
         }
         "session.resume" => {
+            // Resuming a session id opens THAT session: a compressed root replays its own,
+            // pre-compaction transcript (the client must ask for the tip).
             let stored = p["session_id"].as_str().unwrap_or_default().to_owned();
             if !i.sessions.contains_key(&stored) {
                 return Err((4004, "session not found".into()));
             }
-            let rt = format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+            let rt = if i.authority {
+                stored.clone()
+            } else {
+                format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8])
+            };
             i.runtime.insert(rt.clone(), stored.clone());
             i.sinks.insert(rt.clone(), tx.clone());
             i.attached.insert(stored.clone(), rt.clone());
             let title = i.sessions[&stored].title.clone();
             let inflight = i.inflight.get(&stored).cloned().unwrap_or(Value::Null);
-            let open: Vec<Value> = i.open_reqs.get(&stored).cloned().unwrap_or_default().into_iter().map(|mut r| {
-                r["params"]["session_id"] = json!(rt);
-                r
-            }).collect();
-            Ok(json!({"session_id": rt, "stored_session_id": stored, "running": !inflight.is_null(), "info": {"title": title, "model": "mock-model"}, "inflight": inflight, "open_requests": open}))
+            let open: Vec<Value> = i
+                .open_reqs
+                .get(&stored)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut r| {
+                    r["params"]["session_id"] = json!(rt);
+                    r
+                })
+                .collect();
+            Ok(
+                json!({"session_id": rt, "stored_session_id": stored, "running": !inflight.is_null(), "info": {"title": title, "model": "mock-model"}, "inflight": inflight, "open_requests": open, "revision": 1, "execution_generation": 1}),
+            )
         }
         "session.interrupt" => Ok(json!({"ok": true})),
         "profiles.describe" => {
@@ -817,7 +1475,22 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             }
             Ok(json!({"ok": true, "folded": 4}))
         }
-        "image.attach_bytes" => Ok(json!({"attached": true, "path": "/home/hermes/uploads/img.png"})),
+        "image.attach_bytes" => {
+            let rt = p["session_id"].as_str().unwrap_or_default().to_owned();
+            if !i.runtime.contains_key(&rt) {
+                return Err((4004, "unknown session".into()));
+            }
+            let name = p["filename"].as_str().unwrap_or("image.png");
+            let path = format!(
+                "/home/hermes/uploads/{}-{name}",
+                &uuid::Uuid::new_v4().to_string()[..8]
+            );
+            i.staged
+                .entry(rt)
+                .or_default()
+                .push(json!({"path": path, "mime": "image/png"}));
+            Ok(json!({"attached": true, "path": path}))
+        }
         "file.attach" => {
             let name = p["name"].as_str().unwrap_or("file").to_owned();
             let path = format!("/home/hermes/uploads/{name}");
@@ -832,8 +1505,13 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             let row = i.next_row;
             i.next_row += 1;
             let mut user_row = json!({"id": row, "role": "user", "content": text, "timestamp": now()});
-            if let Some(a) = p.get("attachments") {
-                user_row["attachments"] = a.clone();
+            // The authority's admission names its attachments; a plain socket's prompt takes the
+            // images staged on the session.
+            let staged = i.staged.remove(&rt).unwrap_or_default();
+            match p.get("attachments") {
+                Some(a) => user_row["attachments"] = a.clone(),
+                None if !staged.is_empty() => user_row["attachments"] = Value::Array(staged),
+                None => {}
             }
             let s = i.sessions.get_mut(&stored).unwrap();
             s.messages.push(user_row);

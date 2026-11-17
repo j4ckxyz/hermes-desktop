@@ -76,8 +76,14 @@ pub struct BotMeta {
 /// A conversation summary as profiles.list reports it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// For `canonical_session`, the registry row (the lineage root), which keeps the transcript
+    /// from before any compaction.
     #[serde(default)]
     pub id: String,
+    /// For `canonical_session`, the live compression tip (`ProfileCanonicalSession`): the
+    /// session the conversation continues in, which `preview` and `last_active` describe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_id: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
     #[serde(default)]
@@ -86,6 +92,18 @@ pub struct SessionSummary {
     pub last_active: Option<f64>,
     #[serde(default)]
     pub message_count: Option<i64>,
+}
+
+impl SessionSummary {
+    /// The session to open: the compression tip when the server reports one.
+    pub fn live_id(&self) -> &str {
+        self.resolved_id.as_deref().filter(|s| !s.is_empty()).unwrap_or(&self.id)
+    }
+
+    /// Whether `id` names this conversation (its root row or its live tip).
+    pub fn is(&self, id: &str) -> bool {
+        !id.is_empty() && (id == self.id || id == self.live_id())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -502,6 +520,18 @@ mod tests {
         assert_eq!(b.last_active(), 20.0);
         assert!(b.meta.extra.contains_key("unknownKey"));
         assert!(b.tags().contains(&"researchbuddy".to_string()));
+    }
+
+    #[test]
+    fn canonical_chat_opens_at_its_compression_tip() {
+        // Hermes 0.22.5 `ProfileCanonicalSession`: `id` is the registry row, `resolved_id` the
+        // live tip. Opening `id` after a compaction showed weeks-old messages.
+        let row = json!({"name": "default", "canonical_session": {"id": "root", "resolved_id": "tip", "root_title": "Bot Chat", "title": "Bot Chat", "preview": "today", "started_at": 1.0, "last_active": 99.0}});
+        let c = Bot::from_row("c", "C", &row).unwrap().canonical.unwrap();
+        assert_eq!(c.live_id(), "tip");
+        assert!(c.is("root") && c.is("tip") && !c.is("other") && !c.is(""));
+        let plain = SessionSummary { id: "only".into(), ..Default::default() };
+        assert_eq!(plain.live_id(), "only");
     }
 
     #[test]

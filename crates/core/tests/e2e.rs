@@ -39,6 +39,9 @@ fn wait<T>(svc: &Service, secs: u64, mut f: impl FnMut(&Ev) -> Option<T>) -> T {
         if let Ev::Error { message, .. } = &ev {
             eprintln!("service error: {message}");
         }
+        if std::env::var_os("HD_TRACE").is_some() {
+            eprintln!("event: {:.200}", format!("{ev:?}"));
+        }
         if let Some(t) = f(&ev) {
             return t;
         }
@@ -372,4 +375,260 @@ fn slash_commands_and_usage() {
     .unwrap();
     let u = hermes_core::usage::parse(&v);
     assert!(u.totals.input_tokens > 0 && u.totals.requests > 0 && !u.daily.is_empty());
+}
+
+fn first_history(svc: &Service, key: &BotKey) -> Vec<hermes_core::transcript::ChatMessage> {
+    wait(svc, 10, |e| match e {
+        Ev::History {
+            key: k,
+            messages,
+            cached: false,
+        } if k == key => Some(messages.clone()),
+        _ => None,
+    })
+}
+
+fn poll(secs: u64, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(std::time::Instant::now() < deadline, "timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Regression (v0.7.0 against Hermes 0.22.5): sending failed with "invalid params for
+/// session.create: request_id: Extra inputs are not permitted". Hermes refuses any key outside a
+/// method's contract, and a plain gateway socket's `session.create` names its retry key
+/// `idempotency_key` (`request_id` is the session authority's). The mock now enforces the
+/// 0.22.5 contracts; a new chat, a message with an image, a compaction, a stop, the thread list
+/// and the Apps page's toolsets must all stay inside them.
+#[test]
+fn plain_gateway_requests_stay_inside_the_contract() {
+    let (_rt, mock, url) = mock_rt();
+    let svc = start(&url, "p1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let key = BotKey::new("p1", "scribe"); // no Bot Chat yet: opening it creates one
+    svc.send(Cmd::OpenBot(key.clone()));
+    assert!(first_history(&svc, &key).is_empty());
+    assert_eq!(mock.bot_chats("scribe"), 1);
+
+    let dir = std::env::temp_dir().join(format!("hd-plain-{}", uuid_like()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("pic.png");
+    std::fs::write(&png, hermes_mock::demo_png(8, 8)).unwrap();
+    svc.send(Cmd::Send {
+        key: key.clone(),
+        text: "hello there".into(),
+        files: vec![LocalFile::from_path(png).unwrap()],
+        refresh: None,
+        slash: false,
+    });
+    let err = wait(&svc, 10, |e| match e {
+        Ev::TurnEnd { key: k, error, .. } if *k == key => Some(error.clone()),
+        _ => None,
+    });
+    assert_eq!(err, None, "the message was sent");
+    let user = mock
+        .messages_of("scribe")
+        .into_iter()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    assert_eq!(user["content"], "hello there");
+    assert!(
+        user["attachments"][0]["path"]
+            .as_str()
+            .unwrap()
+            .starts_with("/home/hermes/uploads/"),
+        "image staged with image.attach_bytes"
+    );
+
+    svc.send(Cmd::Send {
+        key: key.clone(),
+        text: "/new".into(),
+        files: vec![],
+        refresh: None,
+        slash: false,
+    });
+    wait(&svc, 10, |e| {
+        matches!(e, Ev::Info { message } if message.contains("compacted")).then_some(())
+    });
+    svc.send(Cmd::Stop(key.clone()));
+    poll(5, || mock.handled("session.interrupt") == 1);
+
+    svc.send(Cmd::Rpc {
+        conn: "p1".into(),
+        method: "toolsets.list".into(),
+        params: serde_json::json!({"profile": "scribe"}),
+        tag: "ts".into(),
+    });
+    wait(&svc, 10, |e| {
+        matches!(e, Ev::Rpc { tag, result: Ok(_), .. } if tag == "ts").then_some(())
+    });
+    assert_eq!(
+        mock.refusals(),
+        vec![],
+        "every request matched its 0.22.5 contract"
+    );
+}
+
+/// The same flows on a session-authority socket, whose canonical contracts differ: `request_id`
+/// on create, `input_id` and staged `attachments` on submit, `scope: "stored"` listings, and
+/// fenced `session.mutate` / `session.interrupt` (no `session.title` or `session.compress`).
+#[test]
+fn session_authority_requests_stay_inside_the_contract() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mock = hermes_mock::Mock::new("tok-123").as_session_authority();
+    mock.set_pace(1);
+    let addr = rt.block_on(mock.clone().spawn("127.0.0.1:0"));
+    let svc = start(&format!("http://{addr}"), "a1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let key = BotKey::new("a1", "scribe");
+    svc.send(Cmd::OpenBot(key.clone()));
+    first_history(&svc, &key);
+    let dir = std::env::temp_dir().join(format!("hd-auth-{}", uuid_like()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("pic.png");
+    std::fs::write(&png, hermes_mock::demo_png(8, 8)).unwrap();
+    svc.send(Cmd::Send {
+        key: key.clone(),
+        text: "hello".into(),
+        files: vec![LocalFile::from_path(png).unwrap()],
+        refresh: None,
+        slash: false,
+    });
+    let err = wait(&svc, 10, |e| match e {
+        Ev::TurnEnd { key: k, error, .. } if *k == key => Some(error.clone()),
+        _ => None,
+    });
+    assert_eq!(err, None);
+    assert_eq!(
+        mock.bot_chats("scribe"),
+        1,
+        "renamed to Bot Chat through session.mutate"
+    );
+    let user = mock
+        .messages_of("scribe")
+        .into_iter()
+        .find(|m| m["role"] == "user")
+        .unwrap();
+    assert!(
+        user["attachments"][0]["path"].as_str().is_some(),
+        "image sent as an admission attachment"
+    );
+    svc.send(Cmd::Send {
+        key: key.clone(),
+        text: "/new".into(),
+        files: vec![],
+        refresh: None,
+        slash: false,
+    });
+    wait(&svc, 10, |e| {
+        matches!(e, Ev::Info { message } if message.contains("compacted")).then_some(())
+    });
+    svc.send(Cmd::Stop(key.clone()));
+    poll(5, || mock.handled("session.interrupt") == 1);
+    assert_eq!(mock.refusals(), vec![]);
+}
+
+/// Regression (v0.7.0 against a long-lived Bot Chat): the app showed weeks-old messages and
+/// "Back after 16 days". A Bot Chat that has been compacted is a lineage: `canonical_session.id`
+/// is the registry row, whose transcript stops at the first compaction, and `resolved_id` is
+/// the live tip. The app resumed `id`. It must open, and send to, the tip; and the thread list
+/// must date conversations by their last activity, not the day they began.
+#[test]
+fn compacted_bot_chat_opens_at_its_live_tip() {
+    let (_rt, mock, url) = mock_rt();
+    let (root, tip) = mock.compact_bot_chat("default", 16.0);
+    let svc = start(&url, "c1", "tok-123");
+    let bots = wait(&svc, 10, |e| match e {
+        Ev::Roster { bots, .. } => Some(bots.clone()),
+        _ => None,
+    });
+    let hermes = bots.iter().find(|b| b.name == "default").unwrap();
+    let canon = hermes.canonical.as_ref().unwrap();
+    assert_eq!(
+        (canon.id.as_str(), canon.live_id()),
+        (root.as_str(), tip.as_str())
+    );
+
+    let key = BotKey::new("c1", "default");
+    svc.send(Cmd::OpenBot(key.clone()));
+    let msgs = first_history(&svc, &key);
+    let texts: Vec<&str> = msgs.iter().map(|m| m.text.as_str()).collect();
+    assert!(
+        texts.contains(&"Morning! What's on today?"),
+        "today's conversation: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("weeks ago")),
+        "not the pre-compaction transcript: {texts:?}"
+    );
+    let last = msgs
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, Role::User | Role::Assistant))
+        .and_then(|m| m.timestamp)
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    assert!(
+        now - last < 6.0 * 3600.0,
+        "no long-break gap: last message {}h ago",
+        (now - last) / 3600.0
+    );
+
+    svc.send(Cmd::Send {
+        key: key.clone(),
+        text: "still here".into(),
+        files: vec![],
+        refresh: None,
+        slash: false,
+    });
+    wait(&svc, 10, |e| {
+        matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(())
+    });
+    assert!(
+        mock.messages_in(&tip)
+            .iter()
+            .any(|m| m["content"] == "still here"),
+        "sent to the live tip"
+    );
+    assert_eq!(
+        mock.messages_in(&root).len(),
+        2,
+        "the registry row is untouched"
+    );
+
+    // Thread list: by last activity, with real activity times, the canonical lineage left out.
+    for (profile, want) in [
+        ("coder", vec!["s-coder-old", "s-coder-tg"]),
+        ("default", vec![]),
+    ] {
+        let tag = format!("threads-{profile}");
+        svc.send(Cmd::Threads {
+            key: BotKey::new("c1", profile),
+            tag: tag.clone(),
+        });
+        let rows = wait(&svc, 10, |e| match e {
+            Ev::Rpc {
+                tag: t,
+                result: Ok(v),
+                ..
+            } if *t == tag => Some(v["sessions"].as_array().cloned().unwrap_or_default()),
+            _ => None,
+        });
+        let ids: Vec<&str> = rows
+            .iter()
+            .filter(|r| r["title"] != "Bot Chat" && r["root_id"] != root.as_str())
+            .filter_map(|r| r["id"].as_str())
+            .collect();
+        assert_eq!(ids, want, "{profile}");
+        assert!(
+            rows.iter().all(|r| r["last_active"].as_f64().is_some()),
+            "{rows:?}"
+        );
+    }
+    assert_eq!(mock.refusals(), vec![]);
 }
