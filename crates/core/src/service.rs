@@ -17,7 +17,7 @@ use crate::rest::Rest;
 use crate::roster::{self, Bot, BotKey, BOT_CHAT_TITLE, UI_META_KEY};
 use crate::store::Store;
 use crate::transcript::{self, Activity, ChatMessage, Role, ToolState};
-use crate::wire;
+use crate::wire::{self, Mode};
 
 /// Image upload limit (`tui_gateway/prompt_attachments.py`).
 pub const MAX_IMAGE_BYTES: u64 = 25 << 20;
@@ -146,7 +146,6 @@ struct ConnState {
     conn: Connection,
     gw: Gateway,
     rest: Rest,
-    ready: Value,
     roster: Vec<Bot>,
     live: HashMap<String, Live>,
     by_runtime: HashMap<String, BotKey>,
@@ -206,8 +205,14 @@ impl Service {
     }
 }
 
-fn rpc_msg(e: &RpcError) -> String {
-    e.message.clone()
+/// How long a request whose shape depends on the socket mode waits for `gateway.ready`.
+const READY_WAIT: Duration = Duration::from_secs(10);
+/// Default request timeout (as [`Gateway::call`]).
+const RPC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// A failed call as the user should read it (see [`wire::explain`]).
+fn rpc_msg(method: &str, e: &RpcError) -> String {
+    wire::explain(method, e)
 }
 
 impl Svc {
@@ -286,17 +291,19 @@ impl Svc {
             Cmd::Stop(key) => {
                 tokio::spawn(async move {
                     if let Some((gw, sid)) = s.live_of(&key) {
-                        let mut params = json!({"session_id": sid, "profile": key.profile});
-                        if s.session_authority(&key.conn) {
+                        let mode = s.mode(&gw).await;
+                        let mut generation = Value::Null;
+                        if mode.is_authority() {
                             // The authority interrupts one execution generation, never "whatever runs now".
                             let stored = s.st.lock().unwrap().conns.get(&key.conn).and_then(|c| c.live.get(&key.slot()).map(|l| l.stored.clone())).unwrap_or_else(|| sid.clone());
                             match s.fence(&gw, &stored, &key.profile).await {
-                                Ok((_, generation)) => params["execution_generation"] = generation,
+                                Ok((_, g)) => generation = g,
                                 Err(m) => return log::warn!("couldn't stop the turn: {m}"),
                             }
                         }
-                        if let Err(e) = gw.call("session.interrupt", params).await {
-                            log::warn!("session.interrupt failed: {}", e.message);
+                        let params = wire::interrupt_params(mode, &sid, &key.profile, generation);
+                        if let Err(e) = gw.call_compat("session.interrupt", params, RPC_TIMEOUT).await {
+                            log::warn!("session.interrupt failed: {}", rpc_msg("session.interrupt", &e));
                         }
                     }
                 });
@@ -378,13 +385,7 @@ impl Svc {
                 tokio::spawn(async move {
                     let result = match s.gw(&conn) {
                         None => Err("Not connected.".to_owned()),
-                        Some(gw) => gw.call_timeout(&method, params, Duration::from_secs(60)).await.map_err(|e| {
-                            if e.code == METHOD_NOT_FOUND {
-                                format!("This Hermes doesn't offer {method} on this connection.")
-                            } else {
-                                e.message
-                            }
-                        }),
+                        Some(gw) => gw.call_compat(&method, params, RPC_TIMEOUT).await.map_err(|e| rpc_msg(&method, &e)),
                     };
                     if method.starts_with("profiles.") && result.is_ok() {
                         s.clone().refresh_roster(conn.clone()).await;
@@ -437,8 +438,19 @@ impl Svc {
     fn all_bots(&self) -> Vec<Bot> {
         self.st.lock().unwrap().conns.values().flat_map(|c| c.roster.clone()).collect()
     }
-    fn session_authority(&self, conn: &str) -> bool {
-        self.st.lock().unwrap().conns.get(conn).and_then(|c| c.ready.get("session_authority").and_then(Value::as_bool)).unwrap_or(false)
+    /// The mode of the socket that is up now, from its own `gateway.ready`. Waits for it (a
+    /// request sent between the socket opening and `gateway.ready`, or right after a reconnect,
+    /// must not be shaped by a guess or by the previous socket's mode). A server that never sends
+    /// one is treated as a plain gateway, whose shapes are also what pre-authority Hermes takes.
+    async fn mode(&self, gw: &Gateway) -> Mode {
+        let _ = gw.connected(Duration::from_secs(20)).await;
+        match gw.ready(READY_WAIT).await {
+            Some(r) => Mode::of_ready(&r),
+            None => {
+                log::warn!("no gateway.ready within {READY_WAIT:?}; using plain gateway request shapes");
+                Mode::Plain
+            }
+        }
     }
 
     fn connect(&self, conn: Connection) {
@@ -471,7 +483,7 @@ impl Svc {
         let id = conn.id.clone();
         if let Some(old) = self.st.lock().unwrap().conns.insert(
             id.clone(),
-            ConnState { conn, gw, rest, ready: Value::Null, roster: cached, live: HashMap::new(), by_runtime: HashMap::new(), last_roster_json: String::new(), turn_text: HashMap::new(), turn_ids: HashMap::new(), resume: HashSet::new(), inflight: HashMap::new() },
+            ConnState { conn, gw, rest, roster: cached, live: HashMap::new(), by_runtime: HashMap::new(), last_roster_json: String::new(), turn_text: HashMap::new(), turn_ids: HashMap::new(), resume: HashSet::new(), inflight: HashMap::new() },
         ) {
             old.gw.stop();
         }
@@ -502,15 +514,13 @@ impl Svc {
                 }
                 self.emit(Ev::Link { conn: conn.to_owned(), state });
             }
-            Inbound::Ready(payload) => {
+            // The payload itself is read through `Gateway::ready` (see `Svc::mode`).
+            Inbound::Ready(_) => {
                 let reopen: Vec<BotKey> = {
                     let mut st = self.st.lock().unwrap();
                     let focused = st.focused.clone().filter(|k| k.conn == conn);
                     let mut keys: Vec<BotKey> = match st.conns.get_mut(conn) {
-                        Some(c) => {
-                            c.ready = payload;
-                            c.resume.drain().collect()
-                        }
+                        Some(c) => c.resume.drain().collect(),
                         None => vec![],
                     };
                     if let Some(f) = focused {
@@ -740,7 +750,8 @@ impl Svc {
             Ok(r) => r,
             Err(e) => {
                 if e.code == METHOD_NOT_FOUND {
-                    self.emit(Ev::Error { key: None, message: "This Hermes doesn't serve profiles.list (update Hermes for Bot Mode).".into() });
+                    // Genuinely incompatible: Bot Mode's roster is `profiles.list`.
+                    self.emit(Ev::Error { key: None, message: rpc_msg("profiles.list", &e) });
                 }
                 return;
             }
@@ -794,24 +805,24 @@ impl Svc {
             None => self.bot(key).and_then(|b| b.canonical.map(|c| c.live_id().to_owned())).filter(|s| !s.is_empty()),
         };
         if stored.is_none() {
-            let auth = self.session_authority(&key.conn);
-            if let Ok(r) = gw.call("session.list", wire::list_params(auth, p, Some(BOT_CHAT_TITLE), 20)).await {
+            let mode = self.mode(&gw).await;
+            if let Ok(r) = gw.call_compat("session.list", wire::list_params(mode, p, Some(BOT_CHAT_TITLE), 20), RPC_TIMEOUT).await {
                 stored = wire::canonical_from_list(&r);
             }
         }
         let (runtime, stored) = match stored {
             Some(stored) => {
                 let r = gw
-                    .call("session.resume", json!({"session_id": stored, "cols": 96, "source": "desktop", "defer_history": true, "omit_messages": true, "profile": p}))
+                    .call_compat("session.resume", wire::resume_params(&stored, p, true), RPC_TIMEOUT)
                     .await
-                    .map_err(|e| rpc_msg(&e))?;
+                    .map_err(|e| rpc_msg("session.resume", &e))?;
                 let rt = r.get("session_id").and_then(Value::as_str).unwrap_or(&stored).to_owned();
                 let st = r.get("stored_session_id").and_then(Value::as_str).map(str::to_owned).unwrap_or(stored);
                 self.bind_live(key, &rt, &st);
                 self.after_resume(key, &r);
                 (rt, st)
             }
-            None => self.create_canonical(&gw, &key.conn, p).await?,
+            None => self.create_canonical(&gw, p).await?,
         };
         self.bind_live(key, &runtime, &stored);
         Ok((gw, runtime, stored))
@@ -819,21 +830,28 @@ impl Svc {
 
     /// Create a canonical Bot Chat (official createCanonicalChat shape): a hidden session titled
     /// "Bot Chat". Used when a bot is born and when a long break starts a fresh session.
-    async fn create_canonical(&self, gw: &Gateway, conn: &str, p: &str) -> Result<(String, String), String> {
+    async fn create_canonical(&self, gw: &Gateway, p: &str) -> Result<(String, String), String> {
+                let mode = self.mode(gw).await;
                 let r = gw
-                    .call("session.create", wire::create_params(self.session_authority(conn), p, &uuid::Uuid::new_v4().to_string()))
+                    .call_compat("session.create", wire::create_params(mode, p, &uuid::Uuid::new_v4().to_string()), RPC_TIMEOUT)
                     .await
-                    .map_err(|e| rpc_msg(&e))?;
+                    .map_err(|e| rpc_msg("session.create", &e))?;
                 let rt = r.get("session_id").and_then(Value::as_str).ok_or("Hermes didn't return a session.")?.to_owned();
                 let st = r.get("stored_session_id").or_else(|| r.pointer("/info/stored_session_id")).and_then(Value::as_str).unwrap_or(&rt).to_owned();
                 let title = r.pointer("/info/title").and_then(Value::as_str).unwrap_or_default();
                 if title != BOT_CHAT_TITLE {
-                    let t = gw.call("session.title", json!({"session_id": rt, "title": BOT_CHAT_TITLE, "profile": p})).await;
+                    // The shared gateway refuses `session.title` (-32601): rename through `session.mutate`.
+                    let t = if mode.is_authority() {
+                        Err(RpcError { code: METHOD_NOT_FOUND, message: String::new(), data: Value::Null })
+                    } else {
+                        gw.call_compat("session.title", wire::title_params(&rt, p, BOT_CHAT_TITLE), RPC_TIMEOUT).await
+                    };
                     if matches!(&t, Err(e) if e.code == METHOD_NOT_FOUND) {
                         let rev = r.get("revision").cloned().unwrap_or(Value::Null);
-                        let _ = gw
-                            .call("session.mutate", json!({"session_id": rt, "request_id": uuid::Uuid::new_v4().to_string(), "expected_revision": rev, "operation": "rename", "payload": {"title": BOT_CHAT_TITLE}, "profile": p}))
-                            .await;
+                        let params = wire::mutate_params(&rt, p, &uuid::Uuid::new_v4().to_string(), rev, None, "rename", json!({"title": BOT_CHAT_TITLE}));
+                        if let Err(e) = gw.call_compat("session.mutate", params, RPC_TIMEOUT).await {
+                            log::warn!("couldn't title the new Bot Chat: {}", rpc_msg("session.mutate", &e));
+                        }
                     }
                 }
         Ok((rt, st))
@@ -897,7 +915,14 @@ impl Svc {
     /// `session.compress`, falling back to `session.mutate compress` where the shared gateway
     /// refuses the former (docs: gateway method ledger).
     async fn compress(&self, gw: &Gateway, sid: &str, stored: &str, p: &str, focus: Option<&str>) -> Result<(), String> {
-        let r = gw.call_timeout("session.compress", json!({"session_id": sid, "focus_topic": focus, "profile": p}), Duration::from_secs(300)).await;
+        const COMPRESS_TIMEOUT: Duration = Duration::from_secs(300);
+        let r = if self.mode(gw).await.is_authority() {
+            // The shared gateway refuses `session.compress` (-32601, *Which methods the shared
+            // gateway answers*): go straight to the fenced mutation.
+            Err(RpcError { code: METHOD_NOT_FOUND, message: String::new(), data: Value::Null })
+        } else {
+            gw.call_compat("session.compress", wire::compress_params(sid, p, focus), COMPRESS_TIMEOUT).await
+        };
         let r = match r {
             Err(e) if e.code == METHOD_NOT_FOUND || e.code == -32602 => {
                 // The authority's compress is revision- and generation-fenced; read both from a
@@ -907,12 +932,12 @@ impl Svc {
                 if let Some(f) = focus {
                     payload["focus"] = json!(f);
                 }
-                let params = json!({"session_id": sid, "request_id": uuid::Uuid::new_v4().to_string(), "expected_revision": revision, "expected_generation": generation, "operation": "compress", "payload": payload, "profile": p});
-                gw.call_timeout("session.mutate", params, Duration::from_secs(300)).await
+                let params = wire::mutate_params(sid, p, &uuid::Uuid::new_v4().to_string(), revision, Some(generation), "compress", payload);
+                gw.call_compat("session.mutate", params, COMPRESS_TIMEOUT).await.map_err(|e| rpc_msg("session.mutate", &e))
             }
-            other => other,
+            other => other.map_err(|e| rpc_msg("session.compress", &e)),
         };
-        r.map(|_| ()).map_err(|e| e.message)
+        r.map(|_| ())
     }
 
     /// The bot's other conversations for the info panel. `GET /api/sessions?order=recent` sorts
@@ -932,7 +957,8 @@ impl Svc {
             }
         }
         let gw = self.gw(&key.conn).ok_or("Not connected.")?;
-        let r = gw.call("session.list", wire::list_params(self.session_authority(&key.conn), &key.profile, None, 200)).await.map_err(|e| rpc_msg(&e))?;
+        let mode = self.mode(&gw).await;
+        let r = gw.call_compat("session.list", wire::list_params(mode, &key.profile, None, 200), RPC_TIMEOUT).await.map_err(|e| rpc_msg("session.list", &e))?;
         let rows: Vec<Value> = wire::conversations(r.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default()).into_iter().take(LIMIT).collect();
         Ok(json!({"sessions": wire::thread_rows(&rows, false)}))
     }
@@ -942,9 +968,9 @@ impl Svc {
     /// `session.interrupt`.
     async fn fence(&self, gw: &Gateway, stored: &str, p: &str) -> Result<(Value, Value), String> {
         let r = gw
-            .call("session.resume", json!({"session_id": stored, "defer_history": true, "omit_messages": true, "profile": p}))
+            .call_compat("session.resume", wire::resume_params(stored, p, false), RPC_TIMEOUT)
             .await
-            .map_err(|e| rpc_msg(&e))?;
+            .map_err(|e| rpc_msg("session.resume", &e))?;
         Ok((r.get("revision").cloned().unwrap_or(Value::Null), r.get("execution_generation").cloned().unwrap_or(Value::Null)))
     }
 
@@ -994,8 +1020,8 @@ impl Svc {
         // The RPC listing, because it includes hidden sessions (earlier Bot Chats). Its window is
         // over-fetched and filtered here: on a busy server the newest rows are empty cron runs and
         // idle TUI windows (seen on a real 0.22.5 server: all of the 13 newest).
-        let auth = self.session_authority(&key.conn);
-        let Ok(r) = gw.call("session.list", wire::list_params(auth, &key.profile, None, 200)).await else { return msgs };
+        let mode = self.mode(&gw).await;
+        let Ok(r) = gw.call_compat("session.list", wire::list_params(mode, &key.profile, None, 200), RPC_TIMEOUT).await else { return msgs };
         let rows = wire::conversations(r.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default());
         let wanted: Vec<(String, String, String, String)> = rows
             .iter()
@@ -1078,7 +1104,7 @@ impl Svc {
             if let Some(cmd) = text.trim().strip_prefix('/').filter(|c| slash && !c.is_empty() && !c.starts_with('/')) {
                 let command = format!("/{cmd}");
                 let name = command.split_whitespace().next().unwrap_or(&command).to_owned();
-                match gw.call_timeout("slash.exec", json!({"session_id": sid, "command": command, "profile": p}), Duration::from_secs(120)).await {
+                match gw.call_compat("slash.exec", wire::slash_params(&sid, &p, &command), Duration::from_secs(120)).await {
                     Ok(r) if r.get("type").and_then(Value::as_str) == Some("skill") => {
                         let msg = r.get("message").and_then(Value::as_str).unwrap_or_default().to_owned();
                         if msg.is_empty() {
@@ -1098,7 +1124,7 @@ impl Svc {
                         } else if e.message.contains("unsupported_command") {
                             format!("Hermes doesn't run {name} from desktop clients. Try it in the CLI or a messaging app.")
                         } else {
-                            e.message.clone()
+                            rpc_msg("slash.exec", &e)
                         };
                         self.emit(Ev::TurnEnd { key: key.clone(), text: String::new(), error: None });
                         self.emit(Ev::Slash { key, command: name, output: why, error: true });
@@ -1114,7 +1140,7 @@ impl Svc {
                 Err(m) => log::warn!("long-break compaction failed: {m}"),
             },
             Some(GapAction::Fresh) if key.thread.is_none() => {
-                let (rt, st) = self.create_canonical(&gw, &key.conn, &p).await?;
+                let (rt, st) = self.create_canonical(&gw, &p).await?;
                 self.bind_live(&key, &rt, &st);
                 sid = rt;
                 self.emit(Ev::Refreshed { key: key.clone(), action: GapAction::Fresh });
@@ -1126,7 +1152,7 @@ impl Svc {
         let rest = self.rest(&key.conn).ok_or("Not connected.")?;
         // Only the session authority's `prompt.submit` takes `attachments`; a plain gateway
         // socket attaches images to the session with `image.attach_bytes` instead.
-        let authority = self.session_authority(&key.conn);
+        let mode = self.mode(&gw).await;
         for f in files {
             if f.size > MAX_FILE_BYTES {
                 return Err(format!("{} is larger than Hermes accepts (256 MB).", f.name));
@@ -1149,7 +1175,7 @@ impl Svc {
             .map_err(|e| e.to_string())?
             .map_err(|e| format!("Couldn't read {}: {e}", f.name))?;
             if f.mime.starts_with("image/") && f.size <= MAX_IMAGE_BYTES {
-                if authority {
+                if mode.is_authority() {
                     if let Ok(v) = rest.upload_image(&p, &f.name, data_url.clone()).await {
                         if let Some(path) = v.get("path").and_then(Value::as_str) {
                             let mime = v.get("mime_type").and_then(Value::as_str).unwrap_or(&f.mime);
@@ -1158,15 +1184,15 @@ impl Svc {
                         }
                     }
                 }
-                let r = gw.call_timeout("image.attach_bytes", json!({"session_id": sid, "content_base64": b64_of(&data_url), "filename": f.name, "profile": p}), Duration::from_secs(300)).await;
+                let r = gw.call_compat("image.attach_bytes", wire::image_attach_params(&sid, &p, &f.name, b64_of(&data_url)), Duration::from_secs(300)).await;
                 if r.is_ok() {
                     continue;
                 }
             }
             let r = gw
-                .call_timeout("file.attach", json!({"session_id": sid, "name": f.name, "data_url": data_url, "profile": p}), Duration::from_secs(600))
+                .call_compat("file.attach", wire::file_attach_params(&sid, &p, &f.name, &data_url), Duration::from_secs(600))
                 .await
-                .map_err(|e| format!("Couldn't attach {}: {}", f.name, e.message))?;
+                .map_err(|e| format!("Couldn't attach {}: {}", f.name, rpc_msg("file.attach", &e)))?;
             match r.get("ref_text").and_then(Value::as_str) {
                 Some(rt) => text = format!("{text}\n{rt}"),
                 None => return Err(format!("Hermes couldn't attach {}.", f.name)),
@@ -1175,14 +1201,14 @@ impl Svc {
         if let Some(note) = roster::mention_note(&roster::resolve_mentions(&text, &self.all_bots(), &key.conn)) {
             text.push_str(&note);
         }
-        let params = wire::submit_params(authority, &sid, &text, &p, &uuid::Uuid::new_v4().to_string(), attachments);
-        gw.call("prompt.submit", params).await.map_err(|e| rpc_msg(&e))?;
+        let params = wire::submit_params(mode, &sid, &text, &p, &uuid::Uuid::new_v4().to_string(), attachments);
+        gw.call_compat("prompt.submit", params, RPC_TIMEOUT).await.map_err(|e| rpc_msg("prompt.submit", &e))?;
         Ok(())
     }
 
     async fn create_bot(&self, conn: String, name: String, title: String, description: String) {
         let Some(gw) = self.gw(&conn) else { return };
-        let r = gw.call_timeout("profiles.create", json!({"name": name, "description": description}), Duration::from_secs(120)).await;
+        let r = gw.call_compat("profiles.create", wire::profile_create_params(&name, &description), Duration::from_secs(120)).await;
         match r {
             Ok(_) => {
                 if !title.trim().is_empty() {
@@ -1193,7 +1219,7 @@ impl Svc {
                 self.clone().refresh_roster(conn).await;
                 self.emit(Ev::Info { message: format!("Created bot {name}.") });
             }
-            Err(e) => self.emit(Ev::Error { key: None, message: format!("Couldn't create {name}: {}", e.message) }),
+            Err(e) => self.emit(Ev::Error { key: None, message: format!("Couldn't create {name}: {}", rpc_msg("profiles.create", &e)) }),
         }
     }
 
@@ -1204,11 +1230,8 @@ impl Svc {
         for _ in 0..3 {
             let bot = self.bot(key).ok_or("Unknown bot.")?;
             let meta = roster::patch_meta(&bot.meta_raw, &patch);
-            let mut params = json!({"name": key.profile, "ui_meta": {UI_META_KEY: meta}});
-            if let Some(rev) = bot.meta_revision {
-                params["ui_meta_expected_revisions"] = json!({UI_META_KEY: rev});
-            }
-            let r = gw.call("profiles.configure", params).await.map_err(|e| e.message)?;
+            let params = wire::profile_meta_params(&key.profile, UI_META_KEY, meta, bot.meta_revision);
+            let r = gw.call_compat("profiles.configure", params, RPC_TIMEOUT).await.map_err(|e| rpc_msg("profiles.configure", &e))?;
             let conflict = r.pointer("/applied/ui_meta_conflicts").is_some_and(|c| c.as_object().is_some_and(|o| !o.is_empty()));
             self.clone().refresh_roster(key.conn.clone()).await;
             if !conflict {

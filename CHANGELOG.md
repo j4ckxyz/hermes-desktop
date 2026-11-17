@@ -3,6 +3,46 @@
 All notable changes to this project. Format: [Keep a Changelog](https://keepachangelog.com),
 versioning: [SemVer](https://semver.org) (see AGENTS.md).
 
+## [0.7.2] - 2026-11-17
+
+Sending must work against every recent Hermes release, and a refused request must never send
+users off to update a Hermes that is not at fault.
+
+### Fixed
+- Sending failed with "invalid params for prompt.submit: submission_id: Extra inputs are not
+  permitted", and the app passed on Hermes's advice to run `hermes update` and restart both. No
+  Hermes release has ever accepted `submission_id` on a plain gateway socket (the client sent it
+  there up to 0.7.0), so updating Hermes could not help. The remaining ways the app could still
+  send a request in the wrong shape are now closed:
+  - The socket mode (plain gateway or session authority) came from a `gateway.ready` flag that
+    survived reconnects and was unknown in the moment after connecting. A message sent then, or
+    right after Hermes restarted in the other mode, was shaped for the wrong mode and refused.
+    The mode is now cleared whenever a socket drops, and requests that depend on it wait for the
+    new socket's `gateway.ready`.
+  - On the session authority, `prompt.submit` sends the documented `submission_id` (the older
+    `input_id` alias is no longer used). Plain sockets still send neither.
+- Hermes v2026.9.14 and v2026.9.24, the first releases that refuse unknown keys, have no
+  `idempotency_key` on `session.create`, so opening a new Bot Chat failed there. When a release
+  refuses a key the request can do without, the app now sends the request again without it and
+  leaves the key out for the rest of that connection. Keys a request needs (`profile`,
+  `submission_id`, `attachments`, revision and generation fences) are never dropped.
+- Error messages: a refused request is now reported as a Hermes Desktop bug ("updating Hermes
+  won't fix it", with where to report it), never as version skew. Only a Hermes that does not
+  serve a method the chat needs (`profiles.list`, `session.create`, `session.resume`,
+  `session.list`, `prompt.submit`) is called too old, and the message names the release it needs.
+- On the shared gateway the app no longer tries `session.title` and `session.compress`, which it
+  always refuses (-32601), before falling back to `session.mutate`.
+
+### Changed
+- Every gateway request is built in `crates/core/src/wire.rs`. A test pins each one against the
+  param contracts of hermes-agent v2026.9.14, v0.21.6, v0.22.0, v0.22.1, v0.22.5 and v0.23.2 in
+  both socket modes. Supported: Hermes v2026.9.14 through v0.23.2 (and the 2026-11-17 canary).
+  Earlier releases don't validate params and may work, but they were not checked.
+- The mock enforces the v0.23.2 contracts. Authority refusals now carry `data.fields`, and its
+  session verbs treat `profile` as implicit. New switches play v2026.9.x contracts, a late
+  `gateway.ready`, a restart into the other socket mode, a refused key and a missing method. Each
+  bug above has a regression test that fails without its fix.
+
 ## [0.7.1] - 2026-11-17
 
 Protocol fixes found running 0.7.0 against a real Hermes 0.22.5 server.

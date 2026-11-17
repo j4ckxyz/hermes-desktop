@@ -98,6 +98,7 @@ fn live_server() {
     // Socket mode, from a read-only probe: only the authority's session.list knows `scope`.
     let probe = rpc(&svc, conn, "session.list", json!({"profile": main.name, "limit": 1, "scope": "stored"}));
     let authority = probe.is_ok();
+    let mode = if authority { wire::Mode::Authority } else { wire::Mode::Plain };
     println!("3. socket mode: {} ({})", if authority { "session authority" } else { "plain gateway" }, probe.err().unwrap_or_else(|| "scope accepted".into()));
 
     // Bug 2: the canonical chat's registry row versus its live tip.
@@ -112,13 +113,13 @@ fn live_server() {
         ),
         None => println!("4. no canonical Bot Chat on `{}`", main.name),
     }
-    if let Ok(r) = rpc(&svc, conn, "session.list", wire::list_params(authority, &main.name, Some("Bot Chat"), 20)) {
+    if let Ok(r) = rpc(&svc, conn, "session.list", wire::list_params(mode, &main.name, Some("Bot Chat"), 20)) {
         let row = r["sessions"].get(0).cloned().unwrap_or(Value::Null);
         println!("   title lookup: id {} resolved_id {} started {}", short(row["id"].as_str().unwrap_or("-")), short(row["resolved_id"].as_str().unwrap_or("-")), age(row["started_at"].as_f64()));
     }
 
     // What the stream merges: the RPC listing's rows (ids, sources and counts only).
-    if let Ok(r) = rpc(&svc, conn, "session.list", wire::list_params(authority, &main.name, None, 13)) {
+    if let Ok(r) = rpc(&svc, conn, "session.list", wire::list_params(mode, &main.name, None, 13)) {
         for row in r["sessions"].as_array().cloned().unwrap_or_default() {
             println!(
                 "   listed {} source {} titled {} msgs {} started {} resolved {}",
@@ -181,7 +182,7 @@ fn live_server() {
             k
         }
         None => {
-            let mut params = wire::create_params(authority, &main.name, &format!("hd-live-{}", uuid_like()));
+            let mut params = wire::create_params(mode, &main.name, &format!("hd-live-{}", uuid_like()));
             params["title"] = json!(TITLE);
             params["hidden"] = json!(false);
             let created = rpc(&svc, conn, "session.create", params).expect("session.create");
@@ -193,7 +194,7 @@ fn live_server() {
     let key = BotKey::new(conn, &main.name).with_thread(Some(stored));
     svc.send(Cmd::OpenBot(key.clone()));
     wait(&svc, 120, "test session history", |e| matches!(e, Ev::History { key: k, cached: false, .. } if *k == key).then_some(()));
-    svc.send(Cmd::Send { key: key.clone(), text: "Protocol test from Hermes Desktop 0.7.1. Please reply with just: OK".into(), files: vec![], refresh: None, slash: false });
+    svc.send(Cmd::Send { key: key.clone(), text: "Protocol test from Hermes Desktop 0.7.2. Please reply with just: OK".into(), files: vec![], refresh: None, slash: false });
     let (text, error) = wait(&svc, 300, "reply", |e| match e {
         Ev::TurnEnd { key: k, text, error } if *k == key => Some((text.clone(), error.clone())),
         _ => None,

@@ -101,20 +101,53 @@ secrets to an admin, but using it to fish out keys would be off-label, so the ap
 ## Two socket modes
 A gateway WebSocket is either a **plain gateway** socket (the dashboard's `server.dispatch`;
 contracts in `tui_gateway/contracts/*.py`) or a **session authority** socket (`gateway.ready`
-carries `session_authority: true`; contracts in `tui_gateway/contracts/canonical*.py`). Both
-refuse any key a method's contract does not declare: the plain socket with `4000 invalid params
-for <method>: <key>: Extra inputs are not permitted …`, the authority with `4001 invalid_params`
-(which also covers missing required keys). The shapes that differ are built in
-`crates/core/src/wire.rs`, checked against hermes-agent v0.22.5, and the mock enforces both
-contract sets so a stray key fails the tests.
+carries `session_authority: true`; contracts in `tui_gateway/contracts/canonical*.py`). Since
+Hermes v2026.9.14 both refuse any key a method's contract does not declare:
+* plain: ``4000 invalid params for <method>: <key>: Extra inputs are not permitted — the client and
+  the Hermes backend are out of sync (different versions); run `hermes update` and restart both``
+  (`registry.validate_params`; it names the first unknown key only);
+* authority: `4001 invalid_params` with `data.fields` listing every unknown or missing key
+  (`session_controls.dispatch`, `registry.canonical_param_problems`). Its own session verbs
+  (`_PROFILE_IMPLICIT`) strip `profile` before checking.
+
+Every request is built in `crates/core/src/wire.rs`. Its `contracts` test pins each request
+against the contracts of hermes-agent v2026.9.14, v0.21.6, v0.22.0, v0.22.1, v0.22.5 and v0.23.2
+(plus the 2026-11-17 canary for `prompt.submit`). The mock enforces the v0.23.2 contracts for both
+modes, and can play v2026.9.x (`Mock::as_release_2026_9`), so a stray key fails the tests.
 
 | Call | Plain gateway | Session authority |
 |---|---|---|
 | `session.create` retry key | `idempotency_key` | `request_id` |
-| `prompt.submit` | `{session_id, text, profile}`; images staged first with `image.attach_bytes` | adds `input_id` and `attachments:[{path, mime}]` (images from `/api/chat/image-upload`) |
+| `prompt.submit` | `{session_id, text, profile}`; images staged first with `image.attach_bytes` | adds `submission_id` and `attachments:[{path, mime}]` (images from `/api/chat/image-upload`) |
 | `session.list` | stored sessions | `scope:"stored"` (the default scope is live sessions only) |
 | `session.interrupt` | `{session_id}` | adds `execution_generation` from a fresh `session.resume` |
-| Rename, compact | `session.title`, `session.compress` | `session.mutate {request_id, expected_revision, operation, payload}` (compress also `expected_generation`) |
+| Rename, compact | `session.title`, `session.compress` | `session.mutate {request_id, expected_revision, operation, payload}` (compress also `expected_generation`); the shared gateway answers -32601 to the plain methods |
+
+**`prompt.submit` across releases.** No plain `PromptSubmitParams` has ever declared
+`submission_id`, `input_id` or `attachments`; 0.7.0 sent `submission_id` there, which is what
+Hermes refused with "Extra inputs are not permitted". The authority (v0.22.1, v0.22.3 and later;
+v0.22.2 shipped without it) requires one of `submission_id` / `input_id`
+(`AuthorityConnection.submission`). The docs name `submission_id` (*Gateway local sessions*:
+`prompt.submit({session_id, submission_id, text})`), so that is what the app sends.
+
+**Mode detection.** The mode is the current socket's own `gateway.ready`. `Gateway` forgets it
+when a socket drops, and every request whose shape depends on it waits (up to 10 s) for the new
+socket's `gateway.ready` instead of reusing the old socket's mode or guessing. A server that never
+sends one gets the plain shapes, which Hermes releases from before strict validation also accept.
+
+**Degrading instead of failing.** `Gateway::call_compat` reads either refusal. If every refused
+key is one the request can do without (`wire::droppable`: e.g. `idempotency_key`, which
+v2026.9.14–v2026.9.24 lack, `hidden`, `source`, resume's `cols`), it sends the request again
+without them and leaves them out for the rest of that connection. Contract checks run before any
+handler, so the retry is safe. `profile`, `submission_id`, `attachments` and every fence are never
+dropped.
+
+**One error path.** `wire::explain` writes every failed request's message. A refusal of a key the
+request needs is a Hermes Desktop bug: the message says so and that updating Hermes won't fix it,
+and never passes on Hermes's "run `hermes update`" advice. Only a Hermes that does not serve a core
+method (`profiles.list`, `session.create`, `session.resume`, `session.list`, `prompt.submit`) is
+called incompatible, with the release it needs (v2026.9.14 or newer). `client.capabilities` has no
+contract in v2026.9.x, so it is not validated there.
 
 `toolsets.list` takes only `{session_id}` in both modes (it reads that session's profile).
 

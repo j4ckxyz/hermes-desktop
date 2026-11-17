@@ -81,6 +81,14 @@ struct Inner {
     refusals: Vec<(String, String)>,
     /// Methods answered without a contract refusal, in order.
     handled: Vec<String>,
+    /// Plain contracts of the first strict releases (v2026.9.14 / v2026.9.24).
+    legacy: bool,
+    /// Extra `(method, key)` refusals (a release that dropped a key).
+    forbidden: Vec<(String, String)>,
+    /// Methods this release does not serve (-32601).
+    unserved: Vec<String>,
+    /// Delay before `gateway.ready` (ms); requests are served meanwhile, as on a real socket.
+    ready_delay_ms: u64,
 }
 
 impl Inner {
@@ -115,10 +123,29 @@ impl Inner {
     }
 }
 
-/// Keys each method's params may carry, from hermes-agent v0.22.5 `tui_gateway/contracts`
-/// (plain dispatcher: `METHODS`; authority: `CANONICAL_METHODS`, where `profile` is implicit).
-/// Both refuse unknown keys before any handler runs (`registry.validate_params`,
-/// `canonical_param_problems`); the authority also refuses missing required keys.
+/// `_PROFILE_IMPLICIT` (`gateway/session_controls.py`): the authority's session verbs whose
+/// `profile` key it strips (own profile) or routes on (a sibling) before validating params.
+const PROFILE_IMPLICIT: &[&str] = &[
+    "session.create",
+    "session.list",
+    "session.info",
+    "session.resume",
+    "session.detach",
+    "prompt.submit",
+    "prompt.receipt",
+    "prompt.cancel",
+    "session.interrupt",
+    "session.events.since",
+    "session.mutate",
+    "session.stats",
+    "approval.respond",
+];
+
+/// Keys each method's params may carry, from hermes-agent v0.23.2 `tui_gateway/contracts`
+/// (plain dispatcher: `METHODS`; authority: `CANONICAL_METHODS`, checked after `profile` is
+/// stripped, see [`PROFILE_IMPLICIT`]). Both refuse unknown keys before any handler runs
+/// (`registry.validate_params`, `canonical_param_problems`); the authority also refuses missing
+/// required keys. Returns `(keys, required, canonical)`.
 fn contract(
     method: &str,
     authority: bool,
@@ -127,7 +154,6 @@ fn contract(
     let canonical: Option<(&[&str], &[&str])> = match method {
         "session.create" => Some((
             &[
-                "profile",
                 "request_id",
                 "source",
                 "cwd",
@@ -156,12 +182,12 @@ fn contract(
                 "run_budget",
                 "verbose",
                 "client_env",
+                "client",
             ],
             NONE,
         )),
         "session.resume" => Some((
             &[
-                "profile",
                 "session_id",
                 "title",
                 "latest",
@@ -177,16 +203,17 @@ fn contract(
             NONE,
         )),
         "session.list" => Some((
-            &["profile", "scope", "limit", "title", "include_hidden"],
+            &["scope", "limit", "title", "include_hidden", "workspace", "picker", "query", "cursor"],
             NONE,
         )),
         "session.interrupt" => Some((
-            &["profile", "session_id", "execution_generation"],
+            &["session_id", "execution_generation"],
             &["session_id", "execution_generation"],
         )),
+        // `submission_id` / `input_id` are both optional here; the handler requires one of them
+        // (`AuthorityConnection.submission`), see `dispatch`.
         "prompt.submit" => Some((
             &[
-                "profile",
                 "session_id",
                 "text",
                 "submission_id",
@@ -210,7 +237,6 @@ fn contract(
         )),
         "session.mutate" => Some((
             &[
-                "profile",
                 "session_id",
                 "request_id",
                 "expected_revision",
@@ -255,6 +281,7 @@ fn contract(
             "clone_from",
             "clone_all",
             "clone_channels",
+            "clone_config",
             "no_skills",
             "no_alias",
             "soul",
@@ -262,6 +289,8 @@ fn contract(
             "provider",
             "share_auth",
             "mirror_credentials",
+            "report",
+            "sync_imports",
         ],
         "profiles.describe" => &["profile", "name"],
         "session.list" => &["profile", "title", "limit", "include_hidden"],
@@ -309,7 +338,7 @@ fn contract(
             "filename",
             "ext",
         ],
-        "file.attach" => &["session_id", "profile", "path", "data_url", "name"],
+        "file.attach" => &["session_id", "profile", "path", "data_url", "name", "staged_upload"],
         "prompt.submit" => &[
             "session_id",
             "profile",
@@ -351,24 +380,51 @@ fn contract(
     Some((keys, NONE, false))
 }
 
-/// The gateway's refusal for params outside the method's contract, worded as Hermes words it.
-fn check_params(method: &str, p: &Value, authority: bool) -> Result<(), (i64, String)> {
+/// Plain-gateway keys that the first strict releases (v2026.9.14, v2026.9.24) did not declare
+/// yet, for [`Mock::as_release_2026_9`].
+fn absent_in_2026_9(method: &str) -> &'static [&'static str] {
+    match method {
+        "session.create" => &["cwd_explicit", "idempotency_key", "service_tier"],
+        "session.resume" => &["inline_images"],
+        "prompt.submit" => &["confirm_deep_truncate", "title_preview", "voice_turn"],
+        _ => &[],
+    }
+}
+
+/// A contract refusal, as Hermes words it: `(code, message, data)`.
+type Refusal = (i64, String, Value);
+
+/// The gateway's refusal for params outside the method's contract. `legacy`: the plain
+/// contracts of v2026.9.x; `forbidden`: extra `(method, key)` pairs a test wants refused.
+fn check_params(method: &str, p: &Value, authority: bool, legacy: bool, forbidden: &[(String, String)]) -> Result<(), Refusal> {
+    if legacy && method == "client.capabilities" {
+        return Ok(()); // no contract yet in v2026.9.x: not validated
+    }
     let Some((allowed, required, canonical)) = contract(method, authority) else {
         return Ok(());
     };
-    let obj = p.as_object().cloned().unwrap_or_default();
-    if let Some(k) = obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-        return Err(if canonical {
-            (4001, format!("invalid_params: {k}"))
-        } else {
-            (4000, format!("invalid params for {method}: {k}: Extra inputs are not permitted — the client and the Hermes backend are out of sync (different versions); run `hermes update` and restart both"))
-        });
+    let mut obj = p.as_object().cloned().unwrap_or_default();
+    if canonical && PROFILE_IMPLICIT.contains(&method) {
+        obj.remove("profile");
     }
-    if let Some(k) = required
-        .iter()
-        .find(|k| obj.get(**k).is_none_or(Value::is_null))
-    {
-        return Err((4001, format!("invalid_params: {k}")));
+    let accepts = |k: &str| {
+        allowed.contains(&k)
+            && !(legacy && !authority && absent_in_2026_9(method).contains(&k))
+            && !forbidden.iter().any(|(m, f)| m == method && f == k)
+    };
+    let extra: Vec<String> = obj.keys().filter(|k| !accepts(k)).cloned().collect();
+    if canonical {
+        // `canonical_param_problems`: every unknown and missing key, in `data.fields`.
+        let missing = required.iter().filter(|k| obj.get(**k).is_none_or(Value::is_null)).map(|k| k.to_string());
+        let fields: Vec<String> = extra.into_iter().chain(missing).collect();
+        if !fields.is_empty() {
+            return Err((4001, "invalid_params".into(), json!({"reason": "invalid_params", "fields": fields})));
+        }
+        return Ok(());
+    }
+    // `validate_params`: the first unknown key, with Hermes's own (version-skew) advice.
+    if let Some(k) = extra.first() {
+        return Err((4000, format!("invalid params for {method}: {k}: Extra inputs are not permitted — the client and the Hermes backend are out of sync (different versions); run `hermes update` and restart both"), Value::Null));
     }
     Ok(())
 }
@@ -515,6 +571,10 @@ impl Mock {
             staged: HashMap::new(),
             refusals: Vec::new(),
             handled: Vec::new(),
+            legacy: false,
+            forbidden: Vec::new(),
+            unserved: Vec::new(),
+            ready_delay_ms: 0,
         })))
     }
 
@@ -560,6 +620,34 @@ impl Mock {
     pub fn as_session_authority(self) -> Mock {
         self.0.lock().unwrap().authority = true;
         self
+    }
+
+    /// Serve sockets opened from now on in the other mode (a server restarted with or without
+    /// the session authority; existing sockets keep theirs until dropped).
+    pub fn set_session_authority(&self, on: bool) {
+        self.0.lock().unwrap().authority = on;
+    }
+
+    /// Enforce the plain contracts of Hermes v2026.9.14 / v2026.9.24, the first strict releases
+    /// (no `idempotency_key` on `session.create`, no `server_requests` capability, ...).
+    pub fn as_release_2026_9(self) -> Mock {
+        self.0.lock().unwrap().legacy = true;
+        self
+    }
+
+    /// Refuse `key` on `method` as outside its contract (a release without that key).
+    pub fn forbid(&self, method: &str, key: &str) {
+        self.0.lock().unwrap().forbidden.push((method.to_owned(), key.to_owned()));
+    }
+
+    /// Answer `method` with -32601 (a release that does not serve it).
+    pub fn unserve(&self, method: &str) {
+        self.0.lock().unwrap().unserved.push(method.to_owned());
+    }
+
+    /// Send `gateway.ready` only `ms` after a socket opens.
+    pub fn set_ready_delay(&self, ms: u64) {
+        self.0.lock().unwrap().ready_delay_ms = ms;
     }
 
     /// Turn a profile's Bot Chat into a compressed lineage, as a long-lived chat on a real
@@ -1069,10 +1157,24 @@ async fn socket(m: Mock, s: WebSocket) {
         }
     });
     let mut ready = json!({"heartbeat": true, "change_events": true, "replay_epoch": "mock"});
-    if m.0.lock().unwrap().authority {
+    // The mode is fixed per socket (`_authority_connection` at accept).
+    let (authority, ready_delay) = {
+        let i = m.0.lock().unwrap();
+        (i.authority, i.ready_delay_ms)
+    };
+    if authority {
         ready["session_authority"] = json!(true);
     }
-    let _ = tx.send(event("gateway.ready", "", ready));
+    let ready_frame = event("gateway.ready", "", ready);
+    if ready_delay == 0 {
+        let _ = tx.send(ready_frame);
+    } else {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ready_delay)).await;
+            let _ = tx.send(ready_frame);
+        });
+    }
     let mut kill = m.0.lock().unwrap().kill.as_ref().map(|k| k.subscribe());
     loop {
         let next = match &mut kill {
@@ -1101,9 +1203,12 @@ async fn socket(m: Mock, s: WebSocket) {
         let id = f["id"].clone();
         let method = f["method"].as_str().unwrap_or_default().to_owned();
         let p = f.get("params").cloned().unwrap_or(json!({}));
-        let reply = match dispatch(&m, &method, &p, &tx) {
-            Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
-            Err((code, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}),
+        let reply = match checked(&m, &method, &p, authority) {
+            Err((code, msg, data)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg, "data": data}}),
+            Ok(()) => match dispatch(&m, &method, &p, &tx, authority) {
+                Ok(r) => json!({"jsonrpc": "2.0", "id": id, "result": r}),
+                Err((code, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}),
+            },
         };
         let _ = tx.send(reply.to_string());
     }
@@ -1152,16 +1257,30 @@ fn summary(id: &str, s: &Session) -> Value {
     json!({"id": id, "title": s.title, "preview": preview, "started_at": s.messages.first().map(|m| m["timestamp"].clone()), "last_active": s.last_active, "message_count": s.messages.len()})
 }
 
-fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String>) -> Result<Value, (i64, String)> {
+/// The checks a request meets before any handler: the release serves the method, and the
+/// params fit its contract. Refusals are recorded for the tests.
+fn checked(m: &Mock, method: &str, p: &Value, authority: bool) -> Result<(), Refusal> {
     let mut i = m.0.lock().unwrap();
-    if let Err(e) = check_params(method, p, i.authority) {
-        i.refusals.push((method.to_owned(), e.1.clone()));
+    if i.unserved.iter().any(|u| u == method) {
+        return Err((-32601, format!("unknown method: {method}"), json!({"reason": "unknown_method"})));
+    }
+    if let Err(e) = check_params(method, p, authority, i.legacy, &i.forbidden) {
+        let detail = match e.2.get("fields") {
+            Some(f) => format!("{}: {f}", e.1),
+            None => e.1.clone(),
+        };
+        i.refusals.push((method.to_owned(), detail));
         return Err(e);
     }
+    Ok(())
+}
+
+fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String>, authority: bool) -> Result<Value, (i64, String)> {
+    let mut i = m.0.lock().unwrap();
     i.handled.push(method.to_owned());
     // The authority serves session verbs itself; methods only the plain dispatcher had are
     // unknown there (`ws_legacy_fallback`: the session namespace never falls back).
-    if i.authority && matches!(method, "session.title" | "session.compress") {
+    if authority && matches!(method, "session.title" | "session.compress") {
         return Err((-32601, format!("unknown method: {method}")));
     }
     let profile = p["profile"].as_str().unwrap_or("default").to_owned();
@@ -1258,7 +1377,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                 r["resolved_id"] = json!(tip);
                 return Ok(json!({"sessions": [r]}));
             }
-            let live_only = i.authority && p["scope"].as_str().unwrap_or("live") == "live";
+            let live_only = authority && p["scope"].as_str().unwrap_or("live") == "live";
             let limit = p["limit"].as_u64().unwrap_or(200) as usize;
             let mut tips: Vec<(String, f64)> = i
                 .sessions
@@ -1291,7 +1410,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
         }
         "session.create" => {
             let retry = p
-                .get(if i.authority {
+                .get(if authority {
                     "request_id"
                 } else {
                     "idempotency_key"
@@ -1305,7 +1424,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                 );
             }
             let stored = format!("s-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-            let rt = if i.authority {
+            let rt = if authority {
                 stored.clone()
             } else {
                 format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8])
@@ -1331,7 +1450,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
                 json!({"session_id": rt, "stored_session_id": stored, "info": {"title": "", "model": "mock-model"}, "revision": 1, "execution_generation": 1}),
             )
         }
-        "session.mutate" if i.authority => {
+        "session.mutate" if authority => {
             let rt = p["session_id"].as_str().unwrap_or_default();
             let stored = i
                 .runtime
@@ -1379,7 +1498,7 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             if !i.sessions.contains_key(&stored) {
                 return Err((4004, "session not found".into()));
             }
-            let rt = if i.authority {
+            let rt = if authority {
                 stored.clone()
             } else {
                 format!("rt-{}", &uuid::Uuid::new_v4().to_string()[..8])
@@ -1519,6 +1638,13 @@ fn dispatch(m: &Mock, method: &str, p: &Value, tx: &mpsc::UnboundedSender<String
             Ok(json!({"attached": true, "path": path, "ref_text": format!("@file:{path}")}))
         }
         "prompt.submit" => {
+            // The authority's admission is keyed by the client's id (`submission_id`, or the
+            // older `input_id`): `AuthorityConnection.submission` refuses a submit without one.
+            let has_id = |k: &str| p[k].as_str().is_some_and(|s| !s.is_empty());
+            if authority && !has_id("submission_id") && !has_id("input_id") {
+                i.refusals.push((method.to_owned(), "invalid_params: no submission_id".into()));
+                return Err((4001, "invalid_params".into()));
+            }
             let rt = p["session_id"].as_str().unwrap_or_default().to_owned();
             let stored = i.runtime.get(&rt).cloned().ok_or((4004, "unknown session".to_owned()))?;
             let text = p["text"].as_str().unwrap_or_default().to_owned();

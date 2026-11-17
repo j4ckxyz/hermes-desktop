@@ -658,3 +658,125 @@ fn empty_sessions_do_not_crowd_out_real_conversations() {
     assert_eq!(ids, ["s-coder-old", "s-coder-tg"]);
     assert_eq!(mock.refusals(), vec![]);
 }
+
+// ---- protocol compatibility (0.7.2) ------------------------------------------------------------
+
+fn mock_with(m: hermes_mock::Mock) -> (tokio::runtime::Runtime, hermes_mock::Mock, String) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    m.set_pace(1);
+    let addr = rt.block_on(m.clone().spawn("127.0.0.1:0"));
+    (rt, m, format!("http://{addr}"))
+}
+
+fn send_text(svc: &Service, key: &BotKey, text: &str) -> Option<String> {
+    svc.send(Cmd::Send { key: key.clone(), text: text.into(), files: vec![], refresh: None, slash: false });
+    wait(svc, 15, |e| match e {
+        Ev::TurnEnd { key: k, error, .. } if k == key => Some(error.clone()),
+        _ => None,
+    })
+}
+
+fn user_texts(mock: &hermes_mock::Mock, profile: &str) -> Vec<String> {
+    mock.messages_of(profile).into_iter().filter(|m| m["role"] == "user").filter_map(|m| m["content"].as_str().map(str::to_owned)).collect()
+}
+
+/// The reported failure, "invalid params for prompt.submit: submission_id: Extra inputs are not
+/// permitted" with Hermes's "run `hermes update`" advice. The mock reproduces Hermes's exact
+/// refusal; the app must turn it into a Hermes Desktop bug report, never update advice.
+#[test]
+fn a_refused_request_is_reported_as_a_client_bug_not_version_skew() {
+    let (_rt, mock, url) = mock_rt();
+    let svc = start(&url, "m5", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let err = rpc(&svc, "prompt.submit", serde_json::json!({"session_id": "x", "text": "hi", "submission_id": "abc"})).unwrap_err();
+    assert!(err.contains("submission_id") && err.contains("Hermes Desktop"), "{err}");
+    assert!(!err.contains("hermes update") && !err.contains("out of sync"), "{err}");
+    let refused = mock.refusals();
+    assert_eq!(refused.len(), 1);
+    assert!(refused[0].1.starts_with("invalid params for prompt.submit: submission_id: Extra inputs are not permitted"));
+}
+
+/// A send that races the socket's `gateway.ready` (the app was used straight after connecting)
+/// used to be shaped as a plain gateway's (no mode known yet) and refused by a session
+/// authority. Mode-dependent requests now wait for `gateway.ready`.
+#[test]
+fn requests_wait_for_gateway_ready_before_choosing_a_shape() {
+    let (_rt, mock, url) = mock_with(hermes_mock::Mock::new("tok-123").as_session_authority());
+    mock.set_ready_delay(600);
+    let svc = start(&url, "r1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Link { state: hermes_core::gateway::LinkState::Connected, .. }).then_some(()));
+    let key = BotKey::new("r1", "scribe");
+    assert_eq!(send_text(&svc, &key, "before ready"), None);
+    assert_eq!(user_texts(&mock, "scribe"), ["before ready"]);
+    assert_eq!(mock.bot_chats("scribe"), 1);
+    assert_eq!(mock.refusals(), vec![]);
+}
+
+/// After a reconnect to a server that came back in the other mode (restarted with the session
+/// authority on), the first send must use the new socket's shapes, not the old socket's.
+#[test]
+fn a_reconnect_into_the_other_mode_uses_the_new_shapes() {
+    let (_rt, mock, url) = mock_rt();
+    let svc = start(&url, "r2", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let key = BotKey::new("r2", "scribe");
+    svc.send(Cmd::OpenBot(key.clone()));
+    first_history(&svc, &key);
+    assert_eq!(send_text(&svc, &key, "on the plain socket"), None);
+    mock.set_session_authority(true);
+    mock.set_ready_delay(600);
+    mock.drop_sockets();
+    wait(&svc, 10, |e| matches!(e, Ev::Link { state: hermes_core::gateway::LinkState::Reconnecting { .. }, .. }).then_some(()));
+    assert_eq!(send_text(&svc, &key, "on the authority"), None);
+    assert_eq!(user_texts(&mock, "scribe"), ["on the plain socket", "on the authority"]);
+    assert_eq!(mock.refusals(), vec![]);
+}
+
+/// Hermes v2026.9.14 / v2026.9.24, the first releases that refuse unknown keys, have no
+/// `idempotency_key` on `session.create`. The app drops that optional key instead of failing,
+/// once per connection: the second create leaves it out up front.
+#[test]
+fn an_older_strict_release_gets_requests_without_keys_it_lacks() {
+    let (_rt, mock, url) = mock_with(hermes_mock::Mock::new("tok-123").as_release_2026_9());
+    let svc = start(&url, "o1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    for profile in ["scribe", "coder"] {
+        let key = BotKey::new("o1", profile);
+        assert_eq!(send_text(&svc, &key, "hello"), None, "{profile}");
+        assert_eq!(mock.bot_chats(profile), 1, "{profile}");
+        assert_eq!(user_texts(&mock, profile), ["hello"]);
+    }
+    let refused = mock.refusals();
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].0, "session.create");
+    assert!(refused[0].1.contains("idempotency_key"));
+}
+
+/// A key the request needs is never dropped: if a release refused one, the send fails with the
+/// one clear message (a Hermes Desktop bug), and is not retried in a broken shape.
+#[test]
+fn a_required_key_is_never_dropped() {
+    let (_rt, mock, url) = mock_rt();
+    mock.forbid("prompt.submit", "profile");
+    let svc = start(&url, "q1", "tok-123");
+    wait(&svc, 10, |e| matches!(e, Ev::Roster { .. }).then_some(()));
+    let err = send_text(&svc, &BotKey::new("q1", "scribe"), "hello").expect("the send fails");
+    assert!(err.contains("prompt.submit") && err.contains("(profile)") && err.contains("Hermes Desktop"), "{err}");
+    assert!(!err.contains("hermes update"), "{err}");
+    assert!(user_texts(&mock, "scribe").is_empty());
+    assert_eq!(mock.refusals().iter().filter(|r| r.0 == "prompt.submit").count(), 1);
+}
+
+/// A Hermes without a method the chat needs is the one genuinely incompatible case, and the only
+/// one where the app names a Hermes release to run.
+#[test]
+fn a_hermes_without_bot_mode_is_told_which_release_it_needs() {
+    let (_rt, mock, url) = mock_rt();
+    mock.unserve("profiles.list");
+    let svc = start(&url, "u1", "tok-123");
+    let msg = wait(&svc, 10, |e| match e {
+        Ev::Error { message, .. } => Some(message.clone()),
+        _ => None,
+    });
+    assert!(msg.contains("too old") && msg.contains(hermes_core::wire::MIN_HERMES), "{msg}");
+}

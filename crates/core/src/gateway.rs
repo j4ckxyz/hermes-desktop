@@ -19,6 +19,8 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, Message};
 
+use crate::wire;
+
 pub const METHOD_NOT_FOUND: i64 = -32601;
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(15);
 const HEARTBEAT_DEADLINE: Duration = Duration::from_secs(45);
@@ -86,6 +88,12 @@ struct Shared {
     link: watch::Sender<LinkState>,
     stop: watch::Sender<bool>,
     inbound: async_channel::Sender<Inbound>,
+    /// This socket's `gateway.ready` payload: `None` until it arrives, and again from the moment
+    /// the socket drops, so a reconnect to a server in another mode never reuses a stale one.
+    ready: watch::Sender<Option<Value>>,
+    /// Keys this connection's server refused, per method ([`Gateway::call_compat`]): left out of
+    /// later requests up front. Cleared on every connect (the server may have been updated).
+    refused: Mutex<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -104,6 +112,8 @@ impl Gateway {
             link: watch::channel(LinkState::Connecting).0,
             stop: watch::channel(false).0,
             inbound,
+            ready: watch::channel(None).0,
+            refused: Mutex::new(HashMap::new()),
         });
         tokio::spawn(run(s.clone()));
         Gateway { s }
@@ -132,6 +142,56 @@ impl Gateway {
             }
         };
         tokio::time::timeout(within, fut).await.map_err(|_| anyhow!("Couldn't reach Hermes yet. Still trying…"))?
+    }
+
+    /// The `gateway.ready` payload of the socket that is up now, if it has arrived.
+    pub fn ready_now(&self) -> Option<Value> {
+        self.s.ready.borrow().clone()
+    }
+
+    /// Wait (up to `within`) for the current socket's `gateway.ready`. The socket mode it
+    /// announces decides request shapes, so mode-dependent requests wait for it rather than
+    /// guess. `None` if it doesn't arrive in time.
+    pub async fn ready(&self, within: Duration) -> Option<Value> {
+        let mut rx = self.s.ready.subscribe();
+        let fut = async {
+            loop {
+                if let Some(v) = rx.borrow_and_update().clone() {
+                    return Some(v);
+                }
+                rx.changed().await.ok()?;
+            }
+        };
+        tokio::time::timeout(within, fut).await.ok().flatten()
+    }
+
+    /// [`Self::call_timeout`], degrading instead of failing when this Hermes release refuses an
+    /// optional key. A key the server refused ([`wire::refused_keys`]) that the request can do
+    /// without ([`wire::droppable`]) is removed and the request sent again; the server is
+    /// remembered so later requests leave it out up front. Contract refusals happen before any
+    /// handler runs (`validate_params`, `canonical_param_problems`), so the retry is safe.
+    /// Anything else (a required key, or no key named) is returned as is.
+    pub async fn call_compat(&self, method: &str, mut params: Value, timeout: Duration) -> std::result::Result<Value, RpcError> {
+        let optional = wire::droppable(method);
+        if let (Some(obj), Some(known)) = (params.as_object_mut(), self.s.refused.lock().unwrap().get(method)) {
+            obj.retain(|k, _| !known.contains(k));
+        }
+        loop {
+            let e = match self.call_timeout(method, params.clone(), timeout).await {
+                Err(e) => e,
+                ok => return ok,
+            };
+            let Some(obj) = params.as_object_mut() else { return Err(e) };
+            let sent: Vec<String> = wire::refused_keys(method, &e).into_iter().filter(|k| obj.contains_key(k)).collect();
+            if sent.is_empty() || !sent.iter().all(|k| optional.contains(&k.as_str())) {
+                return Err(e);
+            }
+            log::warn!("Hermes refused {method} keys {sent:?}; sending without them");
+            for k in &sent {
+                obj.remove(k);
+            }
+            self.s.refused.lock().unwrap().entry(method.to_owned()).or_default().extend(sent);
+        }
     }
 
     pub async fn call(&self, method: &str, params: Value) -> std::result::Result<Value, RpcError> {
@@ -207,6 +267,9 @@ async fn run(s: Arc<Shared>) {
                 let r = pump(&s, ws).await;
                 attempt = attempt_after_link(attempt, up.elapsed());
                 *s.out.lock().unwrap() = None;
+                // Before the link change is announced: nothing may build a request for the
+                // next socket from this one's mode.
+                s.ready.send_replace(None);
                 fail_pending(&s);
                 match r {
                     None => break,
@@ -267,6 +330,8 @@ fn friendly(e: &tungstenite::Error) -> String {
 async fn pump(s: &Arc<Shared>, ws: Ws) -> Option<String> {
     let (mut sink, mut stream) = ws.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    s.ready.send_replace(None);
+    s.refused.lock().unwrap().clear();
     *s.out.lock().unwrap() = Some(tx);
     set_link(s, LinkState::Connected);
     let mut stop = s.stop.subscribe();
@@ -348,6 +413,7 @@ fn route(s: &Arc<Shared>, text: &str) -> Option<bool> {
                 let id = s.next_id.fetch_add(1, Ordering::Relaxed);
                 send(s, json!({"jsonrpc":"2.0","id":id,"method":"client.capabilities","params":{"server_requests":true}}).to_string());
                 let hb = payload.get("heartbeat").and_then(Value::as_bool).unwrap_or(false);
+                s.ready.send_replace(Some(payload.clone()));
                 let _ = s.inbound.try_send(Inbound::Ready(payload));
                 return Some(hb);
             }
