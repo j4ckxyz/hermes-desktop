@@ -18,7 +18,11 @@ env:
 jobs:
   macos:
     name: macOS (universal)
-    runs-on: macos-14
+    # GitHub retires pinned macOS images; macos-latest is always available on free runners.
+    runs-on: macos-latest
+    env:
+      # Run on macOS 11+ (matches LSMinimumSystemVersion), whatever SDK the runner has.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -44,6 +48,7 @@ jobs:
           lipo -create -output "$APP/Contents/MacOS/hermes-desktop" \
             target/aarch64-apple-darwin/release/hermes-desktop target/x86_64-apple-darwin/release/hermes-desktop
           lipo -info "$APP/Contents/MacOS/hermes-desktop"
+          vtool -show-build "$APP/Contents/MacOS/hermes-desktop" | grep -E 'minos|architecture' 
           sed "s/__VERSION__/$V/g" packaging/Info.plist > "$APP/Contents/Info.plist"
           mkdir AppIcon.iconset
           for s in 16 32 128 256 512; do
