@@ -112,6 +112,9 @@ fn roster_chat_stream_mentions_files_compact() {
         _ => None,
     });
     assert_eq!(notice.handle, "research-buddy");
+    // The notice arrives mid-turn: let that turn finish so its TurnEnd can't be mistaken for the
+    // next one's.
+    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, error: None, .. } if *k == key).then_some(()));
     let sent = mock.messages_of("default");
     let last_user = sent.iter().rev().find(|m| m["role"] == "user" && !m["content"].as_str().unwrap().starts_with("Message from")).unwrap();
     assert!(last_user["content"].as_str().unwrap().contains("message_agent target: \"researcher\""));
@@ -125,7 +128,8 @@ fn roster_chat_stream_mentions_files_compact() {
     std::fs::write(&txt, "hello").unwrap();
     let files = vec![LocalFile::from_path(png).unwrap(), LocalFile::from_path(txt).unwrap()];
     svc.send(Cmd::Send { key: key.clone(), text: "see attached".into(), files, refresh: None, slash: false });
-    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { error: None, .. }).then_some(()));
+    // This turn's end specifically: the mock answers an attached file with "Got the file".
+    wait(&svc, 10, |e| matches!(e, Ev::TurnEnd { key: k, text, error: None } if *k == key && text.starts_with("Got the file")).then_some(()));
     let sent = mock.messages_of("default");
     let u = sent.iter().rev().find(|m| m["role"] == "user").unwrap();
     assert!(u["content"].as_str().unwrap().contains("@file:/home/hermes/uploads/notes.txt"));
